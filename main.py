@@ -756,3 +756,120 @@ def get_task(task_id:int):
         return {"success":False}
 
     return dict(task._mapping)
+
+@app.get("/recent-activity")
+def recent_activity():
+
+    with engine.connect() as conn:
+
+        result = conn.execute(
+            text("""
+                SELECT
+                task_id,
+                employee_id,
+                task_title,
+                completed_at
+                FROM task_history
+                ORDER BY completed_at DESC
+                LIMIT 20
+            """)
+        )
+
+        activity = [
+            dict(row._mapping)
+            for row in result
+        ]
+
+    return activity
+
+@app.get("/dashboard-summary")
+def dashboard_summary():
+
+    with engine.connect() as conn:
+
+        employees = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM users
+                WHERE role='employee'
+            """)
+        ).scalar()
+
+        tasks = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM tasks
+            """)
+        ).scalar()
+
+        completed = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE status='Completed'
+            """)
+        ).scalar()
+
+    productivity = 0
+
+    if tasks > 0:
+        productivity = round(completed/tasks*100)
+
+    return {
+        "employees": employees,
+        "tasks": tasks,
+        "completed": completed,
+        "productivity": productivity
+    }
+
+@app.get("/search-employee")
+def search_employee(name:str):
+
+    with engine.connect() as conn:
+
+        result = conn.execute(
+            text("""
+                SELECT
+                id,
+                full_name,
+                email
+                FROM users
+                WHERE full_name ILIKE :name
+            """),
+            {
+                "name":f"%{name}%"
+            }
+        )
+
+        employees = [
+            dict(row._mapping)
+            for row in result
+        ]
+
+    return employees
+
+@app.get("/employee-details")
+def employee_details(user_id:int):
+
+    with engine.connect() as conn:
+
+        result = conn.execute(
+            text("""
+                SELECT
+                id,
+                full_name,
+                email,
+                role
+                FROM users
+                WHERE id=:id
+            """),
+            {"id":user_id}
+        )
+
+        employee = result.fetchone()
+
+    if not employee:
+        return {"success":False}
+
+    return dict(employee._mapping)
+
