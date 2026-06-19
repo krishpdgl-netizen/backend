@@ -444,3 +444,39 @@ def history(user_id:int):
         ]
 
     return history
+
+
+@app.get("/productivity-score")
+def productivity_score(user_id:int):
+
+    with engine.connect() as conn:
+
+        total = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE assigned_to=:id
+            """),
+            {"id":user_id}
+        ).scalar()
+
+        completed = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE assigned_to=:id
+                AND status='Completed'
+            """),
+            {"id":user_id}
+        ).scalar()
+
+    score = 0
+
+    if total > 0:
+        score = round((completed/total)*100)
+
+    return {
+        "total_tasks": total,
+        "completed_tasks": completed,
+        "score": score
+    }
