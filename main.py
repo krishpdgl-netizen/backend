@@ -484,29 +484,3 @@ def productivity_score(user_id:int):
     }
 
 
-async function loadProductivity(){
-
-    const userId =
-    localStorage.getItem("userId");
-
-    const response = await fetch(
-    `https://backend-production-53f3.up.railway.app/productivity-score?user_id=${userId}`
-    );
-
-    const data = await response.json();
-
-    document.getElementById("productivityScore").innerHTML =
-    data.score + "%";
-
-    document.getElementById("progressBar").style.width =
-    data.score + "%";
-
-    document.getElementById("assignedTasks").innerHTML =
-    data.total_tasks;
-
-    document.getElementById("completedTasks").innerHTML =
-    data.completed_tasks;
-
-    document.getElementById("dueTasks").innerHTML =
-    data.total_tasks - data.completed_tasks;
-}
