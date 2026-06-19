@@ -645,4 +645,55 @@ def delete_task(task_id:int):
         "success":True
     }
 
+@app.get("/employee-performance")
+def employee_performance():
 
+    with engine.connect() as conn:
+
+        result = conn.execute(
+            text("""
+            SELECT
+            u.id,
+            u.full_name,
+
+            COUNT(t.id) AS assigned,
+
+            COUNT(
+                CASE
+                WHEN t.status='Completed'
+                THEN 1
+                END
+            ) AS completed
+
+            FROM users u
+
+            LEFT JOIN tasks t
+            ON u.id=t.assigned_to
+
+            WHERE u.role='employee'
+
+            GROUP BY u.id,u.full_name
+            """)
+        )
+
+        data=[]
+
+        for row in result:
+
+            assigned=row.assigned
+            completed=row.completed
+
+            score=0
+
+            if assigned>0:
+                score=round((completed/assigned)*100)
+
+            data.append({
+                "id":row.id,
+                "name":row.full_name,
+                "assigned":assigned,
+                "completed":completed,
+                "score":score
+            })
+
+    return data
