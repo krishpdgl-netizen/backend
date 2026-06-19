@@ -172,6 +172,7 @@ def my_tasks(user_id: int):
                 SELECT *
                 FROM tasks
                 WHERE assigned_to = :user_id
+                AND status != 'Completed'
             """),
             {"user_id": user_id}
         )
