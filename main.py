@@ -873,3 +873,20 @@ def employee_details(user_id:int):
 
     return dict(employee._mapping)
 
+@app.post("/approve-task")
+def approve_task(task_id:int):
+
+    with engine.connect() as conn:
+
+        conn.execute(
+            text("""
+                UPDATE tasks
+                SET status='Completed'
+                WHERE id=:id
+            """),
+            {"id":task_id}
+        )
+
+        conn.commit()
+
+    return {"success":True}
