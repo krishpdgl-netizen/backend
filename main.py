@@ -483,4 +483,166 @@ def productivity_score(user_id:int):
         "score": score
     }
 
+@app.get("/employees")
+def get_employees():
+
+    with engine.connect() as conn:
+
+        result = conn.execute(
+            text("""
+                SELECT
+                id,
+                full_name,
+                email,
+                role
+                FROM users
+                WHERE role='employee'
+            """)
+        )
+
+        employees = [
+            dict(row._mapping)
+            for row in result
+        ]
+
+    return employees
+
+@app.get("/all-tasks")
+def get_all_tasks():
+
+    with engine.connect() as conn:
+
+        result = conn.execute(
+            text("""
+                SELECT *
+                FROM tasks
+                ORDER BY id DESC
+            """)
+        )
+
+        tasks = [
+            dict(row._mapping)
+            for row in result
+        ]
+
+    return tasks
+
+@app.get("/manager-stats")
+def manager_stats():
+
+    with engine.connect() as conn:
+
+        employees = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM users
+                WHERE role='employee'
+            """)
+        ).scalar()
+
+        total_tasks = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM tasks
+            """)
+        ).scalar()
+
+        completed_tasks = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE status='Completed'
+            """)
+        ).scalar()
+
+    productivity = 0
+
+    if total_tasks > 0:
+        productivity = round(
+            (completed_tasks/total_tasks)*100
+        )
+
+    return {
+        "employees": employees,
+        "total_tasks": total_tasks,
+        "completed_tasks": completed_tasks,
+        "productivity": productivity
+    }
+
+
+@app.get("/employee-performance")
+def employee_performance():
+
+    with engine.connect() as conn:
+
+        result = conn.execute(
+            text("""
+            SELECT
+            u.id,
+            u.full_name,
+
+            COUNT(t.id) as assigned,
+
+            COUNT(
+                CASE
+                WHEN t.status='Completed'
+                THEN 1
+                END
+            ) as completed
+
+            FROM users u
+
+            LEFT JOIN tasks t
+            ON u.id=t.assigned_to
+
+            WHERE u.role='employee'
+
+            GROUP BY u.id,u.full_name
+            """)
+        )
+
+        data=[]
+
+        for row in result:
+
+            assigned=row.assigned
+            completed=row.completed
+
+            score=0
+
+            if assigned>0:
+                score=round(
+                    completed/assigned*100
+                )
+
+            data.append({
+                "id":row.id,
+                "name":row.full_name,
+                "assigned":assigned,
+                "completed":completed,
+                "score":score
+            })
+
+    return data
+
+@app.post("/delete-task")
+def delete_task(task_id:int):
+
+    with engine.connect() as conn:
+
+        conn.execute(
+            text("""
+                DELETE
+                FROM tasks
+                WHERE id=:id
+            """),
+            {"id":task_id}
+        )
+
+        conn.commit()
+
+    return {
+        "success":True
+    }
+
 
