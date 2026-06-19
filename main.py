@@ -279,6 +279,7 @@ def my_tasks(user_id: int):
                 SELECT *
                 FROM tasks
                 WHERE assigned_to = :user_id
+                AND status != 'Completed'
                 ORDER BY created_at DESC
             """),
             {
