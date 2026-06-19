@@ -697,3 +697,62 @@ def employee_performance():
             })
 
     return data
+@app.post("/edit-task")
+def edit_task(
+    task_id:int,
+    title:str,
+    description:str,
+    assigned_to:int,
+    priority:str,
+    due_date:str
+):
+
+    with engine.connect() as conn:
+
+        conn.execute(
+            text("""
+                UPDATE tasks
+                SET
+                    title=:title,
+                    description=:description,
+                    assigned_to=:assigned_to,
+                    priority=:priority,
+                    due_date=:due_date
+                WHERE id=:task_id
+            """),
+            {
+                "task_id": task_id,
+                "title": title,
+                "description": description,
+                "assigned_to": assigned_to,
+                "priority": priority,
+                "due_date": due_date
+            }
+        )
+
+        conn.commit()
+
+    return {
+        "success": True
+    }
+
+@app.get("/task")
+def get_task(task_id:int):
+
+    with engine.connect() as conn:
+
+        result = conn.execute(
+            text("""
+                SELECT *
+                FROM tasks
+                WHERE id=:id
+            """),
+            {"id":task_id}
+        )
+
+        task = result.fetchone()
+
+    if not task:
+        return {"success":False}
+
+    return dict(task._mapping)
