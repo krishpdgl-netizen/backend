@@ -890,3 +890,13 @@ def approve_task(task_id:int):
         conn.commit()
 
     return {"success":True}
+
+
+@app.get("/review-tasks")
+def review_tasks():
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT * FROM tasks WHERE status='Pending Review' ORDER BY id DESC")
+        )
+        tasks = [dict(row._mapping) for row in result]
+    return tasks
