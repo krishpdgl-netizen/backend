@@ -1027,24 +1027,34 @@ def manager_tasks(manager_id:int):
 
         rows = conn.execute(
             text("""
-            SELECT *
-            FROM tasks
+                SELECT
+                    tasks.id,
+                    tasks.title,
+                    users.full_name AS employee_name,
+                    tasks.assigned_to,
+                    tasks.priority,
+                    tasks.status,
+                    tasks.due_date
 
-            WHERE assigned_to IN(
+                FROM tasks
 
-                SELECT employee_id
-                FROM team_members
-                WHERE manager_id=:manager_id
+                JOIN users
+                ON tasks.assigned_to = users.id
 
-            )
+                WHERE tasks.assigned_to IN (
 
-            ORDER BY id DESC
+                    SELECT employee_id
+                    FROM team_members
+                    WHERE manager_id=:manager_id
+
+                )
+
+                ORDER BY tasks.id DESC
             """),
-            {"manager_id":manager_id}
+            {"manager_id": manager_id}
         ).fetchall()
 
     return [dict(row._mapping) for row in rows]
-
 
 @app.post("/team/add")
 def add_team_member(manager_id:int, employee_id:int):
