@@ -898,3 +898,173 @@ def review_tasks():
         )
         tasks = [dict(row._mapping) for row in result]
     return tasks
+@app.get("/team")
+def get_team(manager_id:int):
+
+    with engine.connect() as conn:
+
+        data = conn.execute(
+            text("""
+                SELECT users.id,
+                       users.full_name,
+                       users.email
+                FROM team_members
+                JOIN users
+                ON team_members.employee_id = users.id
+                WHERE manager_id=:manager_id
+            """),
+            {"manager_id":manager_id}
+        ).fetchall()
+
+    result=[]
+
+    for row in data:
+
+        result.append({
+            "id":row.id,
+            "full_name":row.full_name,
+            "email":row.email
+        })
+
+    return result
+
+
+@app.get("/employees")
+def employees():
+
+    with engine.connect() as conn:
+
+        data = conn.execute(
+            text("""
+                SELECT id,
+                       full_name,
+                       email
+                FROM users
+                WHERE role='employee'
+            """)
+        ).fetchall()
+
+    result=[]
+
+    for row in data:
+
+        result.append({
+            "id":row.id,
+            "full_name":row.full_name,
+            "email":row.email
+        })
+
+    return result
+
+
+@app.post("/team/add")
+def add_team_member(manager_id:int,
+                    employee_id:int):
+
+    with engine.connect() as conn:
+
+        exists = conn.execute(
+            text("""
+                SELECT *
+                FROM team_members
+                WHERE manager_id=:manager_id
+                AND employee_id=:employee_id
+            """),
+            {
+                "manager_id":manager_id,
+                "employee_id":employee_id
+            }
+        ).fetchone()
+
+        if exists:
+
+            return {
+                "success":False,
+                "message":"Already in team"
+            }
+
+        conn.execute(
+            text("""
+                INSERT INTO team_members
+                (manager_id,employee_id)
+                VALUES
+                (:manager_id,:employee_id)
+            """),
+            {
+                "manager_id":manager_id,
+                "employee_id":employee_id
+            }
+        )
+
+        conn.commit()
+
+    return {"success":True}
+
+
+
+@app.post("/team/remove")
+def remove_team_member(manager_id:int,
+                       employee_id:int):
+
+    with engine.connect() as conn:
+
+        conn.execute(
+            text("""
+                DELETE FROM team_members
+                WHERE manager_id=:manager_id
+                AND employee_id=:employee_id
+            """),
+            {
+                "manager_id":manager_id,
+                "employee_id":employee_id
+            }
+        )
+
+        conn.commit()
+
+    return {"success":True}
+
+
+@app.get("/team")
+def get_team(manager_id:int):
+
+    with engine.connect() as conn:
+
+        data = conn.execute(
+            text("""
+                SELECT
+                    users.id,
+                    users.full_name,
+                    users.email,
+                    COUNT(tasks.id) AS task_count
+                FROM team_members
+
+                JOIN users
+                ON team_members.employee_id = users.id
+
+                LEFT JOIN tasks
+                ON tasks.assigned_to = users.id
+                AND LOWER(tasks.status)!='completed'
+
+                WHERE team_members.manager_id=:manager_id
+
+                GROUP BY
+                users.id,
+                users.full_name,
+                users.email
+            """),
+            {"manager_id":manager_id}
+        ).fetchall()
+
+    result=[]
+
+    for row in data:
+
+        result.append({
+            "id":row.id,
+            "full_name":row.full_name,
+            "email":row.email,
+            "task_count":row.task_count
+        })
+
+    return result
