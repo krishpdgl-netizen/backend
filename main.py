@@ -1044,3 +1044,26 @@ def manager_tasks(manager_id:int):
         ).fetchall()
 
     return [dict(row._mapping) for row in rows]
+
+
+@app.post("/team/add")
+def add_team_member(manager_id:int, employee_id:int):
+
+    with engine.connect() as conn:
+
+        conn.execute(
+            text("""
+                INSERT INTO team_members(manager_id, employee_id)
+                VALUES(:manager_id, :employee_id)
+            """),
+            {
+                "manager_id":manager_id,
+                "employee_id":employee_id
+            }
+        )
+
+        conn.commit()
+
+    return {
+        "success":True
+    }
