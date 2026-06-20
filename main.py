@@ -1039,25 +1039,15 @@ def get_team(manager_id:int):
         data = conn.execute(
             text("""
                 SELECT
-                    users.id,
-                    users.full_name,
-                    users.email,
-                    COUNT(tasks.id) AS task_count
-                FROM team_members
+    users.id,
+    users.full_name,
+    users.email
+FROM team_members
 
-                JOIN users
-                ON team_members.employee_id = users.id
+JOIN users
+ON team_members.employee_id = users.id
 
-                LEFT JOIN tasks
-                ON tasks.assigned_to = users.id
-                AND LOWER(tasks.status)!='completed'
-
-                WHERE team_members.manager_id=:manager_id
-
-                GROUP BY
-                users.id,
-                users.full_name,
-                users.email
+WHERE team_members.manager_id=:manager_id
             """),
             {"manager_id":manager_id}
         ).fetchall()
