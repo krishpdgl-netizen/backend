@@ -1262,3 +1262,88 @@ def get_managers():
         ).fetchall()
 
     return [dict(row._mapping) for row in rows]
+
+
+# ── UPDATE PROFILE ───────────────────────────────────────────────
+@app.post("/update-profile")
+def update_profile(user_id: int, full_name: str, email: str):
+    with engine.connect() as conn:
+ 
+        # Check email not taken by someone else
+        existing = conn.execute(
+            text("SELECT id FROM users WHERE email=:email AND id != :user_id"),
+            {"email": email, "user_id": user_id}
+        ).fetchone()
+ 
+        if existing:
+            return {"success": False, "message": "Email already in use by another account"}
+ 
+        conn.execute(
+            text("""
+                UPDATE users
+                SET full_name = :full_name, email = :email
+                WHERE id = :user_id
+            """),
+            {"full_name": full_name, "email": email, "user_id": user_id}
+        )
+        conn.commit()
+ 
+    return {"success": True, "message": "Profile updated"}
+ 
+ 
+# ── CHANGE PASSWORD ──────────────────────────────────────────────
+@app.post("/change-password")
+def change_password(user_id: int, current_password: str, new_password: str):
+    with engine.connect() as conn:
+ 
+        # Verify current password
+        user = conn.execute(
+            text("SELECT id FROM users WHERE id=:user_id AND password=:password"),
+            {"user_id": user_id, "password": current_password}
+        ).fetchone()
+ 
+        if not user:
+            return {"success": False, "message": "Current password is incorrect"}
+ 
+        if len(new_password) < 6:
+            return {"success": False, "message": "New password must be at least 6 characters"}
+ 
+        conn.execute(
+            text("UPDATE users SET password=:password WHERE id=:user_id"),
+            {"password": new_password, "user_id": user_id}
+        )
+        conn.commit()
+ 
+    return {"success": True, "message": "Password changed successfully"}
+ 
+ 
+# ── GET ALL USERS WITH ROLES (for role management) ───────────────
+@app.get("/all-users")
+def get_all_users():
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("""
+                SELECT id, full_name, email, role
+                FROM users
+                ORDER BY role, full_name
+            """)
+        )
+        users = [dict(row._mapping) for row in result]
+    return users
+ 
+ 
+# ── UPDATE USER ROLE ─────────────────────────────────────────────
+@app.post("/update-role")
+def update_role(user_id: int, new_role: str):
+    valid_roles = ["employee", "manager", "admin"]
+    if new_role not in valid_roles:
+        return {"success": False, "message": "Invalid role"}
+ 
+    with engine.connect() as conn:
+        conn.execute(
+            text("UPDATE users SET role=:role WHERE id=:user_id"),
+            {"role": new_role, "user_id": user_id}
+        )
+        conn.commit()
+ 
+    return {"success": True}
