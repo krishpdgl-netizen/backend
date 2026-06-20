@@ -968,11 +968,11 @@ def manager_dashboard_stats(manager_id:int):
     with engine.connect() as conn:
 
         # Team members
-        team_count = conn.execute(
+        team_members = conn.execute(
             text("""
-            SELECT COUNT(*)
-            FROM team_members
-            WHERE manager_id=:manager_id
+                SELECT COUNT(*)
+                FROM team_members
+                WHERE manager_id=:manager_id
             """),
             {"manager_id":manager_id}
         ).scalar()
@@ -980,62 +980,43 @@ def manager_dashboard_stats(manager_id:int):
         # Pending tasks
         pending_tasks = conn.execute(
             text("""
-            SELECT COUNT(*)
-            FROM tasks
-            WHERE assigned_to IN(
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE assigned_to IN(
 
-                SELECT employee_id
-                FROM team_members
-                WHERE manager_id=:manager_id
+                    SELECT employee_id
+                    FROM team_members
+                    WHERE manager_id=:manager_id
 
-            )
-            AND LOWER(status)!='completed'
+                )
+                AND LOWER(status)!='completed'
             """),
             {"manager_id":manager_id}
         ).scalar()
 
-        # Review tasks
+        # Tasks for review
         review_tasks = conn.execute(
             text("""
-            SELECT COUNT(*)
-            FROM tasks
-            WHERE assigned_to IN(
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE assigned_to IN(
 
-                SELECT employee_id
-                FROM team_members
-                WHERE manager_id=:manager_id
+                    SELECT employee_id
+                    FROM team_members
+                    WHERE manager_id=:manager_id
 
-            )
-            AND LOWER(status)='submitted'
-            """),
-            {"manager_id":manager_id}
-        ).scalar()
-
-        # Team productivity
-        productivity = conn.execute(
-            text("""
-            SELECT AVG(productivity_score)
-            FROM users
-            WHERE id IN(
-
-                SELECT employee_id
-                FROM team_members
-                WHERE manager_id=:manager_id
-
-            )
+                )
+                AND LOWER(status)='submitted'
             """),
             {"manager_id":manager_id}
         ).scalar()
 
     return {
 
-        "team_members":team_count,
-
-        "pending_tasks":pending_tasks,
-
-        "review_tasks":review_tasks,
-
-        "productivity":round(productivity or 0)
+        "team_members": team_members or 0,
+        "pending_tasks": pending_tasks or 0,
+        "review_tasks": review_tasks or 0,
+        "productivity": 0
 
     }
 
