@@ -1067,3 +1067,131 @@ def add_team_member(manager_id:int, employee_id:int):
     return {
         "success":True
     }
+
+@app.get("/manager-report")
+def manager_report(manager_id:int):
+
+    with engine.connect() as conn:
+
+        # Team members
+        team_members = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM team_members
+                WHERE manager_id=:manager_id
+            """),
+            {"manager_id":manager_id}
+        ).scalar()
+
+        # Assigned tasks
+        assigned_tasks = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE assigned_to IN(
+
+                    SELECT employee_id
+                    FROM team_members
+                    WHERE manager_id=:manager_id
+
+                )
+            """),
+            {"manager_id":manager_id}
+        ).scalar()
+
+        # Completed tasks
+        completed_tasks = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE assigned_to IN(
+
+                    SELECT employee_id
+                    FROM team_members
+                    WHERE manager_id=:manager_id
+
+                )
+
+                AND LOWER(status)='completed'
+            """),
+            {"manager_id":manager_id}
+        ).scalar()
+
+        # Pending tasks
+        pending_tasks = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE assigned_to IN(
+
+                    SELECT employee_id
+                    FROM team_members
+                    WHERE manager_id=:manager_id
+
+                )
+
+                AND LOWER(status)!='completed'
+            """),
+            {"manager_id":manager_id}
+        ).scalar()
+
+        # Completion rate
+        if assigned_tasks == 0:
+            completion_rate = 0
+        else:
+            completion_rate = round(
+                completed_tasks * 100 / assigned_tasks
+            )
+
+        # Top performer
+        top_performer_row = conn.execute(
+            text("""
+                SELECT
+                    users.full_name,
+                    COUNT(tasks.id) AS completed_count
+
+                FROM users
+
+                JOIN tasks
+                ON users.id = tasks.assigned_to
+
+                WHERE users.id IN(
+
+                    SELECT employee_id
+                    FROM team_members
+                    WHERE manager_id=:manager_id
+
+                )
+
+                AND LOWER(tasks.status)='completed'
+
+                GROUP BY users.full_name
+
+                ORDER BY completed_count DESC
+
+                LIMIT 1
+            """),
+            {"manager_id":manager_id}
+        ).fetchone()
+
+        top_performer = (
+            top_performer_row.full_name
+            if top_performer_row
+            else "N/A"
+        )
+
+    return {
+
+        "team_members": team_members or 0,
+
+        "assigned_tasks": assigned_tasks or 0,
+
+        "completed_tasks": completed_tasks or 0,
+
+        "pending_tasks": pending_tasks or 0,
+
+        "completion_rate": completion_rate,
+
+        "top_performer": top_performer
+
+    }
