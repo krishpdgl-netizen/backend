@@ -525,47 +525,6 @@ def get_all_tasks():
 
     return tasks
 
-@app.get("/manager-stats")
-def manager_stats():
-
-    with engine.connect() as conn:
-
-        employees = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM users
-                WHERE role='employee'
-            """)
-        ).scalar()
-
-        total_tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-            """)
-        ).scalar()
-
-        completed_tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE status='Completed'
-            """)
-        ).scalar()
-
-    productivity = 0
-
-    if total_tasks > 0:
-        productivity = round(
-            (completed_tasks/total_tasks)*100
-        )
-
-    return {
-        "employees": employees,
-        "total_tasks": total_tasks,
-        "completed_tasks": completed_tasks,
-        "productivity": productivity
-    }
 
 
 @app.get("/employee-performance")
@@ -891,58 +850,29 @@ def approve_task(task_id:int):
 
 
 @app.get("/review-tasks")
-def review_tasks():
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT * FROM tasks WHERE status='Pending Review' ORDER BY id DESC")
-        )
-        tasks = [dict(row._mapping) for row in result]
-    return tasks
-
-
-@app.post("/team/add")
-def add_team_member(manager_id:int,
-                    employee_id:int):
+def review_tasks(manager_id:int):
 
     with engine.connect() as conn:
 
-        exists = conn.execute(
+        rows = conn.execute(
             text("""
-                SELECT *
+            SELECT *
+            FROM tasks
+
+            WHERE assigned_to IN(
+
+                SELECT employee_id
                 FROM team_members
                 WHERE manager_id=:manager_id
-                AND employee_id=:employee_id
+
+            )
+
+            AND LOWER(status)='submitted'
             """),
-            {
-                "manager_id":manager_id,
-                "employee_id":employee_id
-            }
-        ).fetchone()
+            {"manager_id":manager_id}
+        ).fetchall()
 
-        if exists:
-
-            return {
-                "success":False,
-                "message":"Already in team"
-            }
-
-        conn.execute(
-            text("""
-                INSERT INTO team_members
-                (manager_id,employee_id)
-                VALUES
-                (:manager_id,:employee_id)
-            """),
-            {
-                "manager_id":manager_id,
-                "employee_id":employee_id
-            }
-        )
-
-        conn.commit()
-
-    return {"success":True}
-
+    return [dict(row._mapping) for row in rows]
 
 
 @app.post("/team/remove")
@@ -1031,3 +961,105 @@ def get_team(manager_id:int):
         })
 
     return result
+
+@app.get("/manager-dashboard-stats")
+def manager_dashboard_stats(manager_id:int):
+
+    with engine.connect() as conn:
+
+        # Team members
+        team_count = conn.execute(
+            text("""
+            SELECT COUNT(*)
+            FROM team_members
+            WHERE manager_id=:manager_id
+            """),
+            {"manager_id":manager_id}
+        ).scalar()
+
+        # Pending tasks
+        pending_tasks = conn.execute(
+            text("""
+            SELECT COUNT(*)
+            FROM tasks
+            WHERE assigned_to IN(
+
+                SELECT employee_id
+                FROM team_members
+                WHERE manager_id=:manager_id
+
+            )
+            AND LOWER(status)!='completed'
+            """),
+            {"manager_id":manager_id}
+        ).scalar()
+
+        # Review tasks
+        review_tasks = conn.execute(
+            text("""
+            SELECT COUNT(*)
+            FROM tasks
+            WHERE assigned_to IN(
+
+                SELECT employee_id
+                FROM team_members
+                WHERE manager_id=:manager_id
+
+            )
+            AND LOWER(status)='submitted'
+            """),
+            {"manager_id":manager_id}
+        ).scalar()
+
+        # Team productivity
+        productivity = conn.execute(
+            text("""
+            SELECT AVG(productivity_score)
+            FROM users
+            WHERE id IN(
+
+                SELECT employee_id
+                FROM team_members
+                WHERE manager_id=:manager_id
+
+            )
+            """),
+            {"manager_id":manager_id}
+        ).scalar()
+
+    return {
+
+        "team_members":team_count,
+
+        "pending_tasks":pending_tasks,
+
+        "review_tasks":review_tasks,
+
+        "productivity":round(productivity or 0)
+
+    }
+
+@app.get("/manager-tasks")
+def manager_tasks(manager_id:int):
+
+    with engine.connect() as conn:
+
+        rows = conn.execute(
+            text("""
+            SELECT *
+            FROM tasks
+
+            WHERE assigned_to IN(
+
+                SELECT employee_id
+                FROM team_members
+                WHERE manager_id=:manager_id
+
+            )
+
+            ORDER BY id DESC
+            """),
+            {"manager_id":manager_id}
+        ).fetchall()
+
+    return [dict(row._mapping) for row in rows]
