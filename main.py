@@ -1006,11 +1006,15 @@ def add_team_member(manager_id:int,
 def remove_team_member(manager_id:int,
                        employee_id:int):
 
+    print("manager =", manager_id)
+    print("employee =", employee_id)
+
     with engine.connect() as conn:
 
-        conn.execute(
+        result = conn.execute(
             text("""
-                DELETE FROM team_members
+                DELETE
+                FROM team_members
                 WHERE manager_id=:manager_id
                 AND employee_id=:employee_id
             """),
@@ -1021,6 +1025,8 @@ def remove_team_member(manager_id:int,
         )
 
         conn.commit()
+
+    print("rows deleted =", result.rowcount)
 
     return {"success":True}
 
