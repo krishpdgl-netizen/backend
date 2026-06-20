@@ -1205,3 +1205,41 @@ def manager_report(manager_id:int):
         "top_performer": top_performer
 
     }
+@app.post("/delete-user")
+def delete_user(user_id: int):
+
+    with engine.connect() as conn:
+
+        # Delete tasks assigned to employee
+        conn.execute(
+            text("""
+                DELETE FROM tasks
+                WHERE assigned_to=:user_id
+            """),
+            {"user_id": user_id}
+        )
+
+        # Remove employee from teams
+        conn.execute(
+            text("""
+                DELETE FROM team_members
+                WHERE employee_id=:user_id
+            """),
+            {"user_id": user_id}
+        )
+
+        # Delete the user
+        conn.execute(
+            text("""
+                DELETE FROM users
+                WHERE id=:user_id
+            """),
+            {"user_id": user_id}
+        )
+
+        conn.commit()
+
+    return {
+        "success": True,
+        "message": "User deleted successfully"
+    }
