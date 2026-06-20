@@ -867,7 +867,7 @@ def review_tasks(manager_id:int):
 
             )
 
-            AND LOWER(status)='submitted'
+            AND LOWER(status)='pending review'
             """),
             {"manager_id":manager_id}
         ).fetchall()
