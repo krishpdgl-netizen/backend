@@ -1057,10 +1057,10 @@ WHERE team_members.manager_id=:manager_id
     for row in data:
 
         result.append({
-            "id":row.id,
-            "full_name":row.full_name,
-            "email":row.email,
-            "task_count":row.task_count
-        })
+    "id":row.id,
+    "full_name":row.full_name,
+    "email":row.email,
+    "task_count":0
+})
 
     return result
