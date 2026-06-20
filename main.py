@@ -973,5 +973,61 @@ def remove_team_member(manager_id:int,
 
     return {"success":True}
 
-
 @app.get("/team")
+def get_team(manager_id:int):
+
+    with engine.connect() as conn:
+
+        data = conn.execute(
+            text("""
+                SELECT
+                    users.id,
+                    users.full_name,
+                    users.email,
+
+                    COUNT(
+                        CASE
+                        WHEN LOWER(tasks.status) != 'completed'
+                        THEN tasks.id
+                        END
+                    ) AS task_count
+
+                FROM team_members
+
+                JOIN users
+                ON team_members.employee_id = users.id
+
+                LEFT JOIN tasks
+                ON tasks.assigned_to = users.id
+
+                WHERE team_members.manager_id = :manager_id
+
+                GROUP BY
+                    users.id,
+                    users.full_name,
+                    users.email
+
+                ORDER BY users.full_name
+            """),
+            {
+                "manager_id":manager_id
+            }
+        ).fetchall()
+
+    result = []
+
+    for row in data:
+
+        result.append({
+
+            "id":row.id,
+
+            "full_name":row.full_name,
+
+            "email":row.email,
+
+            "task_count":row.task_count
+
+        })
+
+    return result
