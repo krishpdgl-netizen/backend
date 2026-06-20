@@ -898,63 +898,6 @@ def review_tasks():
         )
         tasks = [dict(row._mapping) for row in result]
     return tasks
-@app.get("/team")
-def get_team(manager_id:int):
-
-    with engine.connect() as conn:
-
-        data = conn.execute(
-            text("""
-                SELECT users.id,
-                       users.full_name,
-                       users.email
-                FROM team_members
-                JOIN users
-                ON team_members.employee_id = users.id
-                WHERE manager_id=:manager_id
-            """),
-            {"manager_id":manager_id}
-        ).fetchall()
-
-    result=[]
-
-    for row in data:
-
-        result.append({
-            "id":row.id,
-            "full_name":row.full_name,
-            "email":row.email
-        })
-
-    return result
-
-
-@app.get("/employees")
-def employees():
-
-    with engine.connect() as conn:
-
-        data = conn.execute(
-            text("""
-                SELECT id,
-                       full_name,
-                       email
-                FROM users
-                WHERE role='employee'
-            """)
-        ).fetchall()
-
-    result=[]
-
-    for row in data:
-
-        result.append({
-            "id":row.id,
-            "full_name":row.full_name,
-            "email":row.email
-        })
-
-    return result
 
 
 @app.post("/team/add")
@@ -1032,35 +975,3 @@ def remove_team_member(manager_id:int,
 
 
 @app.get("/team")
-def get_team(manager_id:int):
-
-    with engine.connect() as conn:
-
-        data = conn.execute(
-            text("""
-                SELECT
-    users.id,
-    users.full_name,
-    users.email
-FROM team_members
-
-JOIN users
-ON team_members.employee_id = users.id
-
-WHERE team_members.manager_id=:manager_id
-            """),
-            {"manager_id":manager_id}
-        ).fetchall()
-
-    result=[]
-
-    for row in data:
-
-        result.append({
-    "id":row.id,
-    "full_name":row.full_name,
-    "email":row.email,
-    "task_count":0
-})
-
-    return result
