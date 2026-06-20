@@ -1243,3 +1243,22 @@ def delete_user(user_id: int):
         "success": True,
         "message": "User deleted successfully"
     }
+@app.get("/managers")
+def get_managers():
+
+    with engine.connect() as conn:
+
+        rows = conn.execute(
+            text("""
+                SELECT
+                    id,
+                    full_name,
+                    email,
+                    role
+                FROM users
+                WHERE LOWER(role)='manager'
+                ORDER BY id
+            """)
+        ).fetchall()
+
+    return [dict(row._mapping) for row in rows]
