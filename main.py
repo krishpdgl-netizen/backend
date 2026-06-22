@@ -1915,3 +1915,13 @@ def download_sales():
         filename="sales_tracker.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+@app.get("/sales/debug")
+def debug():
+
+    wb = load_workbook(FILE_NAME)
+
+    return {
+
+        "sheets": wb.sheetnames
+
+    }
