@@ -3,8 +3,8 @@
 ```python
 """
 excel_helper.py
-────────────────────────────
-Excel backend for Panache Sales Tracker
+────────────────────────────────────
+Panache Sales Tracker using Excel
 
 Workbook:
 sales_tracker.xlsx
@@ -12,6 +12,14 @@ sales_tracker.xlsx
 Sheets:
 Employee_{user_id}
 ChangeRequests
+
+Employee sheet columns:
+week | customer | product | projected | price | achieved
+
+ChangeRequests columns:
+request_id | employee_id | week | customer | product |
+old_qty | new_qty | reason | status |
+manager_note | created_at
 """
 
 import os
@@ -45,9 +53,9 @@ CR_HEADERS = [
 ]
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------------
 # WORKBOOK
-# ─────────────────────────────────────────────
+# ---------------------------------------------------
 
 def _get_workbook():
 
@@ -57,6 +65,7 @@ def _get_workbook():
 
         ws = wb.active
         ws.title = "ChangeRequests"
+
         ws.append(CR_HEADERS)
 
         wb.save(FILE_NAME)
@@ -64,9 +73,9 @@ def _get_workbook():
     return load_workbook(FILE_NAME)
 
 
-# ─────────────────────────────────────────────
-# EMPLOYEE SHEETS
-# ─────────────────────────────────────────────
+# ---------------------------------------------------
+# EMPLOYEE SHEET
+# ---------------------------------------------------
 
 def _employee_sheet(user_id):
 
@@ -77,6 +86,7 @@ def _employee_sheet(user_id):
     if sheet_name not in wb.sheetnames:
 
         ws = wb.create_sheet(sheet_name)
+
         ws.append(SALES_HEADERS)
 
         wb.save(FILE_NAME)
@@ -84,9 +94,9 @@ def _employee_sheet(user_id):
     return wb, wb[sheet_name]
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------------
 # CHANGE REQUEST SHEET
-# ─────────────────────────────────────────────
+# ---------------------------------------------------
 
 def _cr_sheet():
 
@@ -97,82 +107,97 @@ def _cr_sheet():
     return wb, ws
 
 
-# ─────────────────────────────────────────────
-# WEEK
-# ─────────────────────────────────────────────
+# ---------------------------------------------------
+# CURRENT WEEK
+# ---------------------------------------------------
 
 def current_week():
 
     return datetime.date.today().isocalendar()[1]
 
 
-# ─────────────────────────────────────────────
-# INTERNAL HELPERS
-# ─────────────────────────────────────────────
+# ---------------------------------------------------
+# FIND ROW
+# ---------------------------------------------------
 
 def _find_row(ws, week, customer, product):
 
     for row in ws.iter_rows(min_row=2):
 
         if (
+
             str(row[0].value) == str(week)
-            and str(row[1].value).strip().lower() == customer.strip().lower()
-            and str(row[2].value).strip().lower() == product.strip().lower()
+
+            and str(row[1].value).strip().lower()
+            == customer.strip().lower()
+
+            and str(row[2].value).strip().lower()
+            == product.strip().lower()
+
         ):
+
             return row
 
     return None
 
 
-# ─────────────────────────────────────────────
-# SALES
-# ─────────────────────────────────────────────
+# ---------------------------------------------------
+# ADD PROJECTION
+# ---------------------------------------------------
 
 def add_projection(
-    user_id,
-    week,
-    customer,
-    product,
-    projected,
-    price
-):
+        user_id,
+        week,
+        customer,
+        product,
+        projected,
+        price):
 
     wb, ws = _employee_sheet(user_id)
 
     if _find_row(ws, week, customer, product):
 
         raise ValueError(
-            "Projection already exists"
+            "Projection already exists."
         )
 
     ws.append([
+
         week,
         customer,
         product,
         projected,
         price,
         0
+
     ])
 
     wb.save(FILE_NAME)
 
-    return {"success": True}
+    return {
 
+        "success": True
+
+    }
+
+
+# ---------------------------------------------------
+# GET SALES
+# ---------------------------------------------------
 
 def get_sales(user_id, week):
 
     wb, ws = _employee_sheet(user_id)
 
-    data = []
+    result = []
 
     for row in ws.iter_rows(
-        min_row=2,
-        values_only=True
-    ):
+            min_row=2,
+            values_only=True):
 
         if str(row[0]) == str(week):
 
-            data.append({
+            result.append({
 
                 "week": row[0],
                 "customer": row[1],
@@ -183,89 +208,19 @@ def get_sales(user_id, week):
 
             })
 
-    return data
-
-
-def update_achieved(
-    user_id,
-    week,
-    customer,
-    product,
-    achieved
-):
-
-    wb, ws = _employee_sheet(user_id)
-
-    row = _find_row(
-        ws,
-        week,
-        customer,
-        product
-    )
-
-    if not row:
-
-        raise ValueError("Row not found")
-
-    row[5].value = achieved
-
-    wb.save(FILE_NAME)
-
-    return {"success": True}
-
-
-def get_all_weeks(user_id):
-
-    wb, ws = _employee_sheet(user_id)
-
-    weeks = set()
-
-    for row in ws.iter_rows(min_row=2):
-
-        if row[0].value:
-            weeks.add(int(row[0].value))
-
-    return sorted(list(weeks))
-
-
-# ─────────────────────────────────────────────
-# MANAGER / ADMIN VIEW
-# ─────────────────────────────────────────────
-
-def get_sales_for_employees(
-    employee_ids,
-    week
-):
-
-    result = {}
-
-    for emp in employee_ids:
-
-        try:
-
-            result[emp] = get_sales(
-                emp,
-                week
-            )
-
-        except Exception:
-
-            result[emp] = []
-
     return result
 
 
-# ─────────────────────────────────────────────
-# MANAGER / ADMIN UPDATE PROJECTION
-# ─────────────────────────────────────────────
+# ---------------------------------------------------
+# UPDATE ACHIEVED
+# ---------------------------------------------------
 
-def admin_update_projection(
-    user_id,
-    week,
-    customer,
-    product,
-    new_qty
-):
+def update_achieved(
+        user_id,
+        week,
+        customer,
+        product,
+        achieved):
 
     wb, ws = _employee_sheet(user_id)
 
@@ -279,37 +234,128 @@ def admin_update_projection(
     if not row:
 
         raise ValueError(
-            "Row not found"
+            "Row not found."
+        )
+
+    row[5].value = achieved
+
+    wb.save(FILE_NAME)
+
+    return {
+
+        "success": True
+
+    }
+
+
+# ---------------------------------------------------
+# GET ALL WEEKS
+# ---------------------------------------------------
+
+def get_all_weeks(user_id):
+
+    wb, ws = _employee_sheet(user_id)
+
+    weeks = set()
+
+    for row in ws.iter_rows(min_row=2):
+
+        if row[0].value:
+
+            weeks.add(
+                int(row[0].value)
+            )
+
+    return sorted(
+        list(weeks)
+    )
+
+
+# ---------------------------------------------------
+# MANAGER / ADMIN VIEW
+# ---------------------------------------------------
+
+def get_sales_for_employees(
+        employee_ids,
+        week):
+
+    result = {}
+
+    for emp_id in employee_ids:
+
+        try:
+
+            result[emp_id] = get_sales(
+                emp_id,
+                week
+            )
+
+        except:
+
+            result[emp_id] = []
+
+    return result
+
+
+# ---------------------------------------------------
+# ADMIN UPDATE PROJECTION
+# ---------------------------------------------------
+
+def admin_update_projection(
+        user_id,
+        week,
+        customer,
+        product,
+        new_qty):
+
+    wb, ws = _employee_sheet(user_id)
+
+    row = _find_row(
+        ws,
+        week,
+        customer,
+        product
+    )
+
+    if not row:
+
+        raise ValueError(
+            "Row not found."
         )
 
     row[3].value = new_qty
 
     wb.save(FILE_NAME)
 
-    return {"success": True}
+    return {
+
+        "success": True
+
+    }
 
 
-# ─────────────────────────────────────────────
-# CHANGE REQUESTS
-# ─────────────────────────────────────────────
+# ---------------------------------------------------
+# RAISE CHANGE REQUEST
+# ---------------------------------------------------
 
 def raise_change_request(
-    employee_id,
-    week,
-    customer,
-    product,
-    old_qty,
-    new_qty,
-    reason
-):
+        employee_id,
+        week,
+        customer,
+        product,
+        old_qty,
+        new_qty,
+        reason):
 
     wb, ws = _cr_sheet()
 
-    rid = str(uuid.uuid4())
+    request_id = str(
+        uuid.uuid4()
+    )
 
     ws.append([
 
-        rid,
+        request_id,
         employee_id,
         week,
         customer,
@@ -328,26 +374,28 @@ def raise_change_request(
     return {
 
         "success": True,
-        "request_id": rid
+        "request_id": request_id
 
     }
 
 
+# ---------------------------------------------------
+# GET CHANGE REQUESTS
+# ---------------------------------------------------
+
 def get_change_requests(
-    employee_ids=None,
-    status=None
-):
+        employee_ids=None,
+        status=None):
 
     wb, ws = _cr_sheet()
 
     data = []
 
     for row in ws.iter_rows(
-        min_row=2,
-        values_only=True
-    ):
+            min_row=2,
+            values_only=True):
 
-        record = {
+        item = {
 
             "request_id": row[0],
             "employee_id": row[1],
@@ -363,22 +411,31 @@ def get_change_requests(
 
         }
 
-        if employee_ids and record["employee_id"] not in employee_ids:
-            continue
+        if employee_ids:
 
-        if status and record["status"] != status:
-            continue
+            if item["employee_id"] not in employee_ids:
 
-        data.append(record)
+                continue
+
+        if status:
+
+            if item["status"] != status:
+
+                continue
+
+        data.append(item)
 
     return data
 
 
+# ---------------------------------------------------
+# RESOLVE CHANGE REQUEST
+# ---------------------------------------------------
+
 def resolve_change_request(
-    request_id,
-    action,
-    manager_note=""
-):
+        request_id,
+        action,
+        manager_note=""):
 
     wb, ws = _cr_sheet()
 
@@ -387,6 +444,7 @@ def resolve_change_request(
         if row[0].value == request_id:
 
             row[8].value = action
+
             row[9].value = manager_note
 
             if action == "approved":
@@ -403,9 +461,13 @@ def resolve_change_request(
 
             wb.save(FILE_NAME)
 
-            return {"success": True}
+            return {
+
+                "success": True
+
+            }
 
     raise ValueError(
-        "Request not found"
+        "Request not found."
     )
 ```
