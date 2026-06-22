@@ -1003,47 +1003,77 @@ def manager_dashboard_stats(manager_id:int):
             {"manager_id":manager_id}
         ).scalar()
 
-        # Pending tasks
+        # Total tasks assigned to team
+        total_tasks = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE assigned_to IN(
+                    SELECT employee_id
+                    FROM team_members
+                    WHERE manager_id=:manager_id
+                )
+            """),
+            {"manager_id":manager_id}
+        ).scalar()
+
+        # Completed tasks
+        completed_tasks = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE assigned_to IN(
+                    SELECT employee_id
+                    FROM team_members
+                    WHERE manager_id=:manager_id
+                )
+                AND LOWER(status)='completed'
+            """),
+            {"manager_id":manager_id}
+        ).scalar()
+
+        # Pending tasks (not completed)
         pending_tasks = conn.execute(
             text("""
                 SELECT COUNT(*)
                 FROM tasks
                 WHERE assigned_to IN(
-
                     SELECT employee_id
                     FROM team_members
                     WHERE manager_id=:manager_id
-
                 )
                 AND LOWER(status)!='completed'
             """),
             {"manager_id":manager_id}
         ).scalar()
 
-        # Tasks for review
+        # Tasks pending review
         review_tasks = conn.execute(
             text("""
                 SELECT COUNT(*)
                 FROM tasks
                 WHERE assigned_to IN(
-
                     SELECT employee_id
                     FROM team_members
                     WHERE manager_id=:manager_id
-
                 )
-                AND LOWER(status)='submitted'
+                AND LOWER(status)='pending review'
             """),
             {"manager_id":manager_id}
         ).scalar()
 
+    # Productivity = completed / total * 100
+    productivity = 0
+    if total_tasks and total_tasks > 0:
+        productivity = round(completed_tasks * 100 / total_tasks)
+
     return {
-
-        "team_members": team_members or 0,
-        "pending_tasks": pending_tasks or 0,
-        "review_tasks": review_tasks or 0,
-        "productivity": 0
-
+        "team_members":   team_members   or 0,
+        "total_tasks":    total_tasks    or 0,
+        "completed_tasks": completed_tasks or 0,
+        "pending_tasks":  pending_tasks  or 0,
+        "review_tasks":   review_tasks   or 0,
+        "productivity":   productivity
     }
 
 @app.get("/manager-tasks")
