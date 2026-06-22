@@ -1,24 +1,3 @@
-# excel_helper.py
-
-excel_helper.py
-────────────────────────────────────
-Panache Sales Tracker using Excel
-
-Workbook:
-sales_tracker.xlsx
-
-Sheets:
-Employee_{user_id}
-ChangeRequests
-
-Employee sheet columns:
-week | customer | product | projected | price | achieved
-
-ChangeRequests columns:
-request_id | employee_id | week | customer | product |
-old_qty | new_qty | reason | status |
-manager_note | created_at
-"""
 
 import os
 import uuid
