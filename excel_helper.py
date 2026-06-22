@@ -36,20 +36,16 @@ CR_HEADERS = [
 
 def _get_workbook():
 
-    try:
+    if os.path.exists(FILE_NAME):
+        return load_workbook(FILE_NAME)
 
-        wb = load_workbook(FILE_NAME)
+    wb = Workbook()
 
-    except Exception:
+    ws = wb.active
+    ws.title = "ChangeRequests"
+    ws.append(CR_HEADERS)
 
-        wb = Workbook()
-
-        ws = wb.active
-        ws.title = "ChangeRequests"
-
-        ws.append(CR_HEADERS)
-
-        wb.save(FILE_NAME)
+    wb.save(FILE_NAME)
 
     return wb
 
