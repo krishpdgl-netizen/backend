@@ -1977,11 +1977,20 @@ def testfiles():
 @app.get("/sales/test-add")
 def sales_test_add():
 
-    return add_projection(
-        user_id=11,
-        week=current_week(),
-        customer="ABC Company",
-        product="Router",
-        projected=10,
-        price=500
-    )
+    try:
+
+        return add_projection(
+            user_id=11,
+            week=current_week(),
+            customer="XYZ Company",
+            product="Switch",
+            projected=25,
+            price=800
+        )
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
