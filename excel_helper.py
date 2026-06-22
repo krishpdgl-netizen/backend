@@ -1,7 +1,5 @@
 # excel_helper.py
 
-```python
-"""
 excel_helper.py
 ────────────────────────────────────
 Panache Sales Tracker using Excel
@@ -470,4 +468,3 @@ def resolve_change_request(
     raise ValueError(
         "Request not found."
     )
-```
