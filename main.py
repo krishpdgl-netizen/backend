@@ -1974,3 +1974,14 @@ def testfiles():
         return {
             "error": str(e)
         }
+@app.get("/sales/test-add")
+def sales_test_add():
+
+    return add_projection(
+        user_id=11,
+        week=current_week(),
+        customer="ABC Company",
+        product="Router",
+        projected=10,
+        price=500
+    )
