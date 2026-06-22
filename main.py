@@ -1915,6 +1915,135 @@ def download_sales():
         filename="sales_tracker.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+
+# ----------------------------------------------------------
+# REMINDER: employees who haven't filled projections
+# ----------------------------------------------------------
+
+@app.get("/sales/reminder-status")
+def sales_reminder_status(viewer_id: int, viewer_role: str):
+    """
+    Returns two lists:
+      - filled:   employee IDs/names who have projections for the current week
+      - missing:  employee IDs/names who have NOT filled projections yet
+
+    For employees: returns only their own status.
+    For managers:  returns status for their team.
+    For admins:    returns status for all employees.
+    """
+    cw = current_week()
+
+    with engine.connect() as conn:
+
+        if viewer_role == "employee":
+            rows = conn.execute(
+                text("""
+                    SELECT id, full_name, email
+                    FROM users WHERE id = :uid
+                """),
+                {"uid": viewer_id}
+            ).fetchall()
+
+        elif viewer_role == "manager":
+            team = _team_member_ids(viewer_id, conn)
+            if not team:
+                return {"week": cw, "filled": [], "missing": []}
+            placeholders = ",".join(str(i) for i in team)
+            rows = conn.execute(
+                text(f"""
+                    SELECT id, full_name, email
+                    FROM users
+                    WHERE id IN ({placeholders})
+                """)
+            ).fetchall()
+
+        elif viewer_role == "admin":
+            rows = conn.execute(
+                text("""
+                    SELECT id, full_name, email
+                    FROM users
+                    WHERE role = 'employee'
+                """)
+            ).fetchall()
+
+        else:
+            return {"week": cw, "filled": [], "missing": []}
+
+    filled  = []
+    missing = []
+
+    for row in rows:
+        sales = get_sales(row.id, cw)
+        entry = {
+            "id":    row.id,
+            "name":  row.full_name,
+            "email": row.email
+        }
+        if sales:
+            filled.append(entry)
+        else:
+            missing.append(entry)
+
+    return {
+        "week":    cw,
+        "filled":  filled,
+        "missing": missing
+    }
+
+
+# ----------------------------------------------------------
+# MANAGER: add projection on behalf of self (as sales rep)
+# ----------------------------------------------------------
+
+@app.post("/sales/manager-projection")
+def manager_projection(
+    manager_id: int,
+    week:       int,
+    customer:   str,
+    product:    str,
+    projected:  int,
+    price:      float
+):
+    """
+    Managers can also fill their own projections.
+    No week-lock — managers can edit any week they own.
+    """
+    try:
+        return add_projection(
+            manager_id,
+            week,
+            customer,
+            product,
+            projected,
+            price
+        )
+    except ValueError as e:
+        return {"success": False, "message": str(e)}
+
+
+# ----------------------------------------------------------
+# MANAGER: update achieved for own rows
+# ----------------------------------------------------------
+
+@app.put("/sales/manager-achieved")
+def manager_achieved(
+    manager_id: int,
+    week:       int,
+    customer:   str,
+    product:    str,
+    achieved:   int
+):
+    try:
+        return update_achieved(
+            manager_id,
+            week,
+            customer,
+            product,
+            achieved
+        )
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 from openpyxl import load_workbook
 import os
 
