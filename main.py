@@ -2,7 +2,9 @@ from fastapi import FastAPI
 from sqlalchemy import create_engine
 from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
-
+from typing import Optional 
+from excel_helper import 
+( add_projection, get_sales, update_achieved, get_all_weeks, get_sales_for_employees, admin_update_projection, raise_change_request, get_change_requests, resolve_change_request, current_week )
 
 
 app = FastAPI()
@@ -1403,3 +1405,504 @@ def update_role(user_id: int, new_role: str):
         conn.commit()
  
     return {"success": True}
+
+
+
+# ==========================================================
+# SALES DASHBOARD ROUTES
+# ==========================================================
+
+from typing import Optional
+
+
+# ----------------------------------------------------------
+# TEAM MEMBER IDS
+# ----------------------------------------------------------
+
+def _team_member_ids(manager_id: int, conn):
+
+    rows = conn.execute(
+        text("""
+            SELECT employee_id
+            FROM team_members
+            WHERE manager_id=:manager_id
+        """),
+        {"manager_id": manager_id}
+    ).fetchall()
+
+    return [row.employee_id for row in rows]
+
+
+# ----------------------------------------------------------
+# CURRENT WEEK
+# ----------------------------------------------------------
+
+@app.get("/sales/current-week")
+def sales_current_week():
+
+    return {
+
+        "week": current_week()
+
+    }
+
+
+# ----------------------------------------------------------
+# ADD PROJECTION
+# ----------------------------------------------------------
+
+@app.post("/sales/projection")
+def sales_projection(
+    user_id: int,
+    week: int,
+    customer: str,
+    product: str,
+    projected: int,
+    price: float
+):
+
+    if week != current_week():
+
+        return {
+
+            "success": False,
+            "message": "Projections can only be added for current week."
+
+        }
+
+    try:
+
+        return add_projection(
+
+            user_id=user_id,
+            week=week,
+            customer=customer,
+            product=product,
+            projected=projected,
+            price=price
+
+        )
+
+    except Exception as e:
+
+        return {
+
+            "success": False,
+            "message": str(e)
+
+        }
+
+
+# ----------------------------------------------------------
+# GET SALES ROWS
+# ----------------------------------------------------------
+
+@app.get("/sales/rows")
+def sales_rows(
+    user_id: int,
+    week: int,
+    viewer_id: int,
+    viewer_role: str
+):
+
+    if viewer_role == "employee":
+
+        if viewer_id != user_id:
+
+            return {
+
+                "success": False,
+                "message": "Access denied"
+
+            }
+
+    elif viewer_role == "manager":
+
+        with engine.connect() as conn:
+
+            team = _team_member_ids(
+                viewer_id,
+                conn
+            )
+
+        if user_id not in team:
+
+            return {
+
+                "success": False,
+                "message": "Not your team member"
+
+            }
+
+    return {
+
+        "rows": get_sales(
+            user_id,
+            week
+        )
+
+    }
+
+
+# ----------------------------------------------------------
+# GET WEEKS
+# ----------------------------------------------------------
+
+@app.get("/sales/weeks")
+def sales_weeks(
+    user_id: int,
+    viewer_id: int,
+    viewer_role: str
+):
+
+    if viewer_role == "employee":
+
+        if viewer_id != user_id:
+
+            return {
+
+                "success": False
+
+            }
+
+    elif viewer_role == "manager":
+
+        with engine.connect() as conn:
+
+            team = _team_member_ids(
+                viewer_id,
+                conn
+            )
+
+        if user_id not in team:
+
+            return {
+
+                "success": False
+
+            }
+
+    return {
+
+        "weeks": get_all_weeks(
+            user_id
+        )
+
+    }
+
+
+# ----------------------------------------------------------
+# UPDATE ACHIEVED
+# ----------------------------------------------------------
+
+@app.put("/sales/achieved")
+def sales_achieved(
+    user_id: int,
+    week: int,
+    customer: str,
+    product: str,
+    achieved: int
+):
+
+    if week != current_week():
+
+        return {
+
+            "success": False,
+            "message": "Only current week editable."
+
+        }
+
+    try:
+
+        return update_achieved(
+
+            user_id,
+            week,
+            customer,
+            product,
+            achieved
+
+        )
+
+    except Exception as e:
+
+        return {
+
+            "success": False,
+            "message": str(e)
+
+        }
+
+
+# ----------------------------------------------------------
+# TEAM SALES
+# ----------------------------------------------------------
+
+@app.get("/sales/team")
+def sales_team(
+    manager_id: int,
+    week: int,
+    viewer_role: str
+):
+
+    with engine.connect() as conn:
+
+        if viewer_role == "admin":
+
+            rows = conn.execute(
+                text("""
+                    SELECT id
+                    FROM users
+                    WHERE role='employee'
+                """)
+            ).fetchall()
+
+            employee_ids = [row.id for row in rows]
+
+        else:
+
+            employee_ids = _team_member_ids(
+                manager_id,
+                conn
+            )
+
+    data = get_sales_for_employees(
+        employee_ids,
+        week
+    )
+
+    names = {}
+
+    if employee_ids:
+
+        placeholders = ",".join(
+            str(i)
+            for i in employee_ids
+        )
+
+        with engine.connect() as conn:
+
+            rows = conn.execute(
+                text(f"""
+                    SELECT
+                    id,
+                    full_name
+
+                    FROM users
+
+                    WHERE id IN ({placeholders})
+                """)
+            ).fetchall()
+
+        names = {
+
+            row.id: row.full_name
+
+            for row in rows
+
+        }
+
+    result = []
+
+    for emp_id in employee_ids:
+
+        result.append({
+
+            "id": emp_id,
+            "name": names.get(
+                emp_id,
+                f"Employee {emp_id}"
+            ),
+            "rows": data.get(
+                emp_id,
+                []
+            )
+
+        })
+
+    return {
+
+        "week": week,
+        "employees": result
+
+    }
+
+
+# ----------------------------------------------------------
+# ADMIN / MANAGER EDIT PROJECTION
+# ----------------------------------------------------------
+
+@app.put("/sales/projection/admin-edit")
+def admin_edit_projection_route(
+    viewer_role: str,
+    user_id: int,
+    week: int,
+    customer: str,
+    product: str,
+    new_qty: int
+):
+
+    if viewer_role not in [
+
+        "admin",
+        "manager"
+
+    ]:
+
+        return {
+
+            "success": False
+
+        }
+
+    try:
+
+        return admin_update_projection(
+
+            user_id,
+            week,
+            customer,
+            product,
+            new_qty
+
+        )
+
+    except Exception as e:
+
+        return {
+
+            "success": False,
+            "message": str(e)
+
+        }
+
+
+# ----------------------------------------------------------
+# CHANGE REQUEST
+# ----------------------------------------------------------
+
+@app.post("/sales/change-request")
+def sales_change_request(
+    employee_id: int,
+    week: int,
+    customer: str,
+    product: str,
+    old_qty: int,
+    new_qty: int,
+    reason: str
+):
+
+    return raise_change_request(
+
+        employee_id,
+        week,
+        customer,
+        product,
+        old_qty,
+        new_qty,
+        reason
+
+    )
+
+
+# ----------------------------------------------------------
+# LIST CHANGE REQUESTS
+# ----------------------------------------------------------
+
+@app.get("/sales/change-requests")
+def list_change_requests(
+    viewer_id: int,
+    viewer_role: str,
+    status: Optional[str] = None
+):
+
+    if viewer_role == "employee":
+
+        requests = get_change_requests(
+
+            employee_ids=[viewer_id],
+            status=status
+
+        )
+
+    elif viewer_role == "manager":
+
+        with engine.connect() as conn:
+
+            team = _team_member_ids(
+                viewer_id,
+                conn
+            )
+
+        requests = get_change_requests(
+
+            employee_ids=team,
+            status=status
+
+        )
+
+    elif viewer_role == "admin":
+
+        requests = get_change_requests(
+
+            employee_ids=None,
+            status=status
+
+        )
+
+    else:
+
+        requests = []
+
+    return {
+
+        "requests": requests
+
+    }
+
+
+# ----------------------------------------------------------
+# RESOLVE CHANGE REQUEST
+# ----------------------------------------------------------
+
+@app.post("/sales/change-request/resolve")
+def resolve_request(
+    request_id: str,
+    action: str,
+    manager_note: str = "",
+    viewer_role: str = ""
+):
+
+    if viewer_role not in [
+
+        "admin",
+        "manager"
+
+    ]:
+
+        return {
+
+            "success": False
+
+        }
+
+    try:
+
+        return resolve_change_request(
+
+            request_id,
+            action,
+            manager_note
+
+        )
+
+    except Exception as e:
+
+        return {
+
+            "success": False,
+            "message": str(e)
+
+        }
+```
