@@ -1,4 +1,3 @@
-
 import os
 import uuid
 import datetime
@@ -413,36 +412,52 @@ def resolve_change_request(
         action,
         manager_note=""):
 
-    wb, ws = _cr_sheet()
+    # Load the workbook ONCE so all edits stay in the same
+    # object before one final save.  The old code called
+    # admin_update_projection() which opened, edited and saved
+    # the file independently; then wb.save() here overwrote
+    # that employee-sheet edit with the stale in-memory copy.
+    wb = _get_workbook()
+    ws = wb["ChangeRequests"]
 
     for row in ws.iter_rows(min_row=2):
 
         if row[0].value == request_id:
 
             row[8].value = action
-
             row[9].value = manager_note
 
             if action == "approved":
 
-                admin_update_projection(
+                emp_id   = row[1].value
+                week     = row[2].value
+                customer = row[3].value
+                product  = row[4].value
+                new_qty  = row[6].value
 
-                    row[1].value,
-                    row[2].value,
-                    row[3].value,
-                    row[4].value,
-                    row[6].value
+                sheet_name = f"Employee_{emp_id}"
 
+                if sheet_name not in wb.sheetnames:
+                    raise ValueError(
+                        f"Sheet {sheet_name} not found."
+                    )
+
+                emp_ws   = wb[sheet_name]
+                proj_row = _find_row(
+                    emp_ws, week, customer, product
                 )
 
+                if not proj_row:
+                    raise ValueError(
+                        "Projection row not found in employee sheet."
+                    )
+
+                proj_row[3].value = int(new_qty)
+
+            # Single save covers both the CR status
+            # and the updated projection quantity
             wb.save(FILE_NAME)
 
-            return {
+            return {"success": True}
 
-                "success": True
-
-            }
-
-    raise ValueError(
-        "Request not found."
-    )
+    raise ValueError("Request not found.")
