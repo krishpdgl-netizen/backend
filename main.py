@@ -1904,3 +1904,14 @@ def resolve_request(
             "message": str(e)
 
         }
+
+from fastapi.responses import FileResponse
+
+@app.get("/sales/download")
+def download_sales():
+
+    return FileResponse(
+        "sales_tracker.xlsx",
+        filename="sales_tracker.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
