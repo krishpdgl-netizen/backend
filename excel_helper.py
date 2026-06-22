@@ -36,7 +36,11 @@ CR_HEADERS = [
 
 def _get_workbook():
 
-    if not os.path.exists(FILE_NAME):
+    try:
+
+        wb = load_workbook(FILE_NAME)
+
+    except Exception:
 
         wb = Workbook()
 
@@ -47,7 +51,7 @@ def _get_workbook():
 
         wb.save(FILE_NAME)
 
-    return load_workbook(FILE_NAME)
+    return wb
 
 
 # ---------------------------------------------------
