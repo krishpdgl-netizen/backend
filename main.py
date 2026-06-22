@@ -1957,3 +1957,20 @@ def test123():
     return {
         "ok": True
     }
+import os
+
+@app.get("/testfiles")
+def testfiles():
+
+    try:
+
+        return {
+            "cwd": os.getcwd(),
+            "files": os.listdir(".")
+        }
+
+    except Exception as e:
+
+        return {
+            "error": str(e)
+        }
