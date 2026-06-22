@@ -3,8 +3,7 @@ from sqlalchemy import create_engine
 from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional 
-from excel_helper import 
-( add_projection, get_sales, update_achieved, get_all_weeks, get_sales_for_employees, admin_update_projection, raise_change_request, get_change_requests, resolve_change_request, current_week )
+from excel_helper import ( add_projection, get_sales, update_achieved, get_all_weeks, get_sales_for_employees, admin_update_projection, raise_change_request, get_change_requests, resolve_change_request, current_week )
 
 
 app = FastAPI()
