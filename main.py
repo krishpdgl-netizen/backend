@@ -835,6 +835,16 @@ def approve_task(task_id:int):
 
     with engine.connect() as conn:
 
+        # Fetch task details before updating so we can log to history
+        task = conn.execute(
+            text("""
+                SELECT *
+                FROM tasks
+                WHERE id=:id
+            """),
+            {"id":task_id}
+        ).fetchone()
+
         conn.execute(
             text("""
                 UPDATE tasks
@@ -843,6 +853,22 @@ def approve_task(task_id:int):
             """),
             {"id":task_id}
         )
+
+        # Insert into task_history so the employee's History page is populated
+        if task:
+            conn.execute(
+                text("""
+                    INSERT INTO task_history
+                    (task_id, employee_id, task_title)
+                    VALUES
+                    (:task_id, :employee_id, :task_title)
+                """),
+                {
+                    "task_id":    task.id,
+                    "employee_id": task.assigned_to,
+                    "task_title":  task.title
+                }
+            )
 
         conn.commit()
 
