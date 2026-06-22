@@ -1952,3 +1952,8 @@ def debug_path():
         "files": os.listdir()
 
     }
+@app.get("/test123")
+def test123():
+    return {
+        "ok": True
+    }
