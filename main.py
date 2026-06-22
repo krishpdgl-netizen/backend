@@ -1915,13 +1915,28 @@ def download_sales():
         filename="sales_tracker.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+from openpyxl import load_workbook
+import os
+
 @app.get("/sales/debug")
-def debug():
+def sales_debug():
 
-    wb = load_workbook(FILE_NAME)
+    try:
 
-    return {
+        exists = os.path.exists(FILE_NAME)
 
-        "sheets": wb.sheetnames
+        wb = load_workbook(FILE_NAME)
 
-    }
+        return {
+            "file_name": FILE_NAME,
+            "exists": exists,
+            "sheets": wb.sheetnames
+        }
+
+    except Exception as e:
+
+        return {
+            "file_name": FILE_NAME,
+            "exists": os.path.exists(FILE_NAME),
+            "error": str(e)
+        }
