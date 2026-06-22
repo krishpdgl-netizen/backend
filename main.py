@@ -1940,3 +1940,15 @@ def sales_debug():
             "exists": os.path.exists(FILE_NAME),
             "error": str(e)
         }
+@app.get("/sales/debug-path")
+def debug_path():
+
+    import os
+
+    return {
+
+        "cwd": os.getcwd(),
+
+        "files": os.listdir()
+
+    }
