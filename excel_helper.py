@@ -3,7 +3,11 @@ import uuid
 import datetime
 from openpyxl import Workbook, load_workbook
 
-FILE_NAME = "sales_tracker.xlsx"
+# Store on Railway persistent volume so data survives deploys.
+# Railway sets RAILWAY_VOLUME_MOUNT_PATH automatically when a volume
+# is attached. Falls back to current directory for local dev.
+_VOLUME   = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", ".")
+FILE_NAME = os.path.join(_VOLUME, "sales_tracker.xlsx")
 
 SALES_HEADERS = [
     "week",
@@ -412,52 +416,36 @@ def resolve_change_request(
         action,
         manager_note=""):
 
-    # Load the workbook ONCE so all edits stay in the same
-    # object before one final save.  The old code called
-    # admin_update_projection() which opened, edited and saved
-    # the file independently; then wb.save() here overwrote
-    # that employee-sheet edit with the stale in-memory copy.
-    wb = _get_workbook()
-    ws = wb["ChangeRequests"]
+    wb, ws = _cr_sheet()
 
     for row in ws.iter_rows(min_row=2):
 
         if row[0].value == request_id:
 
             row[8].value = action
+
             row[9].value = manager_note
 
             if action == "approved":
 
-                emp_id   = row[1].value
-                week     = row[2].value
-                customer = row[3].value
-                product  = row[4].value
-                new_qty  = row[6].value
+                admin_update_projection(
 
-                sheet_name = f"Employee_{emp_id}"
+                    row[1].value,
+                    row[2].value,
+                    row[3].value,
+                    row[4].value,
+                    row[6].value
 
-                if sheet_name not in wb.sheetnames:
-                    raise ValueError(
-                        f"Sheet {sheet_name} not found."
-                    )
-
-                emp_ws   = wb[sheet_name]
-                proj_row = _find_row(
-                    emp_ws, week, customer, product
                 )
 
-                if not proj_row:
-                    raise ValueError(
-                        "Projection row not found in employee sheet."
-                    )
-
-                proj_row[3].value = int(new_qty)
-
-            # Single save covers both the CR status
-            # and the updated projection quantity
             wb.save(FILE_NAME)
 
-            return {"success": True}
+            return {
 
-    raise ValueError("Request not found.")
+                "success": True
+
+            }
+
+    raise ValueError(
+        "Request not found."
+    )
