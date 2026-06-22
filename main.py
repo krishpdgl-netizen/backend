@@ -1921,25 +1921,25 @@ import os
 @app.get("/sales/debug")
 def sales_debug():
 
-    try:
+    from openpyxl import load_workbook
 
-        exists = os.path.exists(FILE_NAME)
+    wb = load_workbook("sales_tracker.xlsx")
 
-        wb = load_workbook(FILE_NAME)
+    output = {}
 
-        return {
-            "file_name": FILE_NAME,
-            "exists": exists,
-            "sheets": wb.sheetnames
-        }
+    for sheet in wb.sheetnames:
 
-    except Exception as e:
+        ws = wb[sheet]
 
-        return {
-            "file_name": FILE_NAME,
-            "exists": os.path.exists(FILE_NAME),
-            "error": str(e)
-        }
+        rows=[]
+
+        for row in ws.iter_rows(values_only=True):
+
+            rows.append(row)
+
+        output[sheet]=rows
+
+    return output
 @app.get("/sales/debug-path")
 def debug_path():
 
