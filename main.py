@@ -2189,3 +2189,12 @@ def get_manager_remarks(manager_id: int):
         ).fetchall()
 
     return [dict(r._mapping) for r in rows]
+@app.get("/debug-env")
+def debug_env():
+    import os
+    return {
+        "RAILWAY_VOLUME_MOUNT_PATH": os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "NOT SET"),
+        "FILE_NAME": FILE_NAME,
+        "data_dir_exists": os.path.exists("/data"),
+        "data_dir_files": os.listdir("/data") if os.path.exists("/data") else "directory not found"
+    }
