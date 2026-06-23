@@ -6,6 +6,8 @@ from typing import Optional
 from excel_helper import ( add_projection, get_sales, update_achieved, get_all_weeks, get_sales_for_employees, admin_update_projection, raise_change_request, get_change_requests, resolve_change_request, current_week )
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from excel_helper import FILE_NAME
+
 
 app = FastAPI()
 app.add_middleware(
@@ -2198,3 +2200,26 @@ def debug_env():
         "data_dir_exists": os.path.exists("/data"),
         "data_dir_files": os.listdir("/data") if os.path.exists("/data") else "directory not found"
     }
+
+
+@app.get("/sales/download")
+def download_sales():
+    return FileResponse(
+        FILE_NAME,
+        filename="sales_tracker.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+
+@app.get("/sales/debug")
+def sales_debug():
+    from excel_helper import FILE_NAME
+    wb = load_workbook(FILE_NAME)  # ← was hardcoded "sales_tracker.xlsx"
+    output = {}
+    for sheet in wb.sheetnames:
+        ws = wb[sheet]
+        rows = []
+        for row in ws.iter_rows(values_only=True):
+            rows.append(row)
+        output[sheet] = rows
+    return output
