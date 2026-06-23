@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File as FastAPIFile
 from sqlalchemy import create_engine
 from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
@@ -1915,135 +1915,6 @@ def download_sales():
         filename="sales_tracker.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
-
-# ----------------------------------------------------------
-# REMINDER: employees who haven't filled projections
-# ----------------------------------------------------------
-
-@app.get("/sales/reminder-status")
-def sales_reminder_status(viewer_id: int, viewer_role: str):
-    """
-    Returns two lists:
-      - filled:   employee IDs/names who have projections for the current week
-      - missing:  employee IDs/names who have NOT filled projections yet
-
-    For employees: returns only their own status.
-    For managers:  returns status for their team.
-    For admins:    returns status for all employees.
-    """
-    cw = current_week()
-
-    with engine.connect() as conn:
-
-        if viewer_role == "employee":
-            rows = conn.execute(
-                text("""
-                    SELECT id, full_name, email
-                    FROM users WHERE id = :uid
-                """),
-                {"uid": viewer_id}
-            ).fetchall()
-
-        elif viewer_role == "manager":
-            team = _team_member_ids(viewer_id, conn)
-            if not team:
-                return {"week": cw, "filled": [], "missing": []}
-            placeholders = ",".join(str(i) for i in team)
-            rows = conn.execute(
-                text(f"""
-                    SELECT id, full_name, email
-                    FROM users
-                    WHERE id IN ({placeholders})
-                """)
-            ).fetchall()
-
-        elif viewer_role == "admin":
-            rows = conn.execute(
-                text("""
-                    SELECT id, full_name, email
-                    FROM users
-                    WHERE role = 'employee'
-                """)
-            ).fetchall()
-
-        else:
-            return {"week": cw, "filled": [], "missing": []}
-
-    filled  = []
-    missing = []
-
-    for row in rows:
-        sales = get_sales(row.id, cw)
-        entry = {
-            "id":    row.id,
-            "name":  row.full_name,
-            "email": row.email
-        }
-        if sales:
-            filled.append(entry)
-        else:
-            missing.append(entry)
-
-    return {
-        "week":    cw,
-        "filled":  filled,
-        "missing": missing
-    }
-
-
-# ----------------------------------------------------------
-# MANAGER: add projection on behalf of self (as sales rep)
-# ----------------------------------------------------------
-
-@app.post("/sales/manager-projection")
-def manager_projection(
-    manager_id: int,
-    week:       int,
-    customer:   str,
-    product:    str,
-    projected:  int,
-    price:      float
-):
-    """
-    Managers can also fill their own projections.
-    No week-lock — managers can edit any week they own.
-    """
-    try:
-        return add_projection(
-            manager_id,
-            week,
-            customer,
-            product,
-            projected,
-            price
-        )
-    except ValueError as e:
-        return {"success": False, "message": str(e)}
-
-
-# ----------------------------------------------------------
-# MANAGER: update achieved for own rows
-# ----------------------------------------------------------
-
-@app.put("/sales/manager-achieved")
-def manager_achieved(
-    manager_id: int,
-    week:       int,
-    customer:   str,
-    product:    str,
-    achieved:   int
-):
-    try:
-        return update_achieved(
-            manager_id,
-            week,
-            customer,
-            product,
-            achieved
-        )
-    except Exception as e:
-        return {"success": False, "message": str(e)}
 from openpyxl import load_workbook
 import os
 
@@ -2123,3 +1994,187 @@ def sales_test_add():
             "success": False,
             "error": str(e)
         }
+
+
+# ═══════════════════════════════════════════════════════
+# TASK FILE ATTACHMENT
+# ═══════════════════════════════════════════════════════
+# Run once to add the column (idempotent):
+#   ALTER TABLE tasks ADD COLUMN IF NOT EXISTS file_url TEXT;
+#   ALTER TABLE tasks ADD COLUMN IF NOT EXISTS file_name TEXT;
+
+import shutil, os as _os
+
+UPLOAD_DIR = _os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", ".") + "/task_files"
+_os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.post("/submit-task-with-file")
+async def submit_task_with_file(
+    task_id: int,
+    file: UploadFile = FastAPIFile(None)
+):
+    """
+    Employee calls this instead of /update-task-status when submitting
+    for review with an optional file attachment.
+    Saves the file to the persistent volume and stores the path in tasks.
+    """
+    file_url  = None
+    file_name = None
+
+    if file and file.filename:
+        safe_name = f"{task_id}_{file.filename.replace(' ', '_')}"
+        dest      = f"{UPLOAD_DIR}/{safe_name}"
+        with open(dest, "wb") as buf:
+            shutil.copyfileobj(file.file, buf)
+        file_url  = f"/task-file/{safe_name}"
+        file_name = file.filename
+
+    with engine.connect() as conn:
+        conn.execute(
+            text("""
+                UPDATE tasks
+                SET status    = 'Pending Review',
+                    file_url  = :file_url,
+                    file_name = :file_name
+                WHERE id = :task_id
+            """),
+            {"task_id": task_id, "file_url": file_url, "file_name": file_name}
+        )
+        conn.commit()
+
+    return {"success": True, "file_url": file_url, "file_name": file_name}
+
+
+from fastapi.responses import FileResponse as _FileResp
+
+@app.get("/task-file/{filename}")
+def serve_task_file(filename: str):
+    path = f"{UPLOAD_DIR}/{filename}"
+    if not _os.path.exists(path):
+        return {"error": "File not found"}
+    return _FileResp(path, filename=filename)
+
+
+# ═══════════════════════════════════════════════════════
+# TASK REMARKS (manager → employee corrections)
+# ═══════════════════════════════════════════════════════
+# Run once:
+#   CREATE TABLE IF NOT EXISTS task_remarks (
+#       id          SERIAL PRIMARY KEY,
+#       task_id     INT NOT NULL,
+#       manager_id  INT NOT NULL,
+#       employee_id INT NOT NULL,
+#       remark      TEXT NOT NULL,
+#       status      TEXT DEFAULT 'pending',   -- pending | resolved
+#       created_at  TIMESTAMP DEFAULT NOW()
+#   );
+
+@app.post("/send-remark")
+def send_remark(
+    task_id:     int,
+    manager_id:  int,
+    employee_id: int,
+    remark:      str
+):
+    """
+    Manager sends a correction remark on a task.
+    Also resets the task status back to 'In Progress' so employee
+    can fix and re-submit.
+    """
+    with engine.connect() as conn:
+
+        conn.execute(
+            text("""
+                INSERT INTO task_remarks
+                (task_id, manager_id, employee_id, remark, status)
+                VALUES
+                (:task_id, :manager_id, :employee_id, :remark, 'pending')
+            """),
+            {
+                "task_id":     task_id,
+                "manager_id":  manager_id,
+                "employee_id": employee_id,
+                "remark":      remark
+            }
+        )
+
+        # Push task back to In Progress so employee can re-submit
+        conn.execute(
+            text("""
+                UPDATE tasks
+                SET status = 'In Progress'
+                WHERE id = :task_id
+            """),
+            {"task_id": task_id}
+        )
+
+        conn.commit()
+
+    return {"success": True}
+
+
+@app.get("/task-remarks")
+def get_task_remarks(employee_id: int):
+    """
+    Returns all pending remarks for an employee across all tasks.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT
+                    tr.id,
+                    tr.task_id,
+                    tr.remark,
+                    tr.status,
+                    tr.created_at,
+                    t.title  AS task_title,
+                    u.full_name AS manager_name
+                FROM task_remarks tr
+                JOIN tasks t  ON tr.task_id    = t.id
+                JOIN users u  ON tr.manager_id = u.id
+                WHERE tr.employee_id = :employee_id
+                ORDER BY tr.created_at DESC
+            """),
+            {"employee_id": employee_id}
+        ).fetchall()
+
+    return [dict(r._mapping) for r in rows]
+
+
+@app.put("/resolve-remark")
+def resolve_remark(remark_id: int):
+    """Employee marks a remark as resolved after fixing."""
+    with engine.connect() as conn:
+        conn.execute(
+            text("UPDATE task_remarks SET status='resolved' WHERE id=:id"),
+            {"id": remark_id}
+        )
+        conn.commit()
+    return {"success": True}
+
+
+@app.get("/manager-remarks")
+def get_manager_remarks(manager_id: int):
+    """Returns all remarks sent by this manager, with current task status."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT
+                    tr.id,
+                    tr.task_id,
+                    tr.remark,
+                    tr.status      AS remark_status,
+                    tr.created_at,
+                    t.title        AS task_title,
+                    t.status       AS task_status,
+                    u.full_name    AS employee_name
+                FROM task_remarks tr
+                JOIN tasks t  ON tr.task_id     = t.id
+                JOIN users u  ON tr.employee_id = u.id
+                WHERE tr.manager_id = :manager_id
+                ORDER BY tr.created_at DESC
+            """),
+            {"manager_id": manager_id}
+        ).fetchall()
+
+    return [dict(r._mapping) for r in rows]
