@@ -1464,14 +1464,16 @@ def sales_current_week():
 # ADD PROJECTION
 # ----------------------------------------------------------
 
+from typing import Optional
+
 @app.post("/sales/projection")
-def sales_projection(
+def post_projection(
     user_id: int,
     week: int,
-    customer: str,
-    product: str,
-    projected: int,
-    price: float
+    customer: Optional[str] = "",
+    product: Optional[str] = "",
+    projected: Optional[int] = 0,
+    price: Optional[float] = 0
 ):
 
     if week != current_week():
