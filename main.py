@@ -1920,17 +1920,15 @@ def resolve_request(
 
 from fastapi.responses import FileResponse
 
+from excel_helper import FILE_NAME
+
 @app.get("/sales/download")
 def download_sales():
-
     return FileResponse(
-        "sales_tracker.xlsx",
+        FILE_NAME,  # ← now points to /data/sales_tracker.xlsx
         filename="sales_tracker.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-from openpyxl import load_workbook
-import os
-
 @app.get("/sales/debug")
 def sales_debug():
 
