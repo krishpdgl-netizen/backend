@@ -9,6 +9,16 @@ from openpyxl import Workbook, load_workbook
 _VOLUME   = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", ".")
 FILE_NAME = os.path.join(_VOLUME, "sales_tracker.xlsx")
 
+# ── SEED: if the volume file doesn't exist yet, copy the repo seed file ──────
+# When a Railway volume is first attached it is empty.  The repo contains a
+# pre-populated sales_tracker.xlsx at the project root.  We copy it once so
+# the volume starts with that data instead of a blank workbook.
+_REPO_SEED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sales_tracker.xlsx")
+if not os.path.exists(FILE_NAME) and os.path.exists(_REPO_SEED):
+    import shutil as _shutil
+    os.makedirs(_VOLUME, exist_ok=True)
+    _shutil.copy2(_REPO_SEED, FILE_NAME)
+
 SALES_HEADERS = [
     "week",
     "customer",
