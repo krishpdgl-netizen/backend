@@ -873,14 +873,15 @@ def approve_task(task_id:int):
             conn.execute(
                 text("""
                     INSERT INTO task_history
-                    (task_id, employee_id, task_title)
+                    (task_id, employee_id, task_title, submitted_at)
                     VALUES
-                    (:task_id, :employee_id, :task_title)
+                    (:task_id, :employee_id, :task_title, :submitted_at)
                 """),
                 {
-                    "task_id":    task.id,
-                    "employee_id": task.assigned_to,
-                    "task_title":  task.title
+                    "task_id":      task.id,
+                    "employee_id":  task.assigned_to,
+                    "task_title":   task.title,
+                    "submitted_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
                 }
             )
 
@@ -1127,148 +1128,26 @@ def manager_tasks(manager_id:int):
     return [dict(row._mapping) for row in rows]
 
 @app.post("/team/add")
-def add_team_member(manager_id: int, employee_id: int):
-    """
-    Replaced with a 2-step approval flow.
-    Manager calls this → creates a pending request for the employee to approve.
-    """
+def add_team_member(manager_id:int, employee_id:int):
+
     with engine.connect() as conn:
 
-        # Check if already on the team
-        already = conn.execute(
-            text("""
-                SELECT 1 FROM team_members
-                WHERE manager_id=:manager_id AND employee_id=:employee_id
-            """),
-            {"manager_id": manager_id, "employee_id": employee_id}
-        ).fetchone()
-
-        if already:
-            return {"success": False, "message": "Employee is already on your team."}
-
-        # Check if a pending request already exists
-        pending = conn.execute(
-            text("""
-                SELECT 1 FROM team_requests
-                WHERE manager_id=:manager_id AND employee_id=:employee_id
-                AND status='pending'
-            """),
-            {"manager_id": manager_id, "employee_id": employee_id}
-        ).fetchone()
-
-        if pending:
-            return {"success": False, "message": "A request is already pending for this employee."}
-
-        # Insert or re-use a rejected request
         conn.execute(
             text("""
-                INSERT INTO team_requests (manager_id, employee_id, status)
-                VALUES (:manager_id, :employee_id, 'pending')
-                ON CONFLICT (manager_id, employee_id)
-                DO UPDATE SET status='pending', created_at=NOW()
+                INSERT INTO team_members(manager_id, employee_id)
+                VALUES(:manager_id, :employee_id)
             """),
-            {"manager_id": manager_id, "employee_id": employee_id}
+            {
+                "manager_id":manager_id,
+                "employee_id":employee_id
+            }
         )
 
         conn.commit()
 
-    return {"success": True, "message": "Request sent. Waiting for employee approval."}
-
-
-# ── MANAGER: FETCH SENT REQUESTS ─────────────────────────────────
-@app.get("/team-requests/sent")
-def get_sent_requests(manager_id: int):
-    """Returns all requests sent by a manager with employee details."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT
-                    tr.id,
-                    tr.employee_id,
-                    tr.status,
-                    tr.created_at,
-                    u.full_name AS employee_name,
-                    u.email     AS employee_email
-                FROM team_requests tr
-                JOIN users u ON tr.employee_id = u.id
-                WHERE tr.manager_id = :manager_id
-                ORDER BY tr.created_at DESC
-            """),
-            {"manager_id": manager_id}
-        ).fetchall()
-    return [dict(r._mapping) for r in rows]
-
-
-# ── EMPLOYEE: FETCH INCOMING TEAM REQUESTS ────────────────────────
-@app.get("/team-requests")
-def get_team_requests(employee_id: int):
-    """Returns all pending team requests for an employee."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT
-                    tr.id,
-                    tr.manager_id,
-                    tr.status,
-                    tr.created_at,
-                    u.full_name  AS manager_name,
-                    u.email      AS manager_email
-                FROM team_requests tr
-                JOIN users u ON tr.manager_id = u.id
-                WHERE tr.employee_id = :employee_id
-                AND   tr.status      = 'pending'
-                ORDER BY tr.created_at DESC
-            """),
-            {"employee_id": employee_id}
-        ).fetchall()
-
-    return [dict(r._mapping) for r in rows]
-
-
-# ── EMPLOYEE: RESPOND TO TEAM REQUEST ────────────────────────────
-@app.post("/team-request/respond")
-def respond_team_request(request_id: int, action: str):
-    """
-    action = 'approved' or 'rejected'
-    If approved, the employee is added to team_members automatically.
-    """
-    if action not in ("approved", "rejected"):
-        return {"success": False, "message": "Invalid action."}
-
-    with engine.connect() as conn:
-
-        req = conn.execute(
-            text("""
-                SELECT manager_id, employee_id
-                FROM team_requests
-                WHERE id=:id AND status='pending'
-            """),
-            {"id": request_id}
-        ).fetchone()
-
-        if not req:
-            return {"success": False, "message": "Request not found or already resolved."}
-
-        # Update request status
-        conn.execute(
-            text("UPDATE team_requests SET status=:status WHERE id=:id"),
-            {"status": action, "id": request_id}
-        )
-
-        # If approved → add to team_members
-        if action == "approved":
-            conn.execute(
-                text("""
-                    INSERT INTO team_members (manager_id, employee_id)
-                    VALUES (:manager_id, :employee_id)
-                    ON CONFLICT DO NOTHING
-                """),
-                {"manager_id": req.manager_id, "employee_id": req.employee_id}
-            )
-
-        conn.commit()
-
-    return {"success": True}
+    return {
+        "success":True
+    }
 
 @app.get("/manager-report")
 def manager_report(manager_id:int):
