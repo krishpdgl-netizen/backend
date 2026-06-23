@@ -4,7 +4,8 @@ from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional 
 from excel_helper import ( add_projection, get_sales, update_achieved, get_all_weeks, get_sales_for_employees, admin_update_projection, raise_change_request, get_change_requests, resolve_change_request, current_week )
-
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 app = FastAPI()
 app.add_middleware(
@@ -407,19 +408,31 @@ def complete_task(task_id:int):
         )
 
         conn.execute(
-            text("""
-                INSERT INTO task_history
-                (task_id,employee_id,task_title)
-                VALUES
-                (:task_id,:employee_id,:task_title)
-            """),
-            {
-                "task_id":task.id,
-                "employee_id":task.assigned_to,
-                "task_title":task.title
-            }
+    text("""
+        INSERT INTO task_history
+        (
+            task_id,
+            employee_id,
+            task_title,
+            submitted_at
         )
-
+        VALUES
+        (
+            :task_id,
+            :employee_id,
+            :task_title,
+            :submitted_at
+        )
+    """),
+    {
+        "task_id": task.id,
+        "employee_id": task.assigned_to,
+        "task_title": task.title,
+        "submitted_at": datetime.now(
+            ZoneInfo("Asia/Kolkata")
+        ).isoformat()
+    }
+)
         conn.commit()
 
     return {"success":True}
