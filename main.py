@@ -1519,44 +1519,21 @@ def sales_rows(
     viewer_id: int,
     viewer_role: str
 ):
-
-    if viewer_role == "employee":
-
-        if viewer_id != user_id:
-
-            return {
-
-                "success": False,
-                "message": "Access denied"
-
-            }
-
+    if viewer_role == "admin":
+        pass  # admin can view anyone
     elif viewer_role == "manager":
+        # manager can view their own rows OR their team members'
+        if viewer_id != user_id:
+            with engine.connect() as conn:
+                team = _team_member_ids(viewer_id, conn)
+            if user_id not in team:
+                return {"success": False, "message": "Not your team member"}
+    else:
+        # employee can only view their own rows
+        if viewer_id != user_id:
+            return {"success": False, "message": "Access denied"}
 
-        with engine.connect() as conn:
-
-            team = _team_member_ids(
-                viewer_id,
-                conn
-            )
-
-        if user_id not in team:
-
-            return {
-
-                "success": False,
-                "message": "Not your team member"
-
-            }
-
-    return {
-
-        "rows": get_sales(
-            user_id,
-            week
-        )
-
-    }
+    return {"rows": get_sales(user_id, week)}
 
 
 # ----------------------------------------------------------
@@ -1569,41 +1546,20 @@ def sales_weeks(
     viewer_id: int,
     viewer_role: str
 ):
-
-    if viewer_role == "employee":
-
-        if viewer_id != user_id:
-
-            return {
-
-                "success": False
-
-            }
-
+    if viewer_role == "admin":
+        pass  # admin can view anyone
     elif viewer_role == "manager":
+        # manager can view own weeks OR team members'
+        if viewer_id != user_id:
+            with engine.connect() as conn:
+                team = _team_member_ids(viewer_id, conn)
+            if user_id not in team:
+                return {"success": False}
+    else:
+        if viewer_id != user_id:
+            return {"success": False}
 
-        with engine.connect() as conn:
-
-            team = _team_member_ids(
-                viewer_id,
-                conn
-            )
-
-        if user_id not in team:
-
-            return {
-
-                "success": False
-
-            }
-
-    return {
-
-        "weeks": get_all_weeks(
-            user_id
-        )
-
-    }
+    return {"weeks": get_all_weeks(user_id)}
 
 
 # ----------------------------------------------------------
@@ -1619,13 +1575,10 @@ def sales_achieved(
     achieved: int
 ):
 
-    if week != current_week():
-
+    if week < current_week():
         return {
-
             "success": False,
-            "message": "Only current week editable."
-
+            "message": "Only current or future weeks are editable."
         }
 
     try:
