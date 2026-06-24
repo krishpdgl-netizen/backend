@@ -3,7 +3,19 @@ from sqlalchemy import create_engine
 from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional 
-from excel_helper import ( add_projection, get_sales, update_achieved, get_all_weeks, get_sales_for_employees, admin_update_projection, raise_change_request, get_change_requests, resolve_change_request, current_week )
+from excel_helper import (
+    add_projection,
+    get_sales,
+    update_achieved,
+    get_all_weeks,
+    get_sales_for_employees,
+    admin_update_projection,
+    raise_change_request,
+    get_change_requests,
+    resolve_change_request,
+    current_week,
+    FILE_NAME
+)
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -1876,24 +1888,23 @@ def resolve_request(
 
 from fastapi.responses import FileResponse
 
+from fastapi.responses import FileResponse
+
 @app.get("/sales/download")
 def download_sales():
 
     return FileResponse(
-        "sales_tracker.xlsx",
+        FILE_NAME,
         filename="sales_tracker.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-from openpyxl import load_workbook
-import os
 
 @app.get("/sales/debug")
 def sales_debug():
 
     from openpyxl import load_workbook
 
-    wb = load_workbook("sales_tracker.xlsx")
-
+wb = load_workbook(FILE_NAME)
     output = {}
 
     for sheet in wb.sheetnames:
