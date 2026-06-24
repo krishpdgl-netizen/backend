@@ -1899,25 +1899,18 @@ def download_sales():
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
+from openpyxl import load_workbook
+
 @app.get("/sales/debug")
 def sales_debug():
 
-    from openpyxl import load_workbook
-
-wb = load_workbook(FILE_NAME)
+    wb = load_workbook(FILE_NAME)
     output = {}
 
     for sheet in wb.sheetnames:
-
         ws = wb[sheet]
-
-        rows=[]
-
-        for row in ws.iter_rows(values_only=True):
-
-            rows.append(row)
-
-        output[sheet]=rows
+        rows = [row for row in ws.iter_rows(values_only=True)]
+        output[sheet] = rows
 
     return output
 @app.get("/sales/debug-path")
