@@ -18,7 +18,20 @@ from excel_helper import (
 )
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from pydantic import BaseModel
+from typing import List
+from sqlalchemy import text
 
+
+class MeetingRequest(BaseModel):
+    title: str
+    description: str = ""
+    meeting_date: str
+    start_slot: int
+    end_slot: int
+    organizer_id: int
+    location: str = ""
+    attendees: List[int]
 
 
 app = FastAPI()
@@ -2153,3 +2166,82 @@ def get_manager_remarks(manager_id: int):
         ).fetchall()
 
     return [dict(r._mapping) for r in rows]
+
+@app.post("/meetings/create")
+def create_meeting(req: MeetingRequest):
+
+    with engine.begin() as conn:
+
+        conflict = conn.execute(
+            text("""
+            SELECT id
+            FROM meetings
+            WHERE meeting_date=:meeting_date
+            AND organizer_id=:organizer_id
+            AND (
+                start_slot < :new_end
+                AND end_slot > :new_start
+            )
+            """),
+            {
+                "meeting_date": req.meeting_date,
+                "organizer_id": req.organizer_id,
+                "new_start": req.start_slot,
+                "new_end": req.end_slot
+            }
+        ).fetchone()
+
+        if conflict:
+            return {
+                "success": False,
+                "message": "Organizer already has a meeting"
+            }
+
+        meeting_id = conn.execute(
+            text("""
+            INSERT INTO meetings(
+                title,
+                description,
+                organizer_id,
+                meeting_date,
+                start_slot,
+                end_slot,
+                location
+            )
+            VALUES(
+                :title,
+                :description,
+                :organizer_id,
+                :meeting_date,
+                :start_slot,
+                :end_slot,
+                :location
+            )
+            RETURNING id
+            """),
+            req.model_dump()
+        ).scalar()
+
+        for user_id in req.attendees:
+
+            conn.execute(
+                text("""
+                INSERT INTO meeting_attendees(
+                    meeting_id,
+                    user_id
+                )
+                VALUES(
+                    :meeting_id,
+                    :user_id
+                )
+                """),
+                {
+                    "meeting_id": meeting_id,
+                    "user_id": user_id
+                }
+            )
+
+    return {
+        "success": True,
+        "meeting_id": meeting_id
+    }
