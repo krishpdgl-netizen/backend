@@ -26,8 +26,12 @@ Sales Team
 
     msg = MIMEText(body)
 
-    msg["Subject"] = "Weekly Sales Projection Reminder"
-    msg["From"] = SMTP_EMAIL
+from datetime import datetime
+
+week_no = datetime.now().isocalendar()[1]
+
+msg["Subject"] = f"Week {week_no} Sales Projection Reminder"
+msg["From"] = SMTP_EMAIL
     msg["To"] = email
 
     with smtplib.SMTP("smtp.gmail.com",587) as server:
