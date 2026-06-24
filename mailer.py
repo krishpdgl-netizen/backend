@@ -28,11 +28,11 @@ Sales Team
 
     msg = MIMEText(body)
 
-    msg["Subject"] = f"Week {week_no} Sales Projection Reminder"
-    msg["From"] = SMTP_EMAIL
-    msg["To"] = email
+msg["Subject"] = f"Week {week_no} Sales Projection Reminder"
+msg["From"] = SMTP_EMAIL
+msg["To"] = email
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.send_message(msg)
+with smtplib.SMTP("smtp.gmail.com", 587) as server:
+    server.starttls()
+    server.login(SMTP_EMAIL, SMTP_PASSWORD)
+    server.send_message(msg)
