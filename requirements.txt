@@ -4,4 +4,4 @@ sqlalchemy
 psycopg2-binary
 openpyxl
 python-multipart
-apscheduler
+APScheduler==3.10.4
