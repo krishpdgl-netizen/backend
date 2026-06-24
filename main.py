@@ -2535,3 +2535,92 @@ def respond_to_meeting(req: MeetingResponseRequest):
         "success": True
 
     }
+@app.get("/calendar-tasks")
+def get_calendar_tasks(user_id: int, month: str):
+
+    with engine.connect() as conn:
+
+        rows = conn.execute(
+            text("""
+            SELECT
+                id,
+                title,
+                task_date,
+                start_slot,
+                end_slot,
+                status
+            FROM calendar_tasks
+            WHERE
+            user_id=:user_id
+            AND
+            TO_CHAR(task_date,'YYYY-MM')=:month
+            ORDER BY task_date,start_slot
+            """),
+            {
+                "user_id": user_id,
+                "month": month
+            }
+        ).fetchall()
+
+    output = []
+
+    for row in rows:
+
+        output.append({
+            "id": row.id,
+            "title": row.title,
+            "date": str(row.task_date),
+            "start_slot": row.start_slot,
+            "end_slot": row.end_slot,
+            "status": row.status
+        })
+
+    return output
+
+@app.get("/calendar/combined")
+def calendar_combined(user_id: int, date: str):
+
+    with engine.connect() as conn:
+
+        meetings = conn.execute(
+            text("""
+            SELECT
+                title,
+                start_slot,
+                end_slot,
+                'meeting' as type
+            FROM meetings
+            WHERE meeting_date=:date
+            """),
+            {
+                "date": date
+            }
+        ).fetchall()
+
+        tasks = conn.execute(
+            text("""
+            SELECT
+                title,
+                start_slot,
+                end_slot,
+                'task' as type
+            FROM calendar_tasks
+            WHERE
+            user_id=:user_id
+            AND task_date=:date
+            """),
+            {
+                "user_id": user_id,
+                "date": date
+            }
+        ).fetchall()
+
+    output = []
+
+    for row in meetings:
+        output.append(dict(row._mapping))
+
+    for row in tasks:
+        output.append(dict(row._mapping))
+
+    return output
