@@ -2338,3 +2338,200 @@ def user_availability(user_id:int, date:str):
         "slots": availability
     }
 
+@app.get("/meetings/week")
+def get_week_meetings(user_id: int, week_start: str):
+
+    with engine.connect() as conn:
+
+        rows = conn.execute(
+            text("""
+            SELECT
+                m.id,
+                m.title,
+                m.description,
+                m.meeting_date,
+                m.start_slot,
+                m.end_slot,
+                m.location,
+                m.organizer_id
+            FROM meetings m
+
+            LEFT JOIN meeting_attendees a
+            ON m.id = a.meeting_id
+
+            WHERE
+            (
+                m.organizer_id=:user_id
+                OR
+                a.user_id=:user_id
+            )
+
+            AND
+
+            m.meeting_date BETWEEN
+            :week_start::date
+            AND
+            (:week_start::date + interval '6 days')
+
+            ORDER BY
+            m.meeting_date,
+            m.start_slot
+            """),
+            {
+                "user_id": user_id,
+                "week_start": week_start
+            }
+        ).fetchall()
+
+    output = []
+
+    for row in rows:
+
+        output.append({
+
+            "id": row.id,
+
+            "title": row.title,
+
+            "description": row.description,
+
+            "date": str(row.meeting_date),
+
+            "start_slot": row.start_slot,
+
+            "end_slot": row.end_slot,
+
+            "start_time": slot_to_time(row.start_slot),
+
+            "end_time": slot_to_time(row.end_slot),
+
+            "location": row.location,
+
+            "organizer_id": row.organizer_id
+
+        })
+
+    return output
+
+@app.get("/meeting/{meeting_id}")
+def get_meeting_details(meeting_id: int):
+
+    with engine.connect() as conn:
+
+        row = conn.execute(
+            text("""
+            SELECT *
+            FROM meetings
+            WHERE id=:meeting_id
+            """),
+            {
+                "meeting_id": meeting_id
+            }
+        ).fetchone()
+
+        attendees = conn.execute(
+            text("""
+            SELECT
+                u.id,
+                u.full_name,
+                ma.response_status
+            FROM meeting_attendees ma
+
+            JOIN users u
+            ON u.id=ma.user_id
+
+            WHERE ma.meeting_id=:meeting_id
+            """),
+            {
+                "meeting_id": meeting_id
+            }
+        ).fetchall()
+
+    if not row:
+
+        return {"success": False}
+
+    return {
+
+        "success": True,
+
+        "meeting": {
+
+            "id": row.id,
+
+            "title": row.title,
+
+            "description": row.description,
+
+            "date": str(row.meeting_date),
+
+            "start_slot": row.start_slot,
+
+            "end_slot": row.end_slot,
+
+            "start_time": slot_to_time(row.start_slot),
+
+            "end_time": slot_to_time(row.end_slot),
+
+            "location": row.location,
+
+            "organizer_id": row.organizer_id
+
+        },
+
+        "attendees": [
+
+            {
+
+                "id": a.id,
+
+                "name": a.full_name,
+
+                "status": a.response_status
+
+            }
+
+            for a in attendees
+
+        ]
+
+    }
+
+class MeetingResponseRequest(BaseModel):
+
+    meeting_id: int
+
+    user_id: int
+
+    status: str
+
+@app.post("/meeting/respond")
+def respond_to_meeting(req: MeetingResponseRequest):
+
+    with engine.begin() as conn:
+
+        conn.execute(
+
+            text("""
+            UPDATE meeting_attendees
+
+            SET response_status=:status
+
+            WHERE
+
+            meeting_id=:meeting_id
+
+            AND
+
+            user_id=:user_id
+            """),
+
+            req.model_dump()
+
+        )
+
+    return {
+
+        "success": True
+
+    }
