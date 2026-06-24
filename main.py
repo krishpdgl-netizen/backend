@@ -1476,7 +1476,7 @@ def post_projection(
     price: Optional[float] = 0
 ):
 
-    if week != current_week():
+    if week < current_week():
 
         return {
 
