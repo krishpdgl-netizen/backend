@@ -23,15 +23,6 @@ from typing import List
 from sqlalchemy import text
 
 
-class MeetingRequest(BaseModel):
-    title: str
-    description: str = ""
-    meeting_date: str
-    start_slot: int
-    end_slot: int
-    organizer_id: int
-    location: str = ""
-    attendees: List[int]
 
 
 app = FastAPI()
@@ -48,6 +39,13 @@ engine = create_engine(
     DATABASE_URL,
     connect_args={"sslmode":"require"}
 )
+
+def slot_to_time(slot):
+
+    hour = slot // 2
+    minute = (slot % 2) * 30
+
+    return f"{hour:02}:{minute:02}"
 
 @app.get("/")
 def home():
@@ -2245,3 +2243,89 @@ def create_meeting(req: MeetingRequest):
         "success": True,
         "meeting_id": meeting_id
     }
+@app.get("/meetings/day")
+def get_day_meetings(date: str):
+
+    with engine.connect() as conn:
+
+        rows = conn.execute(
+            text("""
+            SELECT
+                id,
+                title,
+                description,
+                meeting_date,
+                start_slot,
+                end_slot,
+                location,
+                organizer_id
+            FROM meetings
+            WHERE meeting_date=:date
+            ORDER BY start_slot
+            """),
+            {"date": date}
+        ).fetchall()
+
+    output = []
+
+    for row in rows:
+
+        output.append({
+
+            "id": row.id,
+
+            "title": row.title,
+
+            "description": row.description,
+
+            "date": str(row.meeting_date),
+
+            "start_slot": row.start_slot,
+
+            "end_slot": row.end_slot,
+
+            "start_time": slot_to_time(row.start_slot),
+
+            "end_time": slot_to_time(row.end_slot),
+
+            "location": row.location,
+
+            "organizer_id": row.organizer_id
+        })
+
+    return output
+
+@app.get("/meetings/user-availability")
+def user_availability(user_id:int, date:str):
+
+    availability = [True]*48
+
+    with engine.connect() as conn:
+
+        rows = conn.execute(
+            text("""
+            SELECT
+                start_slot,
+                end_slot
+            FROM meetings
+            WHERE
+                meeting_date=:date
+            AND
+                organizer_id=:user_id
+            """),
+            {
+                "date": date,
+                "user_id": user_id
+            }
+        ).fetchall()
+
+    for row in rows:
+
+        for slot in range(row.start_slot,row.end_slot):
+
+            availability[slot] = False
+
+    return {
+        "slots": availability
+    }
+
