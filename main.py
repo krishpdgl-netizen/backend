@@ -21,6 +21,15 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel
 from typing import List
 from sqlalchemy import text
+class MeetingRequest(BaseModel):
+    title: str
+    description: str = ""
+    meeting_date: str
+    start_slot: int
+    end_slot: int
+    organizer_id: int
+    location: str = ""
+    attendees: List[int]
 
 
 
