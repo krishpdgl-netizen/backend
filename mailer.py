@@ -32,7 +32,7 @@ week_no = datetime.now().isocalendar()[1]
 
 msg["Subject"] = f"Week {week_no} Sales Projection Reminder"
 msg["From"] = SMTP_EMAIL
-    msg["To"] = email
+msg["To"] = email
 
     with smtplib.SMTP("smtp.gmail.com",587) as server:
         server.starttls()
