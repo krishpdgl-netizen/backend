@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine,text
+from sqlalchemy import create_engine, text
 from mailer import send_sales_reminder
 import os
 
@@ -6,36 +6,43 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"sslmode":"require"}
+    connect_args={"sslmode": "require"}
 )
 
-with engine.connect() as conn:
 
-    users = conn.execute(
-        text("""
-        SELECT
-            full_name,
-            email
-        FROM users
-        WHERE
-            receive_sales_reminder=TRUE
-        AND
-            role='employee'
-        ORDER BY full_name
-        """)
-    ).fetchall()
+def send_all_reminders():
 
-for row in users:
+    with engine.connect() as conn:
 
-    try:
+        users = conn.execute(
+            text("""
+            SELECT
+                full_name,
+                email
+            FROM users
+            WHERE
+                receive_sales_reminder = TRUE
+            AND
+                role = 'employee'
+            ORDER BY full_name
+            """)
+        ).fetchall()
 
-        send_sales_reminder(
-            row.full_name,
-            row.email
-        )
+    for row in users:
 
-        print("Sent to",row.full_name)
+        try:
 
-    except Exception as e:
+            send_sales_reminder(
+                row.full_name,
+                row.email
+            )
 
-        print(e)
+            print("Sent to", row.full_name)
+
+        except Exception as e:
+
+            print(e)
+
+
+if __name__ == "__main__":
+    send_all_reminders()
