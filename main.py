@@ -18,7 +18,6 @@ from excel_helper import (
 )
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from send_reminders import send_all_reminders
 
 
 
@@ -2154,11 +2153,3 @@ def get_manager_remarks(manager_id: int):
         ).fetchall()
 
     return [dict(r._mapping) for r in rows]
-@app.get("/test-mail")
-def test_mail():
-
-    send_all_reminders()
-
-    return {
-        "message": "mail sent"
-    }
