@@ -32,7 +32,17 @@ class MeetingRequest(BaseModel):
     attendees: List[int]
 import requests
 import os
+from pydantic import BaseModel
+from typing import Optional
 
+class LeaveRequest(BaseModel):
+    user_id: int
+    employee_name: str
+    leave_type: str
+    start_date: str
+    end_date: str
+    reason: str
+    
 app = FastAPI()
 
 
@@ -2896,9 +2906,7 @@ def send_sales_projection_reminders():
             SELECT full_name, email
             FROM users
             WHERE email IS NOT NULL
-              AND email LIKE '%@%'
-              AND LENGTH(email) > 5
-              AND status = 'active'
+              AND email <> ''
         """))
 
         employees = result.fetchall()
@@ -2962,3 +2970,152 @@ def send_sales_reminders():
             "success": False,
             "error": str(e)
         }
+from sqlalchemy import text
+
+@app.post("/leave-requests")
+def create_leave_request(data: LeaveRequest):
+
+    with engine.begin() as conn:
+
+        result = conn.execute(
+            text("""
+                INSERT INTO leave_requests
+                (
+                    user_id,
+                    employee_name,
+                    leave_type,
+                    start_date,
+                    end_date,
+                    reason
+                )
+                VALUES
+                (
+                    :user_id,
+                    :employee_name,
+                    :leave_type,
+                    :start_date,
+                    :end_date,
+                    :reason
+                )
+                RETURNING id
+            """),
+            {
+                "user_id": data.user_id,
+                "employee_name": data.employee_name,
+                "leave_type": data.leave_type,
+                "start_date": data.start_date,
+                "end_date": data.end_date,
+                "reason": data.reason
+            }
+        )
+
+        leave_id = result.scalar()
+
+    return {
+        "success": True,
+        "leave_id": leave_id
+    }
+
+@app.get("/leave-requests")
+def get_leave_requests():
+
+    with engine.connect() as conn:
+
+        result = conn.execute(
+            text("""
+                SELECT *
+                FROM leave_requests
+                ORDER BY created_at DESC
+            """)
+        )
+
+        rows = result.mappings().all()
+
+    return rows
+
+@app.post("/leave-requests/{leave_id}/approve")
+def approve_leave(leave_id: int):
+
+    with engine.begin() as conn:
+
+        conn.execute(
+            text("""
+                UPDATE leave_requests
+                SET
+                    status = 'Approved',
+                    approved_at = NOW()
+                WHERE id = :leave_id
+            """),
+            {
+                "leave_id": leave_id
+            }
+        )
+
+    return {
+        "success": True
+    }
+
+@app.post("/leave-requests/{leave_id}/reject")
+def reject_leave(leave_id: int):
+
+    with engine.begin() as conn:
+
+        conn.execute(
+            text("""
+                UPDATE leave_requests
+                SET
+                    status = 'Rejected',
+                    approved_at = NOW()
+                WHERE id = :leave_id
+            """),
+            {
+                "leave_id": leave_id
+            }
+        )
+
+    return {
+        "success": True
+    }
+
+@app.get("/leave-stats")
+def leave_stats():
+
+    with engine.connect() as conn:
+
+        total = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM leave_requests
+            """)
+        ).scalar()
+
+        pending = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM leave_requests
+                WHERE status='Pending'
+            """)
+        ).scalar()
+
+        approved = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM leave_requests
+                WHERE status='Approved'
+            """)
+        ).scalar()
+
+        rejected = conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM leave_requests
+                WHERE status='Rejected'
+            """)
+        ).scalar()
+
+    return {
+        "total": total,
+        "pending": pending,
+        "approved": approved,
+        "rejected": rejected
+    }
