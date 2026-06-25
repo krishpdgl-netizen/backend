@@ -55,6 +55,14 @@ def create_tables():
                 created_at  TIMESTAMP DEFAULT NOW()
             )
         """))
+        # Patch any columns missing from an older version of the table
+        for col_sql in [
+            "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'",
+            "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''",
+            "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS color TEXT DEFAULT '#7c3aed'",
+            "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
+        ]:
+            conn.execute(text(col_sql))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS meetings (
                 id           SERIAL PRIMARY KEY,
@@ -2707,8 +2715,8 @@ def create_calendar_task(
     sync_gcal: bool = False
 ):
     try:
-        # Safety: ensure table exists even if startup event was skipped
         with engine.begin() as conn:
+            # Ensure table exists and has all required columns
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS calendar_tasks (
                     id          SERIAL PRIMARY KEY,
@@ -2723,12 +2731,21 @@ def create_calendar_task(
                     created_at  TIMESTAMP DEFAULT NOW()
                 )
             """))
+            # Add any columns that may be missing from an older table schema
+            for col_sql in [
+                "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'",
+                "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''",
+                "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS color TEXT DEFAULT '#7c3aed'",
+                "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
+            ]:
+                conn.execute(text(col_sql))
+
             task_id = conn.execute(
                 text("""
                     INSERT INTO calendar_tasks
-                        (user_id, title, description, task_date, start_slot, end_slot, color, status)
+                        (user_id, title, description, task_date, start_slot, end_slot, color)
                     VALUES
-                        (:user_id, :title, :description, :task_date, :start_slot, :end_slot, :color, 'pending')
+                        (:user_id, :title, :description, :task_date, :start_slot, :end_slot, :color)
                     RETURNING id
                 """),
                 {"user_id": user_id, "title": title, "description": description,
