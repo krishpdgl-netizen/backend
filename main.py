@@ -2887,25 +2887,27 @@ def test_email():
     return result
 def send_sales_projection_reminders():
 
-    conn = get_db_connection()
-    cur = conn.cursor()
+from sqlalchemy import text
 
-    cur.execute("""
-        SELECT full_name, email
-        FROM users
-        WHERE status = 'active'
-        AND email IS NOT NULL
-        AND email <> ''
-    """)
+def send_sales_projection_reminders():
 
-    employees = cur.fetchall()
+    with engine.connect() as conn:
+
+        result = conn.execute(text("""
+            SELECT full_name, email
+            FROM users
+            WHERE status = 'active'
+            AND email LIKE '%@%'
+        """))
+
+        employees = result.fetchall()
 
     sent = 0
 
     for emp in employees:
 
-        full_name = emp["full_name"]
-        email = emp["email"]
+        full_name = emp.full_name
+        email = emp.email
 
         send_email(
             email,
@@ -2915,24 +2917,17 @@ def send_sales_projection_reminders():
 
             <p>Hi {full_name},</p>
 
-            <p>
-            Please fill your sales projections for the current week.
-            </p>
+            <p>Please fill your sales projections for this week.</p>
 
             <p>
             Login to Panache WMS and update your projections.
             </p>
-
-            <br>
 
             <p>Regards,<br>Panache WMS</p>
             """
         )
 
         sent += 1
-
-    cur.close()
-    conn.close()
 
     return {
         "success": True,
