@@ -2196,84 +2196,57 @@ def get_manager_remarks(manager_id: int):
 
     return [dict(r._mapping) for r in rows]
 
+# REMOVE the MeetingRequest class and replace /meetings/create with this:
+
 @app.post("/meetings/create")
-def create_meeting(req: MeetingRequest):
+def create_meeting(
+    title: str,
+    description: str = "",
+    meeting_date: str = "",
+    start_slot: int = 0,
+    end_slot: int = 0,
+    organizer_id: int = 0,
+    location: str = "",
+    attendees: str = "[]"   # JSON string of list, e.g. "[1,2,3]"
+):
+    import json
+    attendee_list = json.loads(attendees)
 
     with engine.begin() as conn:
-
         conflict = conn.execute(
             text("""
-            SELECT id
-            FROM meetings
+            SELECT id FROM meetings
             WHERE meeting_date=:meeting_date
             AND organizer_id=:organizer_id
-            AND (
-                start_slot < :new_end
-                AND end_slot > :new_start
-            )
+            AND (start_slot < :new_end AND end_slot > :new_start)
             """),
-            {
-                "meeting_date": req.meeting_date,
-                "organizer_id": req.organizer_id,
-                "new_start": req.start_slot,
-                "new_end": req.end_slot
-            }
+            {"meeting_date": meeting_date, "organizer_id": organizer_id,
+             "new_start": start_slot, "new_end": end_slot}
         ).fetchone()
 
         if conflict:
-            return {
-                "success": False,
-                "message": "Organizer already has a meeting"
-            }
+            return {"success": False, "message": "Organizer already has a meeting"}
 
         meeting_id = conn.execute(
             text("""
-            INSERT INTO meetings(
-                title,
-                description,
-                organizer_id,
-                meeting_date,
-                start_slot,
-                end_slot,
-                location
-            )
-            VALUES(
-                :title,
-                :description,
-                :organizer_id,
-                :meeting_date,
-                :start_slot,
-                :end_slot,
-                :location
-            )
+            INSERT INTO meetings(title, description, organizer_id, meeting_date,
+                start_slot, end_slot, location)
+            VALUES(:title, :description, :organizer_id, :meeting_date,
+                :start_slot, :end_slot, :location)
             RETURNING id
             """),
-            req.model_dump()
+            {"title": title, "description": description, "organizer_id": organizer_id,
+             "meeting_date": meeting_date, "start_slot": start_slot,
+             "end_slot": end_slot, "location": location}
         ).scalar()
 
-        for user_id in req.attendees:
-
+        for uid in attendee_list:
             conn.execute(
-                text("""
-                INSERT INTO meeting_attendees(
-                    meeting_id,
-                    user_id
-                )
-                VALUES(
-                    :meeting_id,
-                    :user_id
-                )
-                """),
-                {
-                    "meeting_id": meeting_id,
-                    "user_id": user_id
-                }
+                text("INSERT INTO meeting_attendees(meeting_id, user_id) VALUES(:mid, :uid)"),
+                {"mid": meeting_id, "uid": uid}
             )
 
-    return {
-        "success": True,
-        "meeting_id": meeting_id
-    }
+    return {"success": True, "meeting_id": meeting_id}
 @app.get("/meetings/day")
 def get_day_meetings(date: str):
 
@@ -2648,8 +2621,19 @@ class CalendarTaskRequest(BaseModel):
     color: str = "#7c3aed"
     sync_gcal: bool = False
 
+# REMOVE CalendarTaskRequest class and replace /calendar-tasks/create with this:
+
 @app.post("/calendar-tasks/create")
-def create_calendar_task(req: CalendarTaskRequest):
+def create_calendar_task(
+    user_id: int,
+    title: str,
+    description: str = "",
+    task_date: str = "",
+    start_slot: int = 0,
+    end_slot: int = 0,
+    color: str = "#7c3aed",
+    sync_gcal: bool = False
+):
     with engine.begin() as conn:
         task_id = conn.execute(
             text("""
@@ -2659,15 +2643,9 @@ def create_calendar_task(req: CalendarTaskRequest):
                     (:user_id, :title, :description, :task_date, :start_slot, :end_slot, :color, 'pending')
                 RETURNING id
             """),
-            {
-                "user_id":     req.user_id,
-                "title":       req.title,
-                "description": req.description,
-                "task_date":   req.task_date,
-                "start_slot":  req.start_slot,
-                "end_slot":    req.end_slot,
-                "color":       req.color,
-            }
+            {"user_id": user_id, "title": title, "description": description,
+             "task_date": task_date, "start_slot": start_slot,
+             "end_slot": end_slot, "color": color}
         ).scalar()
 
     return {"success": True, "task_id": task_id, "gcal_synced": False}
