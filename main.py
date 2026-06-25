@@ -36,6 +36,48 @@ class MeetingRequest(BaseModel):
 
 app = FastAPI()
 
+
+# ── AUTO-CREATE TABLES ON STARTUP ────────────────────────
+@app.on_event("startup")
+def create_tables():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS calendar_tasks (
+                id          SERIAL PRIMARY KEY,
+                user_id     INT NOT NULL,
+                title       TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                task_date   DATE NOT NULL,
+                start_slot  INT NOT NULL,
+                end_slot    INT NOT NULL,
+                color       TEXT DEFAULT '#7c3aed',
+                status      TEXT DEFAULT 'pending',
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS meetings (
+                id           SERIAL PRIMARY KEY,
+                title        TEXT NOT NULL,
+                description  TEXT DEFAULT '',
+                organizer_id INT NOT NULL,
+                meeting_date DATE NOT NULL,
+                start_slot   INT NOT NULL,
+                end_slot     INT NOT NULL,
+                location     TEXT DEFAULT '',
+                created_at   TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS meeting_attendees (
+                id              SERIAL PRIMARY KEY,
+                meeting_id      INT NOT NULL,
+                user_id         INT NOT NULL,
+                response_status TEXT DEFAULT 'pending'
+            )
+        """))
+
+
 # ── CORS ─────────────────────────────────────────────────
 # allow_origins=["*"] with allow_credentials=False is correct.
 # We also add an explicit OPTIONS catch-all so Railway's proxy
@@ -2578,48 +2620,51 @@ def get_calendar_tasks(user_id: int, month: Optional[str] = None, date: Optional
       ?user_id=X&month=YYYY-MM   → all tasks for a month (month view)
       ?user_id=X&date=YYYY-MM-DD → all tasks for a single day (day view)
     """
-    with engine.connect() as conn:
+    try:
+        with engine.connect() as conn:
 
-        if date:
-            rows = conn.execute(
-                text("""
-                SELECT
-                    id, title, description, task_date,
-                    start_slot, end_slot, color, status
-                FROM calendar_tasks
-                WHERE user_id = :user_id
-                AND task_date = :date
-                ORDER BY start_slot
-                """),
-                {"user_id": user_id, "date": date}
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                text("""
-                SELECT
-                    id, title, description, task_date,
-                    start_slot, end_slot, color, status
-                FROM calendar_tasks
-                WHERE user_id = :user_id
-                AND TO_CHAR(task_date, 'YYYY-MM') = :month
-                ORDER BY task_date, start_slot
-                """),
-                {"user_id": user_id, "month": month or ""}
-            ).fetchall()
+            if date:
+                rows = conn.execute(
+                    text("""
+                    SELECT
+                        id, title, description, task_date,
+                        start_slot, end_slot, color, status
+                    FROM calendar_tasks
+                    WHERE user_id = :user_id
+                    AND task_date = :date
+                    ORDER BY start_slot
+                    """),
+                    {"user_id": user_id, "date": date}
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    text("""
+                    SELECT
+                        id, title, description, task_date,
+                        start_slot, end_slot, color, status
+                    FROM calendar_tasks
+                    WHERE user_id = :user_id
+                    AND TO_CHAR(task_date, 'YYYY-MM') = :month
+                    ORDER BY task_date, start_slot
+                    """),
+                    {"user_id": user_id, "month": month or ""}
+                ).fetchall()
 
-    return [
-        {
-            "id":          row.id,
-            "title":       row.title,
-            "description": row.description,
-            "task_date":   str(row.task_date),
-            "start_slot":  row.start_slot,
-            "end_slot":    row.end_slot,
-            "color":       row.color,
-            "status":      row.status,
-        }
-        for row in rows
-    ]
+        return [
+            {
+                "id":          row.id,
+                "title":       row.title,
+                "description": row.description,
+                "task_date":   str(row.task_date),
+                "start_slot":  row.start_slot,
+                "end_slot":    row.end_slot,
+                "color":       row.color,
+                "status":      row.status,
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        return []
 
 # ═══════════════════════════════════════════════════════
 # CALENDAR TASKS — CREATE / DELETE
@@ -2661,20 +2706,23 @@ def create_calendar_task(
     color: str = "#7c3aed",
     sync_gcal: bool = False
 ):
-    with engine.begin() as conn:
-        task_id = conn.execute(
-            text("""
-                INSERT INTO calendar_tasks
-                    (user_id, title, description, task_date, start_slot, end_slot, color, status)
-                VALUES
-                    (:user_id, :title, :description, :task_date, :start_slot, :end_slot, :color, 'pending')
-                RETURNING id
-            """),
-            {"user_id": user_id, "title": title, "description": description,
-             "task_date": task_date, "start_slot": start_slot,
-             "end_slot": end_slot, "color": color}
-        ).scalar()
-    return {"success": True, "task_id": task_id, "gcal_synced": False}
+    try:
+        with engine.begin() as conn:
+            task_id = conn.execute(
+                text("""
+                    INSERT INTO calendar_tasks
+                        (user_id, title, description, task_date, start_slot, end_slot, color, status)
+                    VALUES
+                        (:user_id, :title, :description, :task_date, :start_slot, :end_slot, :color, 'pending')
+                    RETURNING id
+                """),
+                {"user_id": user_id, "title": title, "description": description,
+                 "task_date": task_date, "start_slot": start_slot,
+                 "end_slot": end_slot, "color": color}
+            ).scalar()
+        return {"success": True, "task_id": task_id, "gcal_synced": False}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
 
 @app.delete("/calendar-tasks/{task_id}")
@@ -2768,4 +2816,3 @@ def get_all_users():
             text("SELECT id, full_name, email, role FROM users ORDER BY full_name")
         )
         return [dict(row._mapping) for row in result]
-
