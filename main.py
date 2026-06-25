@@ -3119,3 +3119,16 @@ def leave_stats():
         "approved": approved,
         "rejected": rejected
     }
+@app.get("/leave-requests/pending")
+def get_pending_leaves():
+
+    with engine.connect() as conn:
+
+        result = conn.execute(text("""
+            SELECT *
+            FROM leave_requests
+            WHERE status = 'Pending'
+            ORDER BY created_at DESC
+        """))
+
+        return result.mappings().all()
