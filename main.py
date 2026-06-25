@@ -2885,7 +2885,6 @@ def test_email():
     )
 
     return result
-def send_sales_projection_reminders():
 
 from sqlalchemy import text
 
