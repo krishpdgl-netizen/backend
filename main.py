@@ -2207,7 +2207,7 @@ def create_meeting(
     end_slot: int = 0,
     organizer_id: int = 0,
     location: str = "",
-    attendees: str = "[]"   # JSON string of list, e.g. "[1,2,3]"
+    attendees: str = "[]"
 ):
     import json
     attendee_list = json.loads(attendees)
@@ -2215,25 +2215,25 @@ def create_meeting(
     with engine.begin() as conn:
         conflict = conn.execute(
             text("""
-            SELECT id FROM meetings
-            WHERE meeting_date=:meeting_date
-            AND organizer_id=:organizer_id
-            AND (start_slot < :new_end AND end_slot > :new_start)
+                SELECT id FROM meetings
+                WHERE meeting_date = :meeting_date
+                AND organizer_id = :organizer_id
+                AND (start_slot < :new_end AND end_slot > :new_start)
             """),
             {"meeting_date": meeting_date, "organizer_id": organizer_id,
              "new_start": start_slot, "new_end": end_slot}
         ).fetchone()
 
         if conflict:
-            return {"success": False, "message": "Organizer already has a meeting"}
+            return {"success": False, "message": "You already have a meeting at that time"}
 
         meeting_id = conn.execute(
             text("""
-            INSERT INTO meetings(title, description, organizer_id, meeting_date,
-                start_slot, end_slot, location)
-            VALUES(:title, :description, :organizer_id, :meeting_date,
-                :start_slot, :end_slot, :location)
-            RETURNING id
+                INSERT INTO meetings
+                    (title, description, organizer_id, meeting_date, start_slot, end_slot, location)
+                VALUES
+                    (:title, :description, :organizer_id, :meeting_date, :start_slot, :end_slot, :location)
+                RETURNING id
             """),
             {"title": title, "description": description, "organizer_id": organizer_id,
              "meeting_date": meeting_date, "start_slot": start_slot,
@@ -2247,6 +2247,33 @@ def create_meeting(
             )
 
     return {"success": True, "meeting_id": meeting_id}
+
+
+
+@app.get("/meetings/month")
+def get_month_meetings(user_id: int, month: str):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT DISTINCT m.id, m.title, m.description,
+                    m.meeting_date, m.start_slot, m.end_slot,
+                    m.location, m.organizer_id
+                FROM meetings m
+                LEFT JOIN meeting_attendees a ON m.id = a.meeting_id
+                WHERE (m.organizer_id = :user_id OR a.user_id = :user_id)
+                AND TO_CHAR(m.meeting_date, 'YYYY-MM') = :month
+                ORDER BY m.meeting_date, m.start_slot
+            """),
+            {"user_id": user_id, "month": month}
+        ).fetchall()
+    return [
+        {"id": r.id, "title": r.title, "description": r.description,
+         "meeting_date": str(r.meeting_date), "date": str(r.meeting_date),
+         "start_slot": r.start_slot, "end_slot": r.end_slot,
+         "location": r.location, "organizer_id": r.organizer_id}
+        for r in rows
+    ]
+    
 @app.get("/meetings/day")
 def get_day_meetings(date: str):
 
@@ -2647,8 +2674,8 @@ def create_calendar_task(
              "task_date": task_date, "start_slot": start_slot,
              "end_slot": end_slot, "color": color}
         ).scalar()
-
     return {"success": True, "task_id": task_id, "gcal_synced": False}
+
 
 @app.delete("/calendar-tasks/{task_id}")
 def delete_calendar_task(task_id: int, user_id: int):
@@ -2733,3 +2760,12 @@ def calendar_combined(user_id: int, date: str):
         output.append(dict(row._mapping))
 
     return output
+
+@app.get("/users")
+def get_all_users():
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT id, full_name, email, role FROM users ORDER BY full_name")
+        )
+        return [dict(row._mapping) for row in result]
+
