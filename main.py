@@ -2876,7 +2876,7 @@ def send_email(to_email, subject, html):
 def test_email():
 
     result = send_email(
-        "krishdhiliwal@gmail.com",
+        "krishpdgl@gmail.com",
         "Panache Test",
         """
         <h2>Email Working ✅</h2>
