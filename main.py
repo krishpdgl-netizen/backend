@@ -2850,7 +2850,7 @@ def get_all_users():
         return [dict(row._mapping) for row in result]
 
 
-RESEND_API_KEY = os.getenv("re_KNYVorPm_LAnWVf5CzY6roZZUya2J1CpF")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 
 
 def send_email(to_email, subject, html):
