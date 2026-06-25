@@ -30,13 +30,8 @@ class MeetingRequest(BaseModel):
     organizer_id: int
     location: str = ""
     attendees: List[int]
+import requests
 import os
-import smtplib
-
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-
-
 
 app = FastAPI()
 
@@ -2853,64 +2848,40 @@ def get_all_users():
             text("SELECT id, full_name, email, role FROM users ORDER BY full_name")
         )
         return [dict(row._mapping) for row in result]
-EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
 
-def send_email(to_email, subject, body):
+RESEND_API_KEY = os.getenv("re_KNYVorPm_LAnWVf5CzY6roZZUya2J1CpF")
 
-    msg = MIMEMultipart()
 
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = to_email
-    msg["Subject"] = subject
+def send_email(to_email, subject, html):
 
-    msg.attach(
-        MIMEText(body, "html")
+    response = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "from": "Panache <onboarding@resend.dev>",
+            "to": [to_email],
+            "subject": subject,
+            "html": html
+        }
     )
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+    return response.json()
 
-        server.starttls()
-
-        server.login(
-            EMAIL_ADDRESS,
-            EMAIL_PASSWORD
-        )
-
-        server.send_message(msg)
 
 @app.post("/test-email")
 def test_email():
 
-    send_email(
+    result = send_email(
         "krishdhiliwal@gmail.com",
         "Panache Test",
         """
         <h2>Email Working ✅</h2>
-        <p>This is a test email from Panache WMS.</p>
+        <p>This email was sent using Resend.</p>
         """
     )
 
-    return {"success": True}
-import socket
-
-@app.get("/smtp-test")
-def smtp_test():
-
-    try:
-        socket.create_connection(
-            ("smtp.gmail.com", 587),
-            timeout=10
-        )
-
-        return {
-            "success": True
-        }
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
+    return result
