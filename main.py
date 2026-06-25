@@ -2939,8 +2939,15 @@ def send_sales_projection_reminders():
         "emails_sent": sent
     }
 
-
 @app.post("/send-sales-reminders")
 def send_sales_reminders():
 
-    return send_sales_projection_reminders()
+    try:
+        return send_sales_projection_reminders()
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
