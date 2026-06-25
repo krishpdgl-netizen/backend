@@ -2413,6 +2413,20 @@ def get_week_meetings(user_id: int, week_start: str):
 
     return output
 
+@app.get("/meetings/{meeting_id}/attendees")
+def get_meeting_attendees(meeting_id: int):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT u.id AS user_id, u.full_name
+                FROM meeting_attendees ma
+                JOIN users u ON u.id = ma.user_id
+                WHERE ma.meeting_id = :meeting_id
+            """),
+            {"meeting_id": meeting_id}
+        ).fetchall()
+    return [{"user_id": r.user_id, "full_name": r.full_name} for r in rows]
+
 @app.get("/meeting/{meeting_id}")
 def get_meeting_details(meeting_id: int):
 
@@ -2671,21 +2685,6 @@ def gcal_login(user_id: int):
 def gcal_disconnect(user_id: int):
     """Disconnects Google Calendar for this user."""
     return {"success": True}
-
-@app.get("/meetings/{meeting_id}/attendees")
-def get_meeting_attendees(meeting_id: int):
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT u.id AS user_id, u.full_name
-                FROM meeting_attendees ma
-                JOIN users u ON u.id = ma.user_id
-                WHERE ma.meeting_id = :meeting_id
-            """),
-            {"meeting_id": meeting_id}
-        ).fetchall()
-    return [{"user_id": r.user_id, "full_name": r.full_name} for r in rows]
-
 
 @app.get("/calendar/combined")
 def calendar_combined(user_id: int, date: str):
