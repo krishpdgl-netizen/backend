@@ -2536,46 +2536,156 @@ def respond_to_meeting(req: MeetingResponseRequest):
 
     }
 @app.get("/calendar-tasks")
-def get_calendar_tasks(user_id: int, month: str):
-
+def get_calendar_tasks(user_id: int, month: Optional[str] = None, date: Optional[str] = None):
+    """
+    Supports two modes:
+      ?user_id=X&month=YYYY-MM   → all tasks for a month (month view)
+      ?user_id=X&date=YYYY-MM-DD → all tasks for a single day (day view)
+    """
     with engine.connect() as conn:
 
-        rows = conn.execute(
+        if date:
+            rows = conn.execute(
+                text("""
+                SELECT
+                    id, title, description, task_date,
+                    start_slot, end_slot, color, status
+                FROM calendar_tasks
+                WHERE user_id = :user_id
+                AND task_date = :date
+                ORDER BY start_slot
+                """),
+                {"user_id": user_id, "date": date}
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                text("""
+                SELECT
+                    id, title, description, task_date,
+                    start_slot, end_slot, color, status
+                FROM calendar_tasks
+                WHERE user_id = :user_id
+                AND TO_CHAR(task_date, 'YYYY-MM') = :month
+                ORDER BY task_date, start_slot
+                """),
+                {"user_id": user_id, "month": month or ""}
+            ).fetchall()
+
+    return [
+        {
+            "id":          row.id,
+            "title":       row.title,
+            "description": row.description,
+            "task_date":   str(row.task_date),
+            "start_slot":  row.start_slot,
+            "end_slot":    row.end_slot,
+            "color":       row.color,
+            "status":      row.status,
+        }
+        for row in rows
+    ]
+
+# ═══════════════════════════════════════════════════════
+# CALENDAR TASKS — CREATE / DELETE
+# ═══════════════════════════════════════════════════════
+# Run once in your DB if the table doesn't exist yet:
+#   CREATE TABLE IF NOT EXISTS calendar_tasks (
+#       id          SERIAL PRIMARY KEY,
+#       user_id     INT NOT NULL,
+#       title       TEXT NOT NULL,
+#       description TEXT DEFAULT '',
+#       task_date   DATE NOT NULL,
+#       start_slot  INT NOT NULL,
+#       end_slot    INT NOT NULL,
+#       color       TEXT DEFAULT '#7c3aed',
+#       status      TEXT DEFAULT 'pending',
+#       created_at  TIMESTAMP DEFAULT NOW()
+#   );
+
+class CalendarTaskRequest(BaseModel):
+    user_id: int
+    title: str
+    description: str = ""
+    task_date: str
+    start_slot: int
+    end_slot: int
+    color: str = "#7c3aed"
+    sync_gcal: bool = False
+
+@app.post("/calendar-tasks/create")
+def create_calendar_task(req: CalendarTaskRequest):
+    with engine.begin() as conn:
+        task_id = conn.execute(
             text("""
-            SELECT
-                id,
-                title,
-                task_date,
-                start_slot,
-                end_slot,
-                status
-            FROM calendar_tasks
-            WHERE
-            user_id=:user_id
-            AND
-            TO_CHAR(task_date,'YYYY-MM')=:month
-            ORDER BY task_date,start_slot
+                INSERT INTO calendar_tasks
+                    (user_id, title, description, task_date, start_slot, end_slot, color, status)
+                VALUES
+                    (:user_id, :title, :description, :task_date, :start_slot, :end_slot, :color, 'pending')
+                RETURNING id
             """),
             {
-                "user_id": user_id,
-                "month": month
+                "user_id":     req.user_id,
+                "title":       req.title,
+                "description": req.description,
+                "task_date":   req.task_date,
+                "start_slot":  req.start_slot,
+                "end_slot":    req.end_slot,
+                "color":       req.color,
             }
+        ).scalar()
+
+    return {"success": True, "task_id": task_id, "gcal_synced": False}
+
+@app.delete("/calendar-tasks/{task_id}")
+def delete_calendar_task(task_id: int, user_id: int):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("""
+                DELETE FROM calendar_tasks
+                WHERE id = :task_id AND user_id = :user_id
+            """),
+            {"task_id": task_id, "user_id": user_id}
+        )
+    if result.rowcount == 0:
+        return {"success": False, "message": "Task not found or not yours"}
+    return {"success": True}
+
+
+# ═══════════════════════════════════════════════════════
+# GOOGLE CALENDAR — STUB ENDPOINTS
+# (Replace with real OAuth once you set up Google Cloud credentials)
+# ═══════════════════════════════════════════════════════
+
+@app.get("/auth/google/status")
+def gcal_status(user_id: int):
+    """Returns whether this user has connected Google Calendar.
+    Currently always returns not-connected until OAuth is wired up."""
+    return {"connected": False}
+
+@app.get("/auth/google/login")
+def gcal_login(user_id: int):
+    """Redirect entry point for Google OAuth. Stub until credentials are added."""
+    return {"message": "Google OAuth not configured yet. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to Railway env vars."}
+
+@app.delete("/auth/google/disconnect")
+def gcal_disconnect(user_id: int):
+    """Disconnects Google Calendar for this user."""
+    return {"success": True}
+
+@app.get("/meetings/{meeting_id}/attendees")
+def get_meeting_attendees(meeting_id: int):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT u.id AS user_id, u.full_name
+                FROM meeting_attendees ma
+                JOIN users u ON u.id = ma.user_id
+                WHERE ma.meeting_id = :meeting_id
+            """),
+            {"meeting_id": meeting_id}
         ).fetchall()
+    return [{"user_id": r.user_id, "full_name": r.full_name} for r in rows]
 
-    output = []
-
-    for row in rows:
-
-        output.append({
-            "id": row.id,
-            "title": row.title,
-            "date": str(row.task_date),
-            "start_slot": row.start_slot,
-            "end_slot": row.end_slot,
-            "status": row.status
-        })
-
-    return output
 
 @app.get("/calendar/combined")
 def calendar_combined(user_id: int, date: str):
