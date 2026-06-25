@@ -2707,7 +2707,22 @@ def create_calendar_task(
     sync_gcal: bool = False
 ):
     try:
+        # Safety: ensure table exists even if startup event was skipped
         with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS calendar_tasks (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     INT NOT NULL,
+                    title       TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    task_date   DATE NOT NULL,
+                    start_slot  INT NOT NULL,
+                    end_slot    INT NOT NULL,
+                    color       TEXT DEFAULT '#7c3aed',
+                    status      TEXT DEFAULT 'pending',
+                    created_at  TIMESTAMP DEFAULT NOW()
+                )
+            """))
             task_id = conn.execute(
                 text("""
                     INSERT INTO calendar_tasks
@@ -2722,6 +2737,7 @@ def create_calendar_task(
             ).scalar()
         return {"success": True, "task_id": task_id, "gcal_synced": False}
     except Exception as e:
+        print(f"[ERROR] create_calendar_task failed: {e}", flush=True)
         return {"success": False, "message": str(e)}
 
 
