@@ -30,7 +30,11 @@ class MeetingRequest(BaseModel):
     organizer_id: int
     location: str = ""
     attendees: List[int]
+import os
+import smtplib
 
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 
 
@@ -2849,3 +2853,43 @@ def get_all_users():
             text("SELECT id, full_name, email, role FROM users ORDER BY full_name")
         )
         return [dict(row._mapping) for row in result]
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+
+
+def send_email(to_email, subject, body):
+
+    msg = MIMEMultipart()
+
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = to_email
+    msg["Subject"] = subject
+
+    msg.attach(
+        MIMEText(body, "html")
+    )
+
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+
+        server.starttls()
+
+        server.login(
+            EMAIL_ADDRESS,
+            EMAIL_PASSWORD
+        )
+
+        server.send_message(msg)
+
+@app.post("/test-email")
+def test_email():
+
+    send_email(
+        "krishdhiliwal@gmail.com",
+        "Panache Test",
+        """
+        <h2>Email Working ✅</h2>
+        <p>This is a test email from Panache WMS.</p>
+        """
+    )
+
+    return {"success": True}
