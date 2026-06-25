@@ -2896,42 +2896,59 @@ def send_sales_projection_reminders():
         result = conn.execute(text("""
             SELECT full_name, email
             FROM users
-            WHERE status = 'active'
-            AND email LIKE '%@%'
+            WHERE email IS NOT NULL
+              AND email LIKE '%@%'
+              AND LENGTH(email) > 5
+              AND status = 'active'
         """))
 
         employees = result.fetchall()
 
     sent = 0
+    failed = 0
 
     for emp in employees:
 
-        full_name = emp.full_name
-        email = emp.email
+        try:
 
-        send_email(
-            email,
-            "Sales Projection Reminder",
-            f"""
-            <h2>Weekly Sales Projection Reminder</h2>
+            full_name = emp.full_name
+            email = emp.email
 
-            <p>Hi {full_name},</p>
+            response = send_email(
+                email,
+                "Sales Projection Reminder",
+                f"""
+                <h2>Weekly Sales Projection Reminder</h2>
 
-            <p>Please fill your sales projections for this week.</p>
+                <p>Hi {full_name},</p>
 
-            <p>
-            Login to Panache WMS and update your projections.
-            </p>
+                <p>Please fill your sales projections for this week.</p>
 
-            <p>Regards,<br>Panache WMS</p>
-            """
-        )
+                <p>Login to Panache WMS and update your projections.</p>
 
-        sent += 1
+                <p>Regards,<br>Panache WMS</p>
+                """
+            )
+
+            if response.get("id"):
+                sent += 1
+            else:
+                failed += 1
+                print(f"Failed email: {email} -> {response}")
+
+        except Exception as e:
+
+            failed += 1
+
+            print(f"Failed email: {email} -> {e}")
+
+            continue
 
     return {
         "success": True,
-        "emails_sent": sent
+        "sent": sent,
+        "failed": failed,
+        "total": len(employees)
     }
 
 @app.post("/send-sales-reminders")
