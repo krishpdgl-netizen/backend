@@ -2885,3 +2885,62 @@ def test_email():
     )
 
     return result
+def send_sales_projection_reminders():
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT full_name, email
+        FROM users
+        WHERE status = 'active'
+        AND email IS NOT NULL
+        AND email <> ''
+    """)
+
+    employees = cur.fetchall()
+
+    sent = 0
+
+    for emp in employees:
+
+        full_name = emp["full_name"]
+        email = emp["email"]
+
+        send_email(
+            email,
+            "Sales Projection Reminder",
+            f"""
+            <h2>Weekly Sales Projection Reminder</h2>
+
+            <p>Hi {full_name},</p>
+
+            <p>
+            Please fill your sales projections for the current week.
+            </p>
+
+            <p>
+            Login to Panache WMS and update your projections.
+            </p>
+
+            <br>
+
+            <p>Regards,<br>Panache WMS</p>
+            """
+        )
+
+        sent += 1
+
+    cur.close()
+    conn.close()
+
+    return {
+        "success": True,
+        "emails_sent": sent
+    }
+
+
+@app.post("/send-sales-reminders")
+def send_sales_reminders():
+
+    return send_sales_projection_reminders()
