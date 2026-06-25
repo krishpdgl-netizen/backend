@@ -35,13 +35,35 @@ class MeetingRequest(BaseModel):
 
 
 app = FastAPI()
+
+# ── CORS ─────────────────────────────────────────────────
+# allow_origins=["*"] with allow_credentials=False is correct.
+# We also add an explicit OPTIONS catch-all so Railway's proxy
+# never swallows the preflight before FastAPI can respond to it.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=600,
 )
+
+from fastapi import Request
+from fastapi.responses import Response
+
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str, request: Request):
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin":  "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age":       "600",
+        },
+    )
 DATABASE_URL = "postgresql://postgres:OJKDsedhwgqyuvTubYNEJssZeJkRUgiS@thomas.proxy.rlwy.net:22127/railway"
 
 engine = create_engine(
