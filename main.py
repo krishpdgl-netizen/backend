@@ -277,28 +277,6 @@ def get_profile(user_id: int):
     }
 
 
-@app.get("/my-tasks")
-def my_tasks(user_id: int):
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT *
-                FROM tasks
-                WHERE assigned_to = :user_id
-                AND status != 'Completed'
-            """),
-            {"user_id": user_id}
-        )
-
-        tasks = [
-            dict(row._mapping)
-            for row in result
-        ]
-
-    return tasks
-
 @app.get("/user")
 def get_user(email: str):
 
@@ -401,26 +379,6 @@ def my_tasks(user_id: int):
             {
                 "user_id": user_id
             }
-        )
-
-        tasks = [
-            dict(row._mapping)
-            for row in result
-        ]
-
-    return tasks
-
-@app.get("/all-tasks")
-def all_tasks():
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT *
-                FROM tasks
-                ORDER BY created_at DESC
-            """)
         )
 
         tasks = [
@@ -655,61 +613,6 @@ def get_all_tasks():
     return tasks
 
 
-
-@app.get("/employee-performance")
-def employee_performance():
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-            SELECT
-            u.id,
-            u.full_name,
-
-            COUNT(t.id) as assigned,
-
-            COUNT(
-                CASE
-                WHEN t.status='Completed'
-                THEN 1
-                END
-            ) as completed
-
-            FROM users u
-
-            LEFT JOIN tasks t
-            ON u.id=t.assigned_to
-
-            WHERE u.role='employee'
-
-            GROUP BY u.id,u.full_name
-            """)
-        )
-
-        data=[]
-
-        for row in result:
-
-            assigned=row.assigned
-            completed=row.completed
-
-            score=0
-
-            if assigned>0:
-                score=round(
-                    completed/assigned*100
-                )
-
-            data.append({
-                "id":row.id,
-                "name":row.full_name,
-                "assigned":assigned,
-                "completed":completed,
-                "score":score
-            })
-
-    return data
 
 @app.post("/delete-task")
 def delete_task(task_id:int):
@@ -2255,8 +2158,6 @@ def get_manager_remarks(manager_id: int):
 
     return [dict(r._mapping) for r in rows]
 
-# REMOVE the MeetingRequest class and replace /meetings/create with this:
-
 @app.post("/meetings/create")
 def create_meeting(
     title: str,
@@ -2334,56 +2235,37 @@ def get_month_meetings(user_id: int, month: str):
     ]
     
 @app.get("/meetings/day")
-def get_day_meetings(date: str):
-
+def get_day_meetings(date: str, user_id: int):
     with engine.connect() as conn:
-
         rows = conn.execute(
             text("""
-            SELECT
-                id,
-                title,
-                description,
-                meeting_date,
-                start_slot,
-                end_slot,
-                location,
-                organizer_id
-            FROM meetings
-            WHERE meeting_date=:date
-            ORDER BY start_slot
+            SELECT DISTINCT m.id, m.title, m.description,
+                m.meeting_date, m.start_slot, m.end_slot,
+                m.location, m.organizer_id
+            FROM meetings m
+            LEFT JOIN meeting_attendees a ON m.id = a.meeting_id
+            WHERE m.meeting_date = :date
+            AND (m.organizer_id = :user_id OR a.user_id = :user_id)
+            ORDER BY m.start_slot
             """),
-            {"date": date}
+            {"date": date, "user_id": user_id}
         ).fetchall()
 
-    output = []
-
-    for row in rows:
-
-        output.append({
-
-            "id": row.id,
-
-            "title": row.title,
-
-            "description": row.description,
-
-            "date": str(row.meeting_date),
-
-            "start_slot": row.start_slot,
-
-            "end_slot": row.end_slot,
-
-            "start_time": slot_to_time(row.start_slot),
-
-            "end_time": slot_to_time(row.end_slot),
-
-            "location": row.location,
-
-            "organizer_id": row.organizer_id
-        })
-
-    return output
+    return [
+        {
+            "id":           row.id,
+            "title":        row.title,
+            "description":  row.description,
+            "date":         str(row.meeting_date),
+            "start_slot":   row.start_slot,
+            "end_slot":     row.end_slot,
+            "start_time":   slot_to_time(row.start_slot),
+            "end_time":     slot_to_time(row.end_slot),
+            "location":     row.location,
+            "organizer_id": row.organizer_id,
+        }
+        for row in rows
+    ]
 
 @app.get("/meetings/user-availability")
 def user_availability(user_id:int, date:str):
@@ -2700,18 +2582,6 @@ def get_calendar_tasks(user_id: int, month: Optional[str] = None, date: Optional
 #       created_at  TIMESTAMP DEFAULT NOW()
 #   );
 
-class CalendarTaskRequest(BaseModel):
-    user_id: int
-    title: str
-    description: str = ""
-    task_date: str
-    start_slot: int
-    end_slot: int
-    color: str = "#7c3aed"
-    sync_gcal: bool = False
-
-# REMOVE CalendarTaskRequest class and replace /calendar-tasks/create with this:
-
 @app.post("/calendar-tasks/create")
 def create_calendar_task(
     user_id: int,
@@ -2725,30 +2595,6 @@ def create_calendar_task(
 ):
     try:
         with engine.begin() as conn:
-            # Ensure table exists and has all required columns
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS calendar_tasks (
-                    id          SERIAL PRIMARY KEY,
-                    user_id     INT NOT NULL,
-                    title       TEXT NOT NULL,
-                    description TEXT DEFAULT '',
-                    task_date   DATE NOT NULL,
-                    start_slot  INT NOT NULL,
-                    end_slot    INT NOT NULL,
-                    color       TEXT DEFAULT '#7c3aed',
-                    status      TEXT DEFAULT 'pending',
-                    created_at  TIMESTAMP DEFAULT NOW()
-                )
-            """))
-            # Add any columns that may be missing from an older table schema
-            for col_sql in [
-                "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'",
-                "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''",
-                "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS color TEXT DEFAULT '#7c3aed'",
-                "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
-            ]:
-                conn.execute(text(col_sql))
-
             task_id = conn.execute(
                 text("""
                     INSERT INTO calendar_tasks
@@ -2782,26 +2628,6 @@ def delete_calendar_task(task_id: int, user_id: int):
     return {"success": True}
 
 
-# ═══════════════════════════════════════════════════════
-# GOOGLE CALENDAR — STUB ENDPOINTS
-# (Replace with real OAuth once you set up Google Cloud credentials)
-# ═══════════════════════════════════════════════════════
-
-@app.get("/auth/google/status")
-def gcal_status(user_id: int):
-    """Returns whether this user has connected Google Calendar.
-    Currently always returns not-connected until OAuth is wired up."""
-    return {"connected": False}
-
-@app.get("/auth/google/login")
-def gcal_login(user_id: int):
-    """Redirect entry point for Google OAuth. Stub until credentials are added."""
-    return {"message": "Google OAuth not configured yet. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to Railway env vars."}
-
-@app.delete("/auth/google/disconnect")
-def gcal_disconnect(user_id: int):
-    """Disconnects Google Calendar for this user."""
-    return {"success": True}
 
 @app.get("/calendar/combined")
 def calendar_combined(user_id: int, date: str):
@@ -2810,17 +2636,13 @@ def calendar_combined(user_id: int, date: str):
 
         meetings = conn.execute(
             text("""
-            SELECT
-                title,
-                start_slot,
-                end_slot,
-                'meeting' as type
-            FROM meetings
-            WHERE meeting_date=:date
+            SELECT DISTINCT m.title, m.start_slot, m.end_slot, 'meeting' as type
+            FROM meetings m
+            LEFT JOIN meeting_attendees a ON m.id = a.meeting_id
+            WHERE m.meeting_date = :date
+            AND (m.organizer_id = :user_id OR a.user_id = :user_id)
             """),
-            {
-                "date": date
-            }
+            {"date": date, "user_id": user_id}
         ).fetchall()
 
         tasks = conn.execute(
