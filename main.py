@@ -45,7 +45,18 @@ class LeaveRequest(BaseModel):
     
 app = FastAPI()
 
+from typing import Optional
+from pydantic import BaseModel
 
+class EmployeeVoiceRequest(BaseModel):
+    user_id: int
+    employee_name: str
+    is_anonymous: bool
+    category: str
+    priority: str
+    subject: str
+    description: str
+    attachment: Optional[str] = None
 # ── AUTO-CREATE TABLES ON STARTUP ────────────────────────
 @app.on_event("startup")
 def create_tables():
@@ -2954,3 +2965,131 @@ def get_pending_leaves():
         """))
 
         return result.mappings().all()
+from sqlalchemy import text
+
+@app.post("/employee-voice")
+def submit_employee_voice(data: EmployeeVoiceRequest):
+
+    with engine.begin() as conn:
+
+        result = conn.execute(
+            text("""
+                INSERT INTO employee_voice
+                (
+                    user_id,
+                    employee_name,
+                    is_anonymous,
+                    category,
+                    priority,
+                    subject,
+                    description,
+                    attachment
+                )
+                VALUES
+                (
+                    :user_id,
+                    :employee_name,
+                    :is_anonymous,
+                    :category,
+                    :priority,
+                    :subject,
+                    :description,
+                    :attachment
+                )
+                RETURNING id
+            """),
+            {
+                "user_id": data.user_id,
+                "employee_name": data.employee_name,
+                "is_anonymous": data.is_anonymous,
+                "category": data.category,
+                "priority": data.priority,
+                "subject": data.subject,
+                "description": data.description,
+                "attachment": data.attachment
+            }
+        )
+
+        new_id = result.scalar()
+
+    return {
+        "success": True,
+        "id": new_id
+    }
+
+@app.get("/employee-voice/my/{user_id}")
+def get_my_voice(user_id: int):
+
+    with engine.connect() as conn:
+
+        result = conn.execute(
+            text("""
+                SELECT *
+                FROM employee_voice
+                WHERE
+                    user_id = :user_id
+                AND
+                    is_anonymous = FALSE
+                ORDER BY created_at DESC
+            """),
+            {
+                "user_id": user_id
+            }
+        )
+
+        return result.mappings().all()
+
+@app.get("/employee-voice")
+def get_employee_voice():
+
+    with engine.connect() as conn:
+
+        result = conn.execute(text("""
+            SELECT *
+            FROM employee_voice
+            ORDER BY created_at DESC
+        """))
+
+        rows = result.mappings().all()
+
+    response = []
+
+    for row in rows:
+
+        item = dict(row)
+
+        if item["is_anonymous"]:
+            item["employee_name"] = "Anonymous"
+
+        response.append(item)
+
+    return response
+
+class VoiceStatusUpdate(BaseModel):
+    status: str
+
+@app.post("/employee-voice/{voice_id}/status")
+def update_voice_status(
+    voice_id: int,
+    data: VoiceStatusUpdate
+):
+
+    with engine.begin() as conn:
+
+        conn.execute(
+            text("""
+                UPDATE employee_voice
+                SET
+                    status = :status,
+                    responded_at = NOW()
+                WHERE id = :id
+            """),
+            {
+                "status": data.status,
+                "id": voice_id
+            }
+        )
+
+    return {
+        "success": True
+    }
