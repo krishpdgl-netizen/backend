@@ -57,6 +57,15 @@ class EmployeeVoiceRequest(BaseModel):
     subject: str
     description: str
     attachment: Optional[str] = None
+
+from pydantic import BaseModel
+from typing import Optional
+ 
+class VoidRequest(BaseModel):
+    void_reason: str
+
+
+
 # ── AUTO-CREATE TABLES ON STARTUP ────────────────────────
 @app.on_event("startup")
 def create_tables():
@@ -3093,3 +3102,240 @@ def update_voice_status(
     return {
         "success": True
     }
+def _next_serial(conn) -> str:
+    """
+    Atomically increments the counter and returns the formatted serial number,
+    e.g. LH-0001, LH-0042, LH-0123.
+    Uses SELECT … FOR UPDATE to prevent race conditions.
+    """
+    row = conn.execute(
+        text("SELECT last_no FROM letterhead_serial_counter WHERE id=1 FOR UPDATE")
+    ).fetchone()
+ 
+    new_no = (row.last_no if row else 0) + 1
+ 
+    conn.execute(
+        text("UPDATE letterhead_serial_counter SET last_no = :n WHERE id=1"),
+        {"n": new_no}
+    )
+ 
+    return f"LH-{new_no:04d}"
+ 
+ 
+# ── GET ALL LETTERHEADS ──────────────────────────────────────
+@app.get("/letterheads")
+def get_letterheads():
+    """Return all letterhead records ordered newest-first."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT * FROM letterheads ORDER BY created_at DESC")
+        ).mappings().all()
+    return [dict(r) for r in rows]
+ 
+ 
+# ── GET NEXT SERIAL (preview only, does NOT increment) ───────
+@app.get("/letterheads/next-serial")
+def get_next_serial():
+    """
+    Returns what the next serial number WILL be, without consuming it.
+    Used by the frontend to preview the filename before generating.
+    """
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT last_no FROM letterhead_serial_counter WHERE id=1")
+        ).fetchone()
+    next_no = (row.last_no if row else 0) + 1
+    return {"next_serial": f"LH-{next_no:04d}"}
+ 
+ 
+# ── GENERATE & ISSUE (auto serial, stores body for re-download) ──
+@app.post("/letterheads/generate")
+def generate_letterhead(
+    category:          str,
+    department:        str,
+    purpose:           str,
+    recipient:         str,
+    issued_by:         str,
+    authorised_by:     str  = "",
+    body_content:      str  = "",
+    remarks:           str  = "",
+    issued_by_user_id: Optional[int] = None,
+):
+    """
+    Atomically allocates the next serial number, saves the record,
+    and returns all fields so the frontend can build the downloadable document.
+    """
+    from datetime import date
+ 
+    try:
+        with engine.begin() as conn:
+            serial_no = _next_serial(conn)
+ 
+            conn.execute(
+                text("""
+                    INSERT INTO letterheads
+                    (serial_no, date_issued, category, department, purpose,
+                     recipient, issued_by, authorised_by, body_content,
+                     remarks, issued_by_user_id)
+                    VALUES
+                    (:serial_no, CURRENT_DATE, :category, :department, :purpose,
+                     :recipient, :issued_by, :authorised_by, :body_content,
+                     :remarks, :issued_by_user_id)
+                """),
+                {
+                    "serial_no":          serial_no,
+                    "category":           category,
+                    "department":         department,
+                    "purpose":            purpose,
+                    "recipient":          recipient,
+                    "issued_by":          issued_by,
+                    "authorised_by":      authorised_by,
+                    "body_content":       body_content,
+                    "remarks":            remarks,
+                    "issued_by_user_id":  issued_by_user_id,
+                }
+            )
+ 
+        return {
+            "success":    True,
+            "serial_no":  serial_no,
+            "date_issued": str(date.today()),
+        }
+ 
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+ 
+ 
+# ── LOG EXISTING (manual entry, no serial auto-generation) ────
+@app.post("/letterheads/log")
+def log_letterhead(
+    serial_no:         str,
+    date_issued:       str,
+    category:          str,
+    department:        str,
+    purpose:           str,
+    recipient:         str,
+    issued_by:         str,
+    authorised_by:     str  = "",
+    remarks:           str  = "",
+    issued_by_user_id: Optional[int] = None,
+):
+    """
+    Logs a letterhead that was already issued outside the system.
+    The serial number is manually provided and must be unique.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO letterheads
+                    (serial_no, date_issued, category, department, purpose,
+                     recipient, issued_by, authorised_by, remarks, issued_by_user_id)
+                    VALUES
+                    (:serial_no, :date_issued, :category, :department, :purpose,
+                     :recipient, :issued_by, :authorised_by, :remarks, :issued_by_user_id)
+                """),
+                {
+                    "serial_no":          serial_no,
+                    "date_issued":        date_issued,
+                    "category":           category,
+                    "department":         department,
+                    "purpose":            purpose,
+                    "recipient":          recipient,
+                    "issued_by":          issued_by,
+                    "authorised_by":      authorised_by,
+                    "remarks":            remarks,
+                    "issued_by_user_id":  issued_by_user_id,
+                }
+            )
+ 
+        return {"success": True, "serial_no": serial_no}
+ 
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+ 
+ 
+# ── VOID A LETTERHEAD ────────────────────────────────────────
+@app.post("/letterheads/{letterhead_id}/void")
+def void_letterhead(letterhead_id: int, data: VoidRequest):
+    """
+    Marks a letterhead as Voided with a mandatory reason.
+    The record is preserved for audit purposes.
+    """
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("""
+                UPDATE letterheads
+                SET status      = 'Voided',
+                    void_reason = :reason
+                WHERE id = :id
+                RETURNING id
+            """),
+            {"reason": data.void_reason, "id": letterhead_id}
+        )
+        updated = result.fetchone()
+ 
+    if not updated:
+        return {"success": False, "message": "Letterhead not found."}
+ 
+    return {"success": True}
+ 
+ 
+# ── GET SINGLE LETTERHEAD ────────────────────────────────────
+@app.get("/letterheads/{letterhead_id}")
+def get_letterhead(letterhead_id: int):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT * FROM letterheads WHERE id = :id"),
+            {"id": letterhead_id}
+        ).mappings().fetchone()
+ 
+    if not row:
+        return {"success": False, "message": "Not found."}
+ 
+    return dict(row)
+ 
+ 
+# ── LETTERHEAD STATS ─────────────────────────────────────────
+@app.get("/letterheads/stats/summary")
+def letterhead_stats():
+    """Quick summary for dashboard stat cards."""
+    with engine.connect() as conn:
+        total = conn.execute(
+            text("SELECT COUNT(*) FROM letterheads")
+        ).scalar()
+ 
+        voided = conn.execute(
+            text("SELECT COUNT(*) FROM letterheads WHERE status='Voided'")
+        ).scalar()
+ 
+        this_month = conn.execute(
+            text("""
+                SELECT COUNT(*) FROM letterheads
+                WHERE DATE_TRUNC('month', date_issued) = DATE_TRUNC('month', CURRENT_DATE)
+            """)
+        ).scalar()
+ 
+        by_category = conn.execute(
+            text("""
+                SELECT category, COUNT(*) AS count
+                FROM letterheads
+                WHERE status != 'Voided'
+                GROUP BY category
+            """)
+        ).mappings().all()
+ 
+        counter_row = conn.execute(
+            text("SELECT last_no FROM letterhead_serial_counter WHERE id=1")
+        ).fetchone()
+ 
+    next_no = (counter_row.last_no if counter_row else 0) + 1
+ 
+    return {
+        "total":       total,
+        "voided":      voided,
+        "this_month":  this_month,
+        "by_category": [dict(r) for r in by_category],
+        "next_serial": f"LH-{next_no:04d}",
+    }
+ 
