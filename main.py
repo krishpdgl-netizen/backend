@@ -3148,6 +3148,25 @@ def get_next_serial():
     return {"next_serial": f"LH-{next_no:04d}"}
  
  
+# ── RESET SERIALS (wipes all records, resets counter to 0) ───
+@app.post("/letterheads/reset")
+def reset_letterheads():
+    """
+    Deletes ALL letterhead records and resets the serial counter
+    back to 0, so the next generated letterhead starts at LH-0001.
+    Destructive — intended for admin/manager use only.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM letterheads"))
+            conn.execute(
+                text("UPDATE letterhead_serial_counter SET last_no = 0 WHERE id=1")
+            )
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+ 
+ 
 # ── GENERATE & ISSUE (auto serial, stores body for re-download) ──
 @app.post("/letterheads/generate")
 def generate_letterhead(
