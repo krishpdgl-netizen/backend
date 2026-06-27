@@ -3312,34 +3312,68 @@ def get_letterhead(letterhead_id: int):
  
  
 # ── LETTERHEAD STATS ─────────────────────────────────────────
-@app.get("/letterheads/stats/summary")
-def letterhead_stats():
-    """Quick summary for dashboard stat cards."""
-    with engine.connect() as conn:
-        total = conn.execute(
-            text("SELECT COUNT(*) FROM letterheads")
-        ).scalar()
- 
-        voided = conn.execute(
-            text("SELECT COUNT(*) FROM letterheads WHERE status='Voided'")
-        ).scalar()
- 
-        this_month = conn.execute(
-            text("""
-                SELECT COUNT(*) FROM letterheads
-                WHERE DATE_TRUNC('month', date_issued) = DATE_TRUNC('month', CURRENT_DATE)
-            """)
-        ).scalar()
- 
-        counter_row = conn.execute(
-            text("SELECT last_no FROM letterhead_serial_counter WHERE id=1")
-        ).fetchone()
- 
-    next_no = (counter_row.last_no if counter_row else 0) + 1
- 
-    return {
-        "total":       total,
-        "voided":      voided,
-        "this_month":  this_month,
-                "next_serial": f"LH-{next_no:04d}",
-    }
+@app.post("/letterheads/log")
+def log_letterhead(
+    date_issued: str,
+    department: str,
+    purpose: str,
+    recipient: str,
+    issued_by: str,
+    authorised_by: str = "",
+    remarks: str = "",
+    issued_by_user_id: Optional[int] = None,
+):
+    try:
+        with engine.begin() as conn:
+            serial_no = _next_serial(conn)
+
+            conn.execute(
+                text("""
+                INSERT INTO letterheads
+                (
+                    serial_no,
+                    date_issued,
+                    department,
+                    purpose,
+                    recipient,
+                    issued_by,
+                    authorised_by,
+                    remarks,
+                    issued_by_user_id
+                )
+                VALUES
+                (
+                    :serial_no,
+                    :date_issued,
+                    :department,
+                    :purpose,
+                    :recipient,
+                    :issued_by,
+                    :authorised_by,
+                    :remarks,
+                    :issued_by_user_id
+                )
+                """),
+                {
+                    "serial_no": serial_no,
+                    "date_issued": date_issued,
+                    "department": department,
+                    "purpose": purpose,
+                    "recipient": recipient,
+                    "issued_by": issued_by,
+                    "authorised_by": authorised_by,
+                    "remarks": remarks,
+                    "issued_by_user_id": issued_by_user_id,
+                }
+            )
+
+        return {
+            "success": True,
+            "serial_no": serial_no
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "message": str(e)
+        }
