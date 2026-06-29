@@ -4797,3 +4797,282 @@ def report_employee_salary_history(emp_id: str):
             {"eid": emp_id}
         ).mappings().all()
     return [dict(r) for r in rows]
+
+
+# ---------- 2. MODELS + ROUTES ----------
+ 
+import json as _json
+from datetime import date as _date
+ 
+class ReminderCreate(BaseModel):
+    title: str
+    description: str = ""
+    category: str = "Other"
+    priority: str = "Medium"
+    assigned_to: int
+    created_by: int
+    start_date: Optional[str] = None
+    due_date: str
+    reminder_offsets: List[int] = [7, 3, 1, 0]
+    repeat_after_due: bool = False
+    amount: Optional[float] = None
+    related_module: Optional[str] = None
+    related_record_id: Optional[int] = None
+    remarks: str = ""
+ 
+ 
+class ReminderUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    priority: Optional[str] = None
+    status: Optional[str] = None
+    assigned_to: Optional[int] = None
+    start_date: Optional[str] = None
+    due_date: Optional[str] = None
+    reminder_offsets: Optional[List[int]] = None
+    repeat_after_due: Optional[bool] = None
+    amount: Optional[float] = None
+    remarks: Optional[str] = None
+ 
+ 
+class ReminderComplete(BaseModel):
+    completed_by: int
+    completion_notes: str = ""
+ 
+ 
+def _days_remaining(due_date):
+    if isinstance(due_date, str):
+        due_date = _date.fromisoformat(due_date)
+    return (due_date - _date.today()).days
+ 
+ 
+def _reminder_row_to_dict(r):
+    d = dict(r)
+    try:
+        d["reminder_offsets"] = _json.loads(d.get("reminder_offsets_json") or "[]")
+    except Exception:
+        d["reminder_offsets"] = []
+    d["days_remaining"] = _days_remaining(d["due_date"]) if d.get("due_date") else None
+    if d.get("amount") is not None:
+        d["amount"] = float(d["amount"])
+    for k in ("due_date", "start_date", "completed_on", "created_at", "updated_at"):
+        if d.get(k) is not None:
+            d[k] = str(d[k])
+    return d
+ 
+ 
+# ---------- LIST / SEARCH / FILTER ----------
+@app.get("/reminders")
+def get_reminders(
+    user_id: Optional[int] = None,
+    role: Optional[str] = None,
+    category: Optional[str] = None,
+    priority: Optional[str] = None,
+    status: Optional[str] = None,
+    assigned_to: Optional[int] = None,
+    overdue: Optional[bool] = None,
+    search: Optional[str] = None,
+):
+    filters, params = [], {}
+ 
+    # Role-based visibility: employees only see their own; admins/managers see all
+    if role == "employee" and user_id:
+        filters.append("assigned_to = :uid")
+        params["uid"] = user_id
+ 
+    if category:
+        filters.append("category = :cat"); params["cat"] = category
+    if priority:
+        filters.append("priority = :pri"); params["pri"] = priority
+    if status:
+        filters.append("status = :st"); params["st"] = status
+    if assigned_to:
+        filters.append("assigned_to = :ato"); params["ato"] = assigned_to
+    if search:
+        filters.append("(title ILIKE :s OR description ILIKE :s)")
+        params["s"] = f"%{search}%"
+    if overdue:
+        filters.append("due_date < CURRENT_DATE AND status = 'Open'")
+ 
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"""
+                SELECT r.*, u.full_name AS assigned_to_name
+                FROM reminders r
+                LEFT JOIN users u ON u.id = r.assigned_to
+                {where}
+                ORDER BY due_date ASC
+            """),
+            params
+        ).mappings().all()
+ 
+    return [_reminder_row_to_dict(r) for r in rows]
+ 
+ 
+# ---------- TODAY'S DUE REMINDERS (for dashboard widget) ----------
+@app.get("/reminders/today")
+def get_todays_reminders(user_id: int, role: str = "employee"):
+    """
+    Returns only reminders whose days_remaining matches one of their
+    configured offsets (or is <= 0, i.e. due today / overdue).
+    """
+    filters = ["status = 'Open'"]
+    params = {}
+    if role == "employee":
+        filters.append("assigned_to = :uid")
+        params["uid"] = user_id
+ 
+    where = "WHERE " + " AND ".join(filters)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"""
+                SELECT r.*, u.full_name AS assigned_to_name
+                FROM reminders r
+                LEFT JOIN users u ON u.id = r.assigned_to
+                {where}
+            """),
+            params
+        ).mappings().all()
+ 
+    due_now = []
+    for r in rows:
+        d = _reminder_row_to_dict(r)
+        days = d["days_remaining"]
+        offsets = d["reminder_offsets"] or [7, 3, 1, 0]
+        is_due = (days in offsets) or (days <= 0)
+        if is_due:
+            due_now.append(d)
+ 
+    due_now.sort(key=lambda x: x["days_remaining"])
+    return due_now
+ 
+ 
+# ---------- NOTIFICATION CENTER FEED ----------
+@app.get("/notifications/reminders")
+def get_reminder_notifications(user_id: int, role: str = "employee"):
+    """Same calculation as /reminders/today, shaped for the notification bell."""
+    items = get_todays_reminders(user_id, role)
+    feed = []
+    for r in items:
+        days = r["days_remaining"]
+        if days < 0:
+            line = f"Overdue by {abs(days)} day(s)"
+        elif days == 0:
+            line = "Due Today"
+        else:
+            line = f"Due in {days} day(s)"
+        feed.append({
+            "id": r["id"],
+            "title": r["title"],
+            "category": r["category"],
+            "priority": r["priority"],
+            "line": line,
+            "days_remaining": days,
+            "due_date": r["due_date"],
+        })
+    return feed
+ 
+ 
+# ---------- CREATE ----------
+@app.post("/reminders")
+def create_reminder(data: ReminderCreate):
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                text("""
+                    INSERT INTO reminders
+                    (title, description, category, priority, assigned_to, created_by,
+                     start_date, due_date, reminder_offsets_json, repeat_after_due,
+                     amount, related_module, related_record_id, remarks, status)
+                    VALUES
+                    (:title, :description, :category, :priority, :assigned_to, :created_by,
+                     :start_date, :due_date, :offsets, :repeat, :amount, :rel_mod, :rel_id,
+                     :remarks, 'Open')
+                    RETURNING id
+                """),
+                {
+                    "title": data.title,
+                    "description": data.description,
+                    "category": data.category,
+                    "priority": data.priority,
+                    "assigned_to": data.assigned_to,
+                    "created_by": data.created_by,
+                    "start_date": data.start_date,
+                    "due_date": data.due_date,
+                    "offsets": _json.dumps(data.reminder_offsets),
+                    "repeat": data.repeat_after_due,
+                    "amount": data.amount,
+                    "rel_mod": data.related_module,
+                    "rel_id": data.related_record_id,
+                    "remarks": data.remarks,
+                }
+            )
+            new_id = result.fetchone()[0]
+        return {"success": True, "id": new_id}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+ 
+ 
+# ---------- UPDATE ----------
+@app.put("/reminders/{reminder_id}")
+def update_reminder(reminder_id: int, data: ReminderUpdate):
+    fields, params = [], {"id": reminder_id}
+    payload = data.dict(exclude_unset=True)
+ 
+    if "reminder_offsets" in payload:
+        payload["reminder_offsets_json"] = _json.dumps(payload.pop("reminder_offsets"))
+ 
+    for k, v in payload.items():
+        fields.append(f"{k} = :{k}")
+        params[k] = v
+ 
+    if not fields:
+        return {"success": False, "message": "No fields to update."}
+ 
+    fields.append("updated_at = NOW()")
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(f"UPDATE reminders SET {', '.join(fields)} WHERE id = :id RETURNING id"),
+            params
+        )
+        row = result.fetchone()
+    if not row:
+        return {"success": False, "message": "Reminder not found."}
+    return {"success": True}
+ 
+ 
+# ---------- MARK COMPLETE ----------
+@app.post("/reminders/{reminder_id}/complete")
+def complete_reminder(reminder_id: int, data: ReminderComplete):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("""
+                UPDATE reminders
+                SET status='Completed', completed_on=NOW(),
+                    completed_by=:cb, completion_notes=:notes, updated_at=NOW()
+                WHERE id=:id
+                RETURNING id
+            """),
+            {"id": reminder_id, "cb": data.completed_by, "notes": data.completion_notes}
+        )
+        row = result.fetchone()
+    if not row:
+        return {"success": False, "message": "Reminder not found."}
+    return {"success": True}
+ 
+ 
+# ---------- DELETE ----------
+@app.delete("/reminders/{reminder_id}")
+def delete_reminder(reminder_id: int):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("DELETE FROM reminders WHERE id=:id RETURNING id"),
+            {"id": reminder_id}
+        )
+        row = result.fetchone()
+    if not row:
+        return {"success": False, "message": "Reminder not found."}
+    return {"success": True}
+ 
