@@ -4878,7 +4878,7 @@ def get_reminders(
  
     # Role-based visibility: employees only see their own; admins/managers see all
     if role == "employee" and user_id:
-        filters.append("assigned_to = :uid")
+        filters.append("r.assigned_to = :uid")
         params["uid"] = user_id
  
     if category:
@@ -4886,14 +4886,14 @@ def get_reminders(
     if priority:
         filters.append("priority = :pri"); params["pri"] = priority
     if status:
-        filters.append("status = :st"); params["st"] = status
+        filters.append("r.status = :st"); params["st"] = status
     if assigned_to:
-        filters.append("assigned_to = :ato"); params["ato"] = assigned_to
+        filters.append("r.assigned_to = :ato"); params["ato"] = assigned_to
     if search:
         filters.append("(title ILIKE :s OR description ILIKE :s)")
         params["s"] = f"%{search}%"
     if overdue:
-        filters.append("due_date < CURRENT_DATE AND status = 'Open'")
+        filters.append("r.due_date < CURRENT_DATE AND r.status = 'Open'")
  
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
     with engine.connect() as conn:
@@ -4903,7 +4903,7 @@ def get_reminders(
                 FROM reminders r
                 LEFT JOIN users u ON u.id = r.assigned_to
                 {where}
-                ORDER BY due_date ASC
+                ORDER BY r.due_date ASC
             """),
             params
         ).mappings().all()
@@ -4918,10 +4918,10 @@ def get_todays_reminders(user_id: int, role: str = "employee"):
     Returns only reminders whose days_remaining matches one of their
     configured offsets (or is <= 0, i.e. due today / overdue).
     """
-    filters = ["status = 'Open'"]
+    filters = ["r.status = 'Open'"]
     params = {}
     if role == "employee":
-        filters.append("assigned_to = :uid")
+        filters.append("r.assigned_to = :uid")
         params["uid"] = user_id
  
     where = "WHERE " + " AND ".join(filters)
@@ -5075,4 +5075,3 @@ def delete_reminder(reminder_id: int):
     if not row:
         return {"success": False, "message": "Reminder not found."}
     return {"success": True}
- 
