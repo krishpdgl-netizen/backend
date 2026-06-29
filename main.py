@@ -3612,6 +3612,116 @@ def delete_attendance(attendance_id: int):
     return {"success": True}
 
 
+# ================================================================
+# SELF-SERVICE PUNCH IN / PUNCH OUT
+# ================================================================
+
+@app.post("/attendance/checkin")
+def checkin(emp_id: str):
+    """
+    Employee punches in for today.
+    Creates attendance row with check_in = current IST time.
+    Calculates late_minutes vs office_start_time from attendance_settings.
+    """
+    from datetime import datetime as _dt
+    now_ist = _dt.now(ZoneInfo("Asia/Kolkata"))
+    today   = now_ist.date().isoformat()
+    ci_str  = now_ist.strftime("%H:%M")
+
+    with engine.connect() as conn:
+        user = conn.execute(
+            text("SELECT full_name FROM users WHERE id = :id OR CAST(id AS TEXT) = :ids"),
+            {"id": int(emp_id) if emp_id.isdigit() else -1, "ids": emp_id}
+        ).fetchone()
+        existing = conn.execute(
+            text("SELECT id, check_in FROM attendance WHERE emp_id=:eid AND att_date=:d"),
+            {"eid": emp_id, "d": today}
+        ).fetchone()
+        settings = _get_settings(conn)
+
+    if existing and existing.check_in:
+        ci_disp = str(existing.check_in)[:5]
+        return {"success": False, "message": f"Already checked in at {ci_disp}"}
+
+    office_start = settings.get("office_start_time", "09:00")
+    grace        = int(settings.get("late_grace_minutes", 10))
+    os_h, os_m   = map(int, office_start.split(":"))
+    ci_h, ci_m   = map(int, ci_str.split(":"))
+    late_mins    = max(0, (ci_h * 60 + ci_m) - (os_h * 60 + os_m) - grace)
+    emp_name     = user.full_name if user else emp_id
+
+    if existing:
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE attendance SET check_in=:ci, status='Present', late_minutes=:late, updated_at=NOW() WHERE emp_id=:eid AND att_date=:d"),
+                {"ci": ci_str, "late": late_mins, "eid": emp_id, "d": today}
+            )
+    else:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO attendance (emp_id, emp_name, att_date, check_in, status, late_minutes, source, created_at, updated_at)
+                    VALUES (:eid, :ename, :d, :ci, 'Present', :late, 'self', NOW(), NOW())
+                """),
+                {"eid": emp_id, "ename": emp_name, "d": today, "ci": ci_str, "late": late_mins}
+            )
+
+    return {
+        "success": True,
+        "check_in": ci_str,
+        "late_minutes": late_mins,
+        "message": f"Checked in at {ci_str}" + (f" ({late_mins} min late)" if late_mins > 0 else "")
+    }
+
+
+@app.post("/attendance/checkout")
+def checkout(emp_id: str):
+    """
+    Employee punches out for today.
+    Updates check_out, recalculates working_hours and overtime.
+    """
+    from datetime import datetime as _dt
+    now_ist = _dt.now(ZoneInfo("Asia/Kolkata"))
+    today   = now_ist.date().isoformat()
+    co_str  = now_ist.strftime("%H:%M")
+
+    with engine.connect() as conn:
+        rec = conn.execute(
+            text("SELECT id, check_in, check_out FROM attendance WHERE emp_id=:eid AND att_date=:d"),
+            {"eid": emp_id, "d": today}
+        ).fetchone()
+        settings = _get_settings(conn)
+
+    if not rec:
+        return {"success": False, "message": "No check-in found for today. Please check in first."}
+    if rec.check_out:
+        return {"success": False, "message": f"Already checked out at {str(rec.check_out)[:5]}"}
+
+    ci_str    = str(rec.check_in)[:5] if rec.check_in else None
+    hours_str = _calc_hours(ci_str, co_str)
+    std_hours = float(settings.get("standard_work_hours", 9.0))
+    ot_hours  = 0.0
+    if ci_str:
+        ci_h, ci_m = map(int, ci_str.split(":"))
+        co_h, co_m = map(int, co_str.split(":"))
+        worked_mins = (co_h * 60 + co_m) - (ci_h * 60 + ci_m)
+        ot_hours = round(max(0, worked_mins - std_hours * 60) / 60, 2)
+
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE attendance SET check_out=:co, working_hours=:h, overtime=:ot, updated_at=NOW() WHERE emp_id=:eid AND att_date=:d"),
+            {"co": co_str, "h": hours_str, "ot": ot_hours, "eid": emp_id, "d": today}
+        )
+
+    return {
+        "success": True,
+        "check_out": co_str,
+        "working_hours": hours_str,
+        "overtime": ot_hours,
+        "message": f"Checked out at {co_str}. Total: {hours_str}"
+    }
+
+
 @app.get("/attendance/summary/today")
 def attendance_summary_today():
     """Quick stat cards for admin dashboard — today's counts."""
@@ -3842,11 +3952,15 @@ def approve_correction(correction_id: int, data: CorrectionReview):
             {"eid": corr["emp_id"], "d": corr["att_date"]}
         ).mappings().fetchone()
 
-        orig_in  = str(att["check_in"])  if att and att["check_in"]  else "—"
-        orig_out = str(att["check_out"]) if att and att["check_out"] else "—"
+        # Strip seconds from TIME objects returned by PostgreSQL ("HH:MM:SS" → "HH:MM")
+        def _t(val):
+            return str(val)[:5] if val else None
 
-        final_ci = data.final_check_in  or (str(att["check_in"])  if att and att["check_in"]  else None)
-        final_co = data.final_check_out or (str(att["check_out"]) if att and att["check_out"] else None)
+        orig_in  = _t(att["check_in"])  if att else None
+        orig_out = _t(att["check_out"]) if att else None
+
+        final_ci = data.final_check_in  or (_t(att["check_in"])  if att else None)
+        final_co = data.final_check_out or (_t(att["check_out"]) if att else None)
         new_hours = _calc_hours(final_ci, final_co)
 
         # Update attendance
@@ -3897,8 +4011,8 @@ def approve_correction(correction_id: int, data: CorrectionReview):
                 "d":        corr["att_date"],
                 "orig_in":  orig_in,
                 "orig_out": orig_out,
-                "new_in":   final_ci or "—",
-                "new_out":  final_co or "—",
+                "new_in":   final_ci,
+                "new_out":  final_co,
                 "reason":   corr["reason"],
                 "by":       data.reviewed_by,
             }
@@ -4683,4 +4797,3 @@ def report_employee_salary_history(emp_id: str):
             {"eid": emp_id}
         ).mappings().all()
     return [dict(r) for r in rows]
-
