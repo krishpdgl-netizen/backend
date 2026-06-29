@@ -4878,9 +4878,9 @@ def get_reminders(
  
     # Role-based visibility: employees only see their own; admins/managers see all
     # Every user only sees reminders they created
-if user_id:
-    filters.append("created_by = :uid")
-    params["uid"] = user_id
+    if user_id:
+        filters.append("created_by = :uid")
+        params["uid"] = user_id
  
     if category:
         filters.append("category = :cat"); params["cat"] = category
