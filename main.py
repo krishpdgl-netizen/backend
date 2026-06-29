@@ -3646,22 +3646,16 @@ def checkin(emp_id: str):
     late_mins    = max(0, (ci_h * 60 + ci_m) - (os_h * 60 + os_m) - grace)
     emp_name     = user.full_name if user else emp_id
 
+    if existing and existing.check_in:
+        # Already checked in — return the existing record id so frontend can handle re-punch via PUT
+        ci_disp = str(existing.check_in)[:5]
+        return {"success": False, "already_checked_in": True, "record_id": existing.id, "check_in": ci_disp, "message": f"Already checked in at {ci_disp}"}
+
     if existing:
-        # Always allow re-punch-in: overwrite check_in and clear check_out so the day restarts cleanly
         with engine.begin() as conn:
             conn.execute(
-                text("""
-                    UPDATE attendance
-                    SET check_in=:ci,
-                        check_out=:co,
-                        working_hours=:wh,
-                        overtime=:ot,
-                        status='Present',
-                        late_minutes=:late,
-                        updated_at=NOW()
-                    WHERE emp_id=:eid AND att_date=:d
-                """),
-                {"ci": ci_str, "co": None, "wh": None, "ot": 0, "late": late_mins, "eid": emp_id, "d": today}
+                text("UPDATE attendance SET check_in=:ci, status='Present', late_minutes=:late, updated_at=NOW() WHERE emp_id=:eid AND att_date=:d"),
+                {"ci": ci_str, "late": late_mins, "eid": emp_id, "d": today}
             )
     else:
         with engine.begin() as conn:
