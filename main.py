@@ -3287,3 +3287,1400 @@ def letterhead_stats():
         "by_department": [dict(r) for r in by_dept],
         "next_serial": f"LH-{next_no:05d}",
     }
+
+# ================================================================
+# ATTENDANCE & PAYROLL MODULE
+# Paste this entire block at the bottom of your existing main.py
+# (before the last closing lines, after the letterhead endpoints)
+# ================================================================
+
+from datetime import date, timedelta
+from decimal import Decimal
+
+
+# ── PYDANTIC MODELS ─────────────────────────────────────────────
+
+class AttendanceRecord(BaseModel):
+    emp_id: str
+    emp_name: str
+    department: str = ""
+    att_date: str                          # YYYY-MM-DD
+    check_in: Optional[str] = None        # HH:MM
+    check_out: Optional[str] = None       # HH:MM
+    working_hours: Optional[str] = "—"
+    status: str = "Present"
+    late_minutes: int = 0
+    early_leaving: int = 0
+    overtime: float = 0.0
+    remarks: str = ""
+    source: str = "manual"
+    created_by: Optional[int] = None
+
+
+class AttendancePatch(BaseModel):
+    check_in: Optional[str] = None
+    check_out: Optional[str] = None
+    working_hours: Optional[str] = None
+    status: Optional[str] = None
+    late_minutes: Optional[int] = None
+    early_leaving: Optional[int] = None
+    overtime: Optional[float] = None
+    remarks: Optional[str] = None
+
+
+class CorrectionRequest(BaseModel):
+    emp_id: str
+    emp_name: str
+    department: str = ""
+    att_date: str
+    issue_type: str
+    req_check_in: Optional[str] = None
+    req_check_out: Optional[str] = None
+    reason: str
+    attachment_url: Optional[str] = None
+
+
+class CorrectionReview(BaseModel):
+    final_check_in: Optional[str] = None
+    final_check_out: Optional[str] = None
+    admin_notes: str = ""
+    reviewed_by: str
+
+
+class SalaryStructure(BaseModel):
+    emp_id: str
+    emp_name: str
+    basic_salary: float = 0
+    hra: float = 0
+    special_allowance: float = 0
+    travel_allowance: float = 0
+    medical_allowance: float = 0
+    bonus: float = 0
+    incentives: float = 0
+    pf_pct: float = 12
+    esic_pct: float = 0.75
+    professional_tax: float = 200
+    income_tax: float = 0
+    other_deductions: float = 0
+    effective_from: Optional[str] = None
+    created_by: Optional[int] = None
+
+
+class PayrollUnlockRequest(BaseModel):
+    unlocked_by: str
+
+
+class HolidayCreate(BaseModel):
+    holiday_date: str
+    name: str
+    holiday_type: str = "Public"
+
+
+class AttendanceSettingsUpdate(BaseModel):
+    correction_window_hours: Optional[int] = None
+    standard_work_hours: Optional[float] = None
+    late_grace_minutes: Optional[int] = None
+    overtime_after_hours: Optional[float] = None
+    office_start_time: Optional[str] = None
+
+
+# ── HELPERS ─────────────────────────────────────────────────────
+
+def _calc_hours(check_in: Optional[str], check_out: Optional[str]) -> str:
+    """Return friendly string e.g. '8h 30m' or '—'."""
+    if not check_in or not check_out:
+        return "—"
+    try:
+        fmt = "%H:%M"
+        from datetime import datetime as _dt
+        ci = _dt.strptime(check_in, fmt)
+        co = _dt.strptime(check_out, fmt)
+        mins = int((co - ci).total_seconds() / 60)
+        if mins <= 0:
+            return "—"
+        h, m = divmod(mins, 60)
+        return f"{h}h {m}m" if m else f"{h}h"
+    except Exception:
+        return "—"
+
+
+def _working_days_in_month(year: int, month: int) -> int:
+    """Count Mon-Fri days in the given month (no holiday awareness)."""
+    import calendar
+    total = 0
+    for d in range(1, calendar.monthrange(year, month)[1] + 1):
+        if date(year, month, d).weekday() < 5:
+            total += 1
+    return total
+
+
+def _get_settings(conn) -> dict:
+    row = conn.execute(text("SELECT * FROM attendance_settings WHERE id=1")).mappings().fetchone()
+    if row:
+        return dict(row)
+    return {
+        "correction_window_hours": 24,
+        "standard_work_hours": 9.0,
+        "late_grace_minutes": 10,
+        "overtime_after_hours": 9.0,
+        "office_start_time": "09:00",
+    }
+
+
+# ================================================================
+# ATTENDANCE SETTINGS
+# ================================================================
+
+@app.get("/attendance/settings")
+def get_attendance_settings():
+    """Return configurable attendance settings."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT * FROM attendance_settings WHERE id=1")
+        ).mappings().fetchone()
+    return dict(row) if row else {}
+
+
+@app.patch("/attendance/settings")
+def update_attendance_settings(data: AttendanceSettingsUpdate):
+    """Update one or more attendance settings fields."""
+    updates = {k: v for k, v in data.dict().items() if v is not None}
+    if not updates:
+        return {"success": False, "message": "Nothing to update."}
+
+    set_clause = ", ".join(f"{k} = :{k}" for k in updates)
+    updates["updated_at_val"] = datetime.now()
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"UPDATE attendance_settings SET {set_clause}, updated_at = :updated_at_val WHERE id=1"),
+            updates
+        )
+    return {"success": True}
+
+
+# ================================================================
+# ATTENDANCE RECORDS
+# ================================================================
+
+@app.get("/attendance")
+def get_attendance(
+    emp_id: Optional[str]    = None,
+    att_date: Optional[str]  = None,
+    month: Optional[str]     = None,   # YYYY-MM
+    department: Optional[str]= None,
+    status: Optional[str]    = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str]   = None,
+):
+    """
+    Fetch attendance records with optional filters.
+    - emp_id      → single employee
+    - att_date    → exact date  (YYYY-MM-DD)
+    - month       → all records for that month  (YYYY-MM)
+    - department  → filter by dept
+    - status      → Present | Absent | …
+    - from_date / to_date → date range
+    """
+    filters = []
+    params: dict = {}
+
+    if emp_id:
+        filters.append("emp_id = :emp_id")
+        params["emp_id"] = emp_id
+    if att_date:
+        filters.append("att_date = :att_date")
+        params["att_date"] = att_date
+    if month:
+        filters.append("TO_CHAR(att_date,'YYYY-MM') = :month")
+        params["month"] = month
+    if department:
+        filters.append("department = :department")
+        params["department"] = department
+    if status:
+        filters.append("status = :status")
+        params["status"] = status
+    if from_date:
+        filters.append("att_date >= :from_date")
+        params["from_date"] = from_date
+    if to_date:
+        filters.append("att_date <= :to_date")
+        params["to_date"] = to_date
+
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    sql = f"SELECT * FROM attendance {where} ORDER BY att_date DESC, emp_id"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(sql), params).mappings().all()
+
+    return [dict(r) for r in rows]
+
+
+@app.post("/attendance")
+def create_attendance(data: AttendanceRecord):
+    """
+    Create a single attendance record.
+    Raises HTTP 409 if a record already exists for emp_id + att_date.
+    """
+    hours = data.working_hours if data.working_hours and data.working_hours != "—" else _calc_hours(data.check_in, data.check_out)
+
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                text("""
+                    INSERT INTO attendance
+                        (emp_id, emp_name, department, att_date,
+                         check_in, check_out, working_hours, status,
+                         late_minutes, early_leaving, overtime, remarks,
+                         source, created_by, updated_at, created_at)
+                    VALUES
+                        (:emp_id, :emp_name, :department, :att_date,
+                         :check_in, :check_out, :working_hours, :status,
+                         :late_minutes, :early_leaving, :overtime, :remarks,
+                         :source, :created_by, NOW(), NOW())
+                    RETURNING id
+                """),
+                {
+                    "emp_id":       data.emp_id,
+                    "emp_name":     data.emp_name,
+                    "department":   data.department,
+                    "att_date":     data.att_date,
+                    "check_in":     data.check_in,
+                    "check_out":    data.check_out,
+                    "working_hours":hours,
+                    "status":       data.status,
+                    "late_minutes": data.late_minutes,
+                    "early_leaving":data.early_leaving,
+                    "overtime":     data.overtime,
+                    "remarks":      data.remarks,
+                    "source":       data.source,
+                    "created_by":   data.created_by,
+                }
+            )
+            new_id = result.fetchone()[0]
+        return {"success": True, "id": new_id}
+    except Exception as e:
+        if "unique" in str(e).lower():
+            return {"success": False, "message": "Attendance record already exists for this employee on this date."}
+        return {"success": False, "message": str(e)}
+
+
+@app.put("/attendance/{attendance_id}")
+def update_attendance(attendance_id: int, data: AttendancePatch):
+    """Full or partial update of an attendance record."""
+    updates = {k: v for k, v in data.dict().items() if v is not None}
+    if not updates:
+        return {"success": False, "message": "Nothing to update."}
+
+    # Recalculate hours if times changed
+    if "check_in" in updates or "check_out" in updates:
+        with engine.connect() as conn:
+            existing = conn.execute(
+                text("SELECT check_in, check_out FROM attendance WHERE id=:id"),
+                {"id": attendance_id}
+            ).fetchone()
+        ci = updates.get("check_in", str(existing.check_in) if existing and existing.check_in else None)
+        co = updates.get("check_out", str(existing.check_out) if existing and existing.check_out else None)
+        updates["working_hours"] = _calc_hours(ci, co)
+
+    updates["updated_at"] = datetime.now()
+    set_clause = ", ".join(f"{k} = :{k}" for k in updates)
+
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(f"UPDATE attendance SET {set_clause} WHERE id=:att_id RETURNING id"),
+            {**updates, "att_id": attendance_id}
+        )
+        row = result.fetchone()
+
+    if not row:
+        return {"success": False, "message": "Record not found."}
+    return {"success": True}
+
+
+@app.delete("/attendance/{attendance_id}")
+def delete_attendance(attendance_id: int):
+    """Delete an attendance record (admin only — enforce role on frontend)."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("DELETE FROM attendance WHERE id=:id RETURNING id"),
+            {"id": attendance_id}
+        )
+        row = result.fetchone()
+    if not row:
+        return {"success": False, "message": "Record not found."}
+    return {"success": True}
+
+
+@app.get("/attendance/summary/today")
+def attendance_summary_today():
+    """Quick stat cards for admin dashboard — today's counts."""
+    today_str = date.today().isoformat()
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT status, COUNT(*) AS cnt FROM attendance WHERE att_date=:d GROUP BY status"),
+            {"d": today_str}
+        ).mappings().all()
+        total = conn.execute(text("SELECT COUNT(*) FROM attendance")).scalar()
+        late  = conn.execute(
+            text("SELECT COUNT(*) FROM attendance WHERE att_date=:d AND late_minutes > 0"),
+            {"d": today_str}
+        ).scalar()
+    status_map = {r["status"]: r["cnt"] for r in rows}
+    return {
+        "present": status_map.get("Present", 0) + status_map.get("Work From Home", 0),
+        "absent":  status_map.get("Absent", 0),
+        "leave":   status_map.get("Leave", 0),
+        "late":    late,
+        "total_records": total,
+    }
+
+
+@app.get("/attendance/employee/{emp_id}/monthly-summary")
+def employee_monthly_summary(emp_id: str, month: str):
+    """
+    Returns summary counts for an employee for a given month (YYYY-MM).
+    Used by the employee My Attendance dashboard cards.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT status, COUNT(*) AS cnt,
+                       SUM(late_minutes) AS total_late,
+                       SUM(overtime)     AS total_ot
+                FROM attendance
+                WHERE emp_id = :emp_id
+                  AND TO_CHAR(att_date,'YYYY-MM') = :month
+                GROUP BY status
+            """),
+            {"emp_id": emp_id, "month": month}
+        ).mappings().all()
+
+    status_map = {r["status"]: r for r in rows}
+    present = (status_map.get("Present", {}).get("cnt") or 0) + \
+              (status_map.get("Work From Home", {}).get("cnt") or 0) + \
+              (status_map.get("Manual Entry", {}).get("cnt") or 0)
+    return {
+        "present":    present,
+        "absent":     status_map.get("Absent",   {}).get("cnt") or 0,
+        "leave":      status_map.get("Leave",    {}).get("cnt") or 0,
+        "half_day":   status_map.get("Half Day", {}).get("cnt") or 0,
+        "late_days":  sum(1 for r in rows if (r.get("total_late") or 0) > 0),
+        "overtime_hours": float(sum((r.get("total_ot") or 0) for r in rows)),
+    }
+
+
+# ================================================================
+# ATTENDANCE CORRECTION REQUESTS
+# ================================================================
+
+@app.get("/attendance/corrections")
+def get_corrections(
+    emp_id: Optional[str]     = None,
+    status: Optional[str]     = None,
+    department: Optional[str] = None,
+    att_date: Optional[str]   = None,
+):
+    """List correction requests. HR/Admin see all; filter by emp_id for self-service."""
+    filters, params = [], {}
+    if emp_id:
+        filters.append("emp_id = :emp_id"); params["emp_id"] = emp_id
+    if status:
+        filters.append("status = :status"); params["status"] = status
+    if department:
+        filters.append("department = :department"); params["department"] = department
+    if att_date:
+        filters.append("att_date = :att_date"); params["att_date"] = att_date
+
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"SELECT * FROM attendance_corrections {where} ORDER BY submitted_at DESC"),
+            params
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.get("/attendance/corrections/{correction_id}")
+def get_correction_detail(correction_id: int):
+    """Full detail including timeline for a single correction request."""
+    with engine.connect() as conn:
+        corr = conn.execute(
+            text("SELECT * FROM attendance_corrections WHERE id=:id"),
+            {"id": correction_id}
+        ).mappings().fetchone()
+        if not corr:
+            return {"success": False, "message": "Not found."}
+
+        timeline = conn.execute(
+            text("SELECT * FROM correction_timeline WHERE correction_id=:id ORDER BY created_at"),
+            {"id": correction_id}
+        ).mappings().all()
+
+        # Original attendance record
+        att = conn.execute(
+            text("SELECT * FROM attendance WHERE emp_id=:eid AND att_date=:d"),
+            {"eid": corr["emp_id"], "d": corr["att_date"]}
+        ).mappings().fetchone()
+
+    return {
+        **dict(corr),
+        "timeline": [dict(t) for t in timeline],
+        "original_attendance": dict(att) if att else None,
+    }
+
+
+@app.post("/attendance/corrections")
+def submit_correction(data: CorrectionRequest):
+    """
+    Employee submits a correction request.
+    Enforces the configurable time window (default 24 hours).
+    """
+    with engine.connect() as conn:
+        settings = _get_settings(conn)
+        # Check for duplicate pending request
+        existing = conn.execute(
+            text("""
+                SELECT id FROM attendance_corrections
+                WHERE emp_id=:eid AND att_date=:d AND status='Pending'
+            """),
+            {"eid": data.emp_id, "d": data.att_date}
+        ).fetchone()
+
+    if existing:
+        return {"success": False, "message": "A pending correction request already exists for this date."}
+
+    # Enforce time window
+    att_date_obj = date.fromisoformat(data.att_date)
+    diff_hours = (datetime.now().date() - att_date_obj).days * 24
+    window = settings.get("correction_window_hours", 24)
+    if diff_hours > window:
+        return {
+            "success": False,
+            "message": f"Attendance correction requests can only be submitted within {window} hours. Please contact HR."
+        }
+
+    with engine.begin() as conn:
+        # Get linked attendance id
+        att_row = conn.execute(
+            text("SELECT id FROM attendance WHERE emp_id=:eid AND att_date=:d"),
+            {"eid": data.emp_id, "d": data.att_date}
+        ).fetchone()
+
+        result = conn.execute(
+            text("""
+                INSERT INTO attendance_corrections
+                    (emp_id, emp_name, department, att_date, issue_type,
+                     req_check_in, req_check_out, reason, attachment_url,
+                     status, submitted_at, attendance_id)
+                VALUES
+                    (:emp_id, :emp_name, :department, :att_date, :issue_type,
+                     :req_check_in, :req_check_out, :reason, :attachment_url,
+                     'Pending', NOW(), :attendance_id)
+                RETURNING id
+            """),
+            {
+                "emp_id":         data.emp_id,
+                "emp_name":       data.emp_name,
+                "department":     data.department,
+                "att_date":       data.att_date,
+                "issue_type":     data.issue_type,
+                "req_check_in":   data.req_check_in,
+                "req_check_out":  data.req_check_out,
+                "reason":         data.reason,
+                "attachment_url": data.attachment_url,
+                "attendance_id":  att_row[0] if att_row else None,
+            }
+        )
+        new_id = result.fetchone()[0]
+
+        # Timeline event
+        conn.execute(
+            text("""
+                INSERT INTO correction_timeline (correction_id, event, done_by, notes)
+                VALUES (:cid, 'Submitted', :by, '')
+            """),
+            {"cid": new_id, "by": data.emp_name}
+        )
+
+    return {"success": True, "id": new_id}
+
+
+@app.post("/attendance/corrections/{correction_id}/approve")
+def approve_correction(correction_id: int, data: CorrectionReview):
+    """
+    HR/Admin approves a correction request.
+    - Updates the attendance record with final times.
+    - Creates an audit log entry.
+    - Warns if payroll is already locked for that month.
+    """
+    with engine.connect() as conn:
+        corr = conn.execute(
+            text("SELECT * FROM attendance_corrections WHERE id=:id"),
+            {"id": correction_id}
+        ).mappings().fetchone()
+
+    if not corr:
+        return {"success": False, "message": "Request not found."}
+    if corr["status"] != "Pending":
+        return {"success": False, "message": f"Request is already {corr['status']}."}
+
+    payroll_month = corr["att_date"][:7]   # YYYY-MM
+    payroll_locked = False
+
+    with engine.begin() as conn:
+        # Check payroll lock
+        lock = conn.execute(
+            text("SELECT id FROM payroll_locks WHERE payroll_month=:m AND unlocked_at IS NULL"),
+            {"m": payroll_month}
+        ).fetchone()
+        payroll_locked = lock is not None
+
+        # Fetch original attendance
+        att = conn.execute(
+            text("SELECT * FROM attendance WHERE emp_id=:eid AND att_date=:d"),
+            {"eid": corr["emp_id"], "d": corr["att_date"]}
+        ).mappings().fetchone()
+
+        orig_in  = str(att["check_in"])  if att and att["check_in"]  else "—"
+        orig_out = str(att["check_out"]) if att and att["check_out"] else "—"
+
+        final_ci = data.final_check_in  or (str(att["check_in"])  if att and att["check_in"]  else None)
+        final_co = data.final_check_out or (str(att["check_out"]) if att and att["check_out"] else None)
+        new_hours = _calc_hours(final_ci, final_co)
+
+        # Update attendance
+        if att:
+            conn.execute(
+                text("""
+                    UPDATE attendance
+                    SET check_in=:ci, check_out=:co, working_hours=:h,
+                        status='Manual Entry', updated_at=NOW()
+                    WHERE emp_id=:eid AND att_date=:d
+                """),
+                {"ci": final_ci, "co": final_co, "h": new_hours,
+                 "eid": corr["emp_id"], "d": corr["att_date"]}
+            )
+        else:
+            # No existing record — create one
+            conn.execute(
+                text("""
+                    INSERT INTO attendance
+                        (emp_id, emp_name, department, att_date, check_in, check_out,
+                         working_hours, status, source, updated_at, created_at)
+                    VALUES
+                        (:eid, :ename, :dept, :d, :ci, :co,
+                         :h, 'Manual Entry', 'correction', NOW(), NOW())
+                """),
+                {"eid": corr["emp_id"], "ename": corr["emp_name"],
+                 "dept": corr["department"], "d": corr["att_date"],
+                 "ci": final_ci, "co": final_co, "h": new_hours}
+            )
+
+        # Audit log
+        conn.execute(
+            text("""
+                INSERT INTO attendance_audit
+                    (attendance_id, correction_id, emp_id, emp_name, att_date,
+                     orig_check_in, orig_check_out, new_check_in, new_check_out,
+                     change_reason, approved_by, approved_at)
+                VALUES
+                    (:att_id, :cid, :eid, :ename, :d,
+                     :orig_in, :orig_out, :new_in, :new_out,
+                     :reason, :by, NOW())
+            """),
+            {
+                "att_id":   corr.get("attendance_id"),
+                "cid":      correction_id,
+                "eid":      corr["emp_id"],
+                "ename":    corr["emp_name"],
+                "d":        corr["att_date"],
+                "orig_in":  orig_in,
+                "orig_out": orig_out,
+                "new_in":   final_ci or "—",
+                "new_out":  final_co or "—",
+                "reason":   corr["reason"],
+                "by":       data.reviewed_by,
+            }
+        )
+
+        # Update correction status
+        conn.execute(
+            text("""
+                UPDATE attendance_corrections
+                SET status='Approved', reviewed_by=:by, reviewed_at=NOW(), admin_notes=:notes
+                WHERE id=:id
+            """),
+            {"by": data.reviewed_by, "notes": data.admin_notes, "id": correction_id}
+        )
+
+        # Timeline
+        conn.execute(
+            text("""
+                INSERT INTO correction_timeline (correction_id, event, done_by, notes)
+                VALUES (:cid, 'Approved', :by, :notes)
+            """),
+            {"cid": correction_id, "by": data.reviewed_by, "notes": data.admin_notes}
+        )
+
+    return {
+        "success": True,
+        "payroll_locked_warning": payroll_locked,
+        "message": "Approved. Payroll recalculation is recommended." if payroll_locked else "Approved."
+    }
+
+
+@app.post("/attendance/corrections/{correction_id}/reject")
+def reject_correction(correction_id: int, data: CorrectionReview):
+    """HR/Admin rejects a correction request."""
+    with engine.connect() as conn:
+        corr = conn.execute(
+            text("SELECT status FROM attendance_corrections WHERE id=:id"),
+            {"id": correction_id}
+        ).fetchone()
+
+    if not corr:
+        return {"success": False, "message": "Request not found."}
+    if corr[0] != "Pending":
+        return {"success": False, "message": f"Request is already {corr[0]}."}
+
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                UPDATE attendance_corrections
+                SET status='Rejected', reviewed_by=:by, reviewed_at=NOW(), admin_notes=:notes
+                WHERE id=:id
+            """),
+            {"by": data.reviewed_by, "notes": data.admin_notes, "id": correction_id}
+        )
+        conn.execute(
+            text("""
+                INSERT INTO correction_timeline (correction_id, event, done_by, notes)
+                VALUES (:cid, 'Rejected', :by, :notes)
+            """),
+            {"cid": correction_id, "by": data.reviewed_by, "notes": data.admin_notes}
+        )
+    return {"success": True}
+
+
+@app.post("/attendance/corrections/{correction_id}/cancel")
+def cancel_correction(correction_id: int, emp_name: str):
+    """Employee cancels their own pending request."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("""
+                UPDATE attendance_corrections
+                SET status='Cancelled'
+                WHERE id=:id AND status='Pending'
+                RETURNING id
+            """),
+            {"id": correction_id}
+        )
+        row = result.fetchone()
+        if row:
+            conn.execute(
+                text("""
+                    INSERT INTO correction_timeline (correction_id, event, done_by)
+                    VALUES (:cid, 'Cancelled', :by)
+                """),
+                {"cid": correction_id, "by": emp_name}
+            )
+    if not row:
+        return {"success": False, "message": "Request not found or already reviewed."}
+    return {"success": True}
+
+
+@app.get("/attendance/corrections/summary/counts")
+def corrections_summary():
+    """Quick counts for the admin cards."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT status, COUNT(*) AS cnt FROM attendance_corrections GROUP BY status")
+        ).mappings().all()
+    m = {r["status"]: r["cnt"] for r in rows}
+    return {
+        "pending":  m.get("Pending", 0),
+        "approved": m.get("Approved", 0),
+        "rejected": m.get("Rejected", 0),
+        "cancelled":m.get("Cancelled", 0),
+    }
+
+
+# ================================================================
+# AUDIT LOG
+# ================================================================
+
+@app.get("/attendance/audit")
+def get_audit_log(
+    emp_id: Optional[str]    = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str]   = None,
+    search: Optional[str]    = None,
+):
+    filters, params = [], {}
+    if emp_id:
+        filters.append("emp_id = :emp_id"); params["emp_id"] = emp_id
+    if from_date:
+        filters.append("att_date >= :from_date"); params["from_date"] = from_date
+    if to_date:
+        filters.append("att_date <= :to_date"); params["to_date"] = to_date
+    if search:
+        filters.append("(LOWER(emp_name) LIKE :s OR LOWER(emp_id) LIKE :s)")
+        params["s"] = f"%{search.lower()}%"
+
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"SELECT * FROM attendance_audit {where} ORDER BY approved_at DESC"),
+            params
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+# ================================================================
+# SALARY STRUCTURE
+# ================================================================
+
+@app.get("/salary-structure")
+def get_all_salary_structures():
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT * FROM salary_structure ORDER BY emp_id")
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.get("/salary-structure/{emp_id}")
+def get_salary_structure(emp_id: str):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT * FROM salary_structure WHERE emp_id=:eid"),
+            {"eid": emp_id}
+        ).mappings().fetchone()
+    if not row:
+        return {"success": False, "message": "No salary structure found for this employee."}
+    return dict(row)
+
+
+@app.post("/salary-structure")
+def upsert_salary_structure(data: SalaryStructure):
+    """Create or update the salary structure for an employee."""
+    eff = data.effective_from or date.today().isoformat()
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO salary_structure
+                    (emp_id, emp_name, basic_salary, hra, special_allowance,
+                     travel_allowance, medical_allowance, bonus, incentives,
+                     pf_pct, esic_pct, professional_tax, income_tax,
+                     other_deductions, effective_from, created_by, updated_at)
+                VALUES
+                    (:emp_id, :emp_name, :basic_salary, :hra, :special_allowance,
+                     :travel_allowance, :medical_allowance, :bonus, :incentives,
+                     :pf_pct, :esic_pct, :professional_tax, :income_tax,
+                     :other_deductions, :effective_from, :created_by, NOW())
+                ON CONFLICT (emp_id) DO UPDATE SET
+                    emp_name          = EXCLUDED.emp_name,
+                    basic_salary      = EXCLUDED.basic_salary,
+                    hra               = EXCLUDED.hra,
+                    special_allowance = EXCLUDED.special_allowance,
+                    travel_allowance  = EXCLUDED.travel_allowance,
+                    medical_allowance = EXCLUDED.medical_allowance,
+                    bonus             = EXCLUDED.bonus,
+                    incentives        = EXCLUDED.incentives,
+                    pf_pct            = EXCLUDED.pf_pct,
+                    esic_pct          = EXCLUDED.esic_pct,
+                    professional_tax  = EXCLUDED.professional_tax,
+                    income_tax        = EXCLUDED.income_tax,
+                    other_deductions  = EXCLUDED.other_deductions,
+                    effective_from    = EXCLUDED.effective_from,
+                    updated_at        = NOW()
+            """),
+            {
+                "emp_id":           data.emp_id,
+                "emp_name":         data.emp_name,
+                "basic_salary":     data.basic_salary,
+                "hra":              data.hra,
+                "special_allowance":data.special_allowance,
+                "travel_allowance": data.travel_allowance,
+                "medical_allowance":data.medical_allowance,
+                "bonus":            data.bonus,
+                "incentives":       data.incentives,
+                "pf_pct":           data.pf_pct,
+                "esic_pct":         data.esic_pct,
+                "professional_tax": data.professional_tax,
+                "income_tax":       data.income_tax,
+                "other_deductions": data.other_deductions,
+                "effective_from":   eff,
+                "created_by":       data.created_by,
+            }
+        )
+    return {"success": True}
+
+
+# ================================================================
+# PAYROLL
+# ================================================================
+
+@app.get("/payroll")
+def get_payroll(month: Optional[str] = None, emp_id: Optional[str] = None):
+    filters, params = [], {}
+    if month:
+        filters.append("payroll_month=:month"); params["month"] = month
+    if emp_id:
+        filters.append("emp_id=:emp_id"); params["emp_id"] = emp_id
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"SELECT * FROM payroll {where} ORDER BY emp_id"),
+            params
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.post("/payroll/generate")
+def generate_payroll(month: str, generated_by: str = "HR Admin"):
+    """
+    Generates payroll for ALL employees who have a salary structure,
+    for the given month (YYYY-MM).
+    Fails if payroll is already locked for that month.
+    Overwrites any un-locked draft for the same month.
+    """
+    # Validate month format
+    try:
+        year, mon = int(month[:4]), int(month[5:7])
+    except Exception:
+        return {"success": False, "message": "Invalid month format. Use YYYY-MM."}
+
+    with engine.connect() as conn:
+        lock = conn.execute(
+            text("SELECT id FROM payroll_locks WHERE payroll_month=:m AND unlocked_at IS NULL"),
+            {"m": month}
+        ).fetchone()
+        if lock:
+            return {"success": False, "message": "Payroll is locked for this month. Unlock first."}
+
+        # All salary structures
+        structs = conn.execute(
+            text("SELECT * FROM salary_structure")
+        ).mappings().all()
+
+        settings = _get_settings(conn)
+
+    working_days = _working_days_in_month(year, mon)
+    generated_rows = []
+
+    for ss in structs:
+        emp_id_val = ss["emp_id"]
+
+        with engine.connect() as conn:
+            att_rows = conn.execute(
+                text("""
+                    SELECT status, late_minutes, overtime
+                    FROM attendance
+                    WHERE emp_id=:eid
+                      AND TO_CHAR(att_date,'YYYY-MM')=:month
+                """),
+                {"eid": emp_id_val, "month": month}
+            ).mappings().all()
+
+        present    = sum(1 for a in att_rows if a["status"] in ("Present","Work From Home","Manual Entry"))
+        half_days  = sum(1 for a in att_rows if a["status"] == "Half Day")
+        leave_days = sum(1 for a in att_rows if a["status"] == "Leave")
+        ot_hours   = float(sum(a["overtime"] or 0 for a in att_rows))
+
+        effective_present = present + half_days * 0.5 + leave_days
+        lop = max(0.0, working_days - effective_present)
+
+        # Earnings
+        basic  = float(ss["basic_salary"])
+        hra    = float(ss["hra"])
+        spl    = float(ss["special_allowance"])
+        travel = float(ss["travel_allowance"])
+        med    = float(ss["medical_allowance"])
+        bonus  = float(ss["bonus"])
+        inc    = float(ss["incentives"])
+        gross  = basic + hra + spl + travel + med + bonus + inc
+
+        # Deductions
+        lop_ded   = round((basic / working_days) * lop, 2) if working_days > 0 else 0
+        pf_ded    = round(basic * float(ss["pf_pct"]) / 100, 2)
+        esic_ded  = round(gross * float(ss["esic_pct"]) / 100, 2)
+        pt_ded    = float(ss["professional_tax"])
+        it_ded    = float(ss["income_tax"])
+        other_ded = float(ss["other_deductions"])
+        total_ded = pf_ded + esic_ded + pt_ded + it_ded + other_ded + lop_ded
+        net       = gross - total_ded
+
+        generated_rows.append({
+            "month": month, "emp_id": emp_id_val,
+            "emp_name": ss["emp_name"], "dept": "",
+            "working_days": working_days, "present": present,
+            "half_days": half_days, "leave": leave_days, "lop": lop,
+            "ot_hours": ot_hours, "gross": gross,
+            "pf": pf_ded, "esic": esic_ded, "pt": pt_ded, "it": it_ded,
+            "other": other_ded, "lop_ded": lop_ded,
+            "total_ded": total_ded, "net": net,
+        })
+
+    with engine.begin() as conn:
+        # Wipe old draft for this month
+        conn.execute(text("DELETE FROM payroll WHERE payroll_month=:m"), {"m": month})
+        for r in generated_rows:
+            conn.execute(
+                text("""
+                    INSERT INTO payroll
+                        (payroll_month, emp_id, emp_name, department,
+                         working_days, present_days, half_days, leave_days, lop_days,
+                         overtime_hours, gross_salary,
+                         pf_deduction, esic_deduction, pt_deduction, it_deduction,
+                         other_deductions, lop_deduction, total_deductions, net_salary,
+                         status, generated_at)
+                    VALUES
+                        (:m, :eid, :ename, :dept,
+                         :wd, :p, :hd, :l, :lop,
+                         :ot, :gross,
+                         :pf, :esic, :pt, :it,
+                         :other, :lop_ded, :total_ded, :net,
+                         'Generated', NOW())
+                """),
+                {
+                    "m": r["month"], "eid": r["emp_id"], "ename": r["emp_name"], "dept": r["dept"],
+                    "wd": r["working_days"], "p": r["present"], "hd": r["half_days"],
+                    "l": r["leave"], "lop": r["lop"], "ot": r["ot_hours"],
+                    "gross": r["gross"], "pf": r["pf"], "esic": r["esic"],
+                    "pt": r["pt"], "it": r["it"], "other": r["other"],
+                    "lop_ded": r["lop_ded"], "total_ded": r["total_ded"], "net": r["net"],
+                }
+            )
+
+    total_gross = sum(r["gross"] for r in generated_rows)
+    total_net   = sum(r["net"]   for r in generated_rows)
+    return {
+        "success": True,
+        "employees_processed": len(generated_rows),
+        "total_gross": round(total_gross, 2),
+        "total_net": round(total_net, 2),
+    }
+
+
+@app.post("/payroll/lock")
+def lock_payroll(month: str, locked_by: str = "HR Admin"):
+    """
+    Locks payroll for a month and auto-generates payslips for all employees.
+    After locking, no edits to payroll or attendance corrections are applied
+    to the payroll figures without an explicit unlock.
+    """
+    with engine.connect() as conn:
+        existing_lock = conn.execute(
+            text("SELECT id FROM payroll_locks WHERE payroll_month=:m AND unlocked_at IS NULL"),
+            {"m": month}
+        ).fetchone()
+        if existing_lock:
+            return {"success": False, "message": "Payroll is already locked for this month."}
+
+        payroll_rows = conn.execute(
+            text("SELECT p.*, s.* FROM payroll p LEFT JOIN salary_structure s ON p.emp_id=s.emp_id WHERE p.payroll_month=:m"),
+            {"m": month}
+        ).mappings().all()
+
+    if not payroll_rows:
+        return {"success": False, "message": "No payroll data found. Generate payroll first."}
+
+    mon_num = int(month[5:7])
+    yr_num  = int(month[:4])
+    mon_str = f"{mon_num:02d}"
+
+    with engine.begin() as conn:
+        # Insert lock record
+        conn.execute(
+            text("""
+                INSERT INTO payroll_locks (payroll_month, locked_by, locked_at)
+                VALUES (:m, :by, NOW())
+                ON CONFLICT (payroll_month) DO UPDATE SET locked_by=EXCLUDED.locked_by, locked_at=NOW(), unlocked_at=NULL
+            """),
+            {"m": month, "by": locked_by}
+        )
+
+        # Update all payroll rows to Locked
+        conn.execute(
+            text("UPDATE payroll SET status='Locked' WHERE payroll_month=:m"),
+            {"m": month}
+        )
+
+        # Generate payslips
+        conn.execute(text("DELETE FROM payslips WHERE payroll_month=:m"), {"m": month})
+        for row in payroll_rows:
+            payslip_no = f"PNT-{yr_num}{mon_str}-{row['emp_id']}"
+            conn.execute(
+                text("""
+                    INSERT INTO payslips
+                        (payslip_no, payroll_month, emp_id, emp_name, department, designation,
+                         working_days, present_days, leave_days, lop_days, overtime_hours,
+                         basic_salary, hra, special_allowance, travel_allowance,
+                         medical_allowance, bonus, incentives, gross_salary,
+                         pf_deduction, esic_deduction, pt_deduction, it_deduction,
+                         other_deductions, lop_deduction, total_deductions, net_salary,
+                         generated_at, payroll_id)
+                    VALUES
+                        (:pno, :m, :eid, :ename, :dept, :desig,
+                         :wd, :p, :l, :lop, :ot,
+                         :basic, :hra, :spl, :travel, :med, :bonus, :inc, :gross,
+                         :pf, :esic, :pt, :it, :other, :lop_ded, :total_ded, :net,
+                         NOW(), :pr_id)
+                """),
+                {
+                    "pno":   payslip_no,
+                    "m":     month,
+                    "eid":   row["emp_id"],
+                    "ename": row["emp_name"],
+                    "dept":  row.get("department",""),
+                    "desig": "Team Member",
+                    "wd":    row["working_days"],
+                    "p":     row["present_days"],
+                    "l":     row["leave_days"],
+                    "lop":   row["lop_days"],
+                    "ot":    row["overtime_hours"],
+                    "basic": row.get("basic_salary", 0),
+                    "hra":   row.get("hra", 0),
+                    "spl":   row.get("special_allowance", 0),
+                    "travel":row.get("travel_allowance", 0),
+                    "med":   row.get("medical_allowance", 0),
+                    "bonus": row.get("bonus", 0),
+                    "inc":   row.get("incentives", 0),
+                    "gross": row["gross_salary"],
+                    "pf":    row["pf_deduction"],
+                    "esic":  row["esic_deduction"],
+                    "pt":    row["pt_deduction"],
+                    "it":    row["it_deduction"],
+                    "other": row["other_deductions"],
+                    "lop_ded": row["lop_deduction"],
+                    "total_ded": row["total_deductions"],
+                    "net":   row["net_salary"],
+                    "pr_id": row["id"],
+                }
+            )
+
+        # Audit the lock
+        conn.execute(
+            text("""
+                INSERT INTO attendance_audit
+                    (emp_id, emp_name, att_date, orig_check_in, orig_check_out,
+                     new_check_in, new_check_out, change_reason, approved_by, approved_at)
+                VALUES
+                    ('SYSTEM','System',:d,'UNLOCKED','UNLOCKED','LOCKED','LOCKED',
+                     'Payroll locked by HR', :by, NOW())
+            """),
+            {"d": f"{yr_num}-{mon_str}-01", "by": locked_by}
+        )
+
+    return {"success": True, "payslips_generated": len(payroll_rows)}
+
+
+@app.post("/payroll/unlock")
+def unlock_payroll(month: str, data: PayrollUnlockRequest):
+    """Super Admin unlocks a previously locked payroll month."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("""
+                UPDATE payroll_locks
+                SET unlocked_by=:by, unlocked_at=NOW()
+                WHERE payroll_month=:m AND unlocked_at IS NULL
+                RETURNING id
+            """),
+            {"m": month, "by": data.unlocked_by}
+        )
+        row = result.fetchone()
+        if not row:
+            return {"success": False, "message": "Payroll is not locked or already unlocked."}
+
+        conn.execute(
+            text("UPDATE payroll SET status='Generated' WHERE payroll_month=:m"),
+            {"m": month}
+        )
+
+        # Audit
+        conn.execute(
+            text("""
+                INSERT INTO attendance_audit
+                    (emp_id, emp_name, att_date, orig_check_in, orig_check_out,
+                     new_check_in, new_check_out, change_reason, approved_by, approved_at)
+                VALUES
+                    ('SYSTEM','System',:d,'LOCKED','LOCKED','UNLOCKED','UNLOCKED',
+                     'Payroll UNLOCKED by Super Admin', :by, NOW())
+            """),
+            {"d": f"{month}-01", "by": data.unlocked_by}
+        )
+
+    return {"success": True}
+
+
+@app.get("/payroll/lock-status/{month}")
+def payroll_lock_status(month: str):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT * FROM payroll_locks WHERE payroll_month=:m"),
+            {"m": month}
+        ).mappings().fetchone()
+    if not row:
+        return {"locked": False}
+    return {**dict(row), "locked": row["unlocked_at"] is None}
+
+
+@app.get("/payroll/summary/{month}")
+def payroll_summary(month: str):
+    """Aggregate totals for a payroll month — used by report cards."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT COUNT(*) AS employees,
+                       SUM(gross_salary)    AS gross,
+                       SUM(total_deductions)AS deductions,
+                       SUM(net_salary)      AS net,
+                       SUM(CASE WHEN lop_days > 0 THEN 1 ELSE 0 END) AS lop_employees
+                FROM payroll
+                WHERE payroll_month=:m
+            """),
+            {"m": month}
+        ).mappings().fetchone()
+        lock = conn.execute(
+            text("SELECT locked_at, locked_by FROM payroll_locks WHERE payroll_month=:m AND unlocked_at IS NULL"),
+            {"m": month}
+        ).fetchone()
+    return {
+        "month": month,
+        "employees":     row["employees"] or 0,
+        "gross":         float(row["gross"] or 0),
+        "deductions":    float(row["deductions"] or 0),
+        "net":           float(row["net"] or 0),
+        "lop_employees": row["lop_employees"] or 0,
+        "locked":        lock is not None,
+        "locked_at":     str(lock[0]) if lock else None,
+        "locked_by":     lock[1] if lock else None,
+    }
+
+
+# ================================================================
+# PAYSLIPS
+# ================================================================
+
+@app.get("/payslips")
+def get_payslips(
+    emp_id: Optional[str] = None,
+    month: Optional[str]  = None,
+    year: Optional[str]   = None,
+):
+    filters, params = [], {}
+    if emp_id:
+        filters.append("emp_id=:emp_id"); params["emp_id"] = emp_id
+    if month:
+        filters.append("payroll_month=:month"); params["month"] = month
+    if year:
+        filters.append("payroll_month LIKE :year"); params["year"] = f"{year}-%"
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"SELECT * FROM payslips {where} ORDER BY payroll_month DESC"),
+            params
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.get("/payslips/{payslip_id}")
+def get_payslip(payslip_id: int):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT * FROM payslips WHERE id=:id"),
+            {"id": payslip_id}
+        ).mappings().fetchone()
+    if not row:
+        return {"success": False, "message": "Payslip not found."}
+    return dict(row)
+
+
+@app.get("/payslips/by-no/{payslip_no}")
+def get_payslip_by_no(payslip_no: str):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT * FROM payslips WHERE payslip_no=:no"),
+            {"no": payslip_no}
+        ).mappings().fetchone()
+    if not row:
+        return {"success": False, "message": "Payslip not found."}
+    return dict(row)
+
+
+# ================================================================
+# HOLIDAYS
+# ================================================================
+
+@app.get("/holidays")
+def get_holidays(year: Optional[str] = None):
+    filters, params = [], {}
+    if year:
+        filters.append("EXTRACT(YEAR FROM holiday_date)=:year"); params["year"] = int(year)
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"SELECT * FROM holidays {where} ORDER BY holiday_date"),
+            params
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.post("/holidays")
+def create_holiday(data: HolidayCreate):
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                text("""
+                    INSERT INTO holidays (holiday_date, name, holiday_type)
+                    VALUES (:d, :name, :type)
+                    RETURNING id
+                """),
+                {"d": data.holiday_date, "name": data.name, "type": data.holiday_type}
+            )
+            new_id = result.fetchone()[0]
+        return {"success": True, "id": new_id}
+    except Exception as e:
+        if "unique" in str(e).lower():
+            return {"success": False, "message": "A holiday already exists on this date."}
+        return {"success": False, "message": str(e)}
+
+
+@app.delete("/holidays/{holiday_id}")
+def delete_holiday(holiday_id: int):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("DELETE FROM holidays WHERE id=:id RETURNING id"),
+            {"id": holiday_id}
+        )
+        row = result.fetchone()
+    if not row:
+        return {"success": False, "message": "Holiday not found."}
+    return {"success": True}
+
+
+# ================================================================
+# REPORTS
+# ================================================================
+
+@app.get("/reports/attendance/late")
+def report_late_employees(month: str):
+    """Employees with late arrivals in a given month."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT emp_id, emp_name, department,
+                       COUNT(*) AS late_days,
+                       SUM(late_minutes) AS total_late_minutes,
+                       ROUND(AVG(late_minutes),0) AS avg_late_minutes
+                FROM attendance
+                WHERE TO_CHAR(att_date,'YYYY-MM')=:month
+                  AND late_minutes > 0
+                GROUP BY emp_id, emp_name, department
+                ORDER BY total_late_minutes DESC
+            """),
+            {"month": month}
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.get("/reports/attendance/absentees")
+def report_absentees(month: str):
+    """Absent / leave / LOP days per employee for a given month."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT emp_id, emp_name, department,
+                       SUM(CASE WHEN status='Absent' THEN 1 ELSE 0 END) AS absent_days,
+                       SUM(CASE WHEN status='Leave'  THEN 1 ELSE 0 END) AS leave_days
+                FROM attendance
+                WHERE TO_CHAR(att_date,'YYYY-MM')=:month
+                GROUP BY emp_id, emp_name, department
+                HAVING SUM(CASE WHEN status IN ('Absent','Leave') THEN 1 ELSE 0 END) > 0
+                ORDER BY absent_days DESC
+            """),
+            {"month": month}
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.get("/reports/attendance/overtime")
+def report_overtime(month: str):
+    """Overtime summary per employee for a given month."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT emp_id, emp_name, department,
+                       COUNT(*) AS ot_days,
+                       SUM(overtime) AS ot_hours
+                FROM attendance
+                WHERE TO_CHAR(att_date,'YYYY-MM')=:month
+                  AND overtime > 0
+                GROUP BY emp_id, emp_name, department
+                ORDER BY ot_hours DESC
+            """),
+            {"month": month}
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.get("/reports/payroll/summary")
+def report_payroll_summary():
+    """Month-wise payroll summary across all months."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT p.payroll_month,
+                       COUNT(*)                AS employees,
+                       SUM(p.gross_salary)     AS gross,
+                       SUM(p.total_deductions) AS deductions,
+                       SUM(p.net_salary)       AS net,
+                       SUM(CASE WHEN p.lop_days>0 THEN 1 ELSE 0 END) AS lop_count,
+                       MAX(pl.locked_at) IS NOT NULL AND MAX(pl.unlocked_at) IS NULL AS is_locked
+                FROM payroll p
+                LEFT JOIN payroll_locks pl ON pl.payroll_month=p.payroll_month
+                GROUP BY p.payroll_month
+                ORDER BY p.payroll_month DESC
+            """)
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.get("/reports/payroll/department")
+def report_department_salary(month: str):
+    """Department-wise salary breakdown for a given month."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT department,
+                       COUNT(*) AS employees,
+                       SUM(gross_salary)     AS gross,
+                       SUM(total_deductions) AS deductions,
+                       SUM(net_salary)       AS net
+                FROM payroll
+                WHERE payroll_month=:month
+                GROUP BY department
+                ORDER BY net DESC
+            """),
+            {"month": month}
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.get("/reports/payroll/employee-history/{emp_id}")
+def report_employee_salary_history(emp_id: str):
+    """All payslips for a single employee — chronological."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT payslip_no, payroll_month, gross_salary, total_deductions, net_salary, generated_at
+                FROM payslips
+                WHERE emp_id=:eid
+                ORDER BY payroll_month DESC
+            """),
+            {"eid": emp_id}
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
