@@ -4914,39 +4914,48 @@ def get_reminders(
  
 # ---------- TODAY'S DUE REMINDERS (for dashboard widget) ----------
 @app.get("/reminders/today")
-def get_todays_reminders(user_id: int, role: str = "employee"):
+def get_todays_reminders(user_id: int):
     """
-    Returns only reminders whose days_remaining matches one of their
-    configured offsets (or is <= 0, i.e. due today / overdue).
+    Returns reminders for the logged-in user whose days_remaining matches
+    one of their configured reminder offsets (or are due/overdue).
     """
-    filters = ["r.status = 'Open'"]
-    params = {}
-    if role == "employee":
-        filters.append("r.assigned_to = :uid")
-        params["uid"] = user_id
- 
+
+    filters = [
+        "r.status = 'Open'",
+        "r.created_by = :uid"
+    ]
+
+    params = {
+        "uid": int(user_id)
+    }
+
     where = "WHERE " + " AND ".join(filters)
+
     with engine.connect() as conn:
         rows = conn.execute(
             text(f"""
-                SELECT r.*, u.full_name AS assigned_to_name
+                SELECT r.*
                 FROM reminders r
-                LEFT JOIN users u ON u.id = r.assigned_to
                 {where}
+                ORDER BY r.due_date ASC
             """),
             params
         ).mappings().all()
- 
+
     due_now = []
+
     for r in rows:
         d = _reminder_row_to_dict(r)
+
         days = d["days_remaining"]
-        offsets = d["reminder_offsets"] or [7, 3, 1, 0]
-        is_due = (days in offsets) or (days <= 0)
-        if is_due:
+
+        offsets = d.get("reminder_offsets") or [7, 3, 1, 0]
+
+        if (days in offsets) or (days <= 0):
             due_now.append(d)
- 
+
     due_now.sort(key=lambda x: x["days_remaining"])
+
     return due_now
  
  
