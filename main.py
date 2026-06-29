@@ -339,21 +339,6 @@ def create_task(
     status: str,
     due_date: str
 ):
-    # Validate that assigned_to is actually in the manager's team
-    with engine.connect() as conn:
-        membership = conn.execute(
-            text("""
-                SELECT 1 FROM team_members
-                WHERE manager_id = :manager_id AND employee_id = :employee_id
-            """),
-            {"manager_id": assigned_by, "employee_id": assigned_to}
-        ).fetchone()
-
-    if not membership:
-        return {
-            "success": False,
-            "message": "You can only assign tasks to members of your own team."
-        }
 
     with engine.connect() as conn:
 
@@ -5101,3 +5086,73 @@ def delete_reminder(reminder_id: int):
     if not row:
         return {"success": False, "message": "Reminder not found."}
     return {"success": True}
+
+
+# ── EXCEL EXPORT ──────────────────────────────────────────
+import pandas as pd
+import io as _io
+from fastapi.responses import StreamingResponse
+
+EXPORTABLE_TABLES = {
+    # People
+    "users":                    "Users",
+    "team_members":             "Team Members",
+    # Tasks
+    "tasks":                    "Tasks",
+    "task_history":             "Task History",
+    "task_remarks":             "Task Remarks",
+    # Attendance
+    "attendance":               "Attendance",
+    "attendance_audit":         "Attendance Audit",
+    "attendance_corrections":   "Attendance Corrections",
+    "attendance_settings":      "Attendance Settings",
+    "correction_timeline":      "Correction Timeline",
+    # Payroll
+    "payroll":                  "Payroll",
+    "payroll_locks":            "Payroll Locks",
+    "payslips":                 "Payslips",
+    "salary_structure":         "Salary Structure",
+    # Leave & HR
+    "leave_requests":           "Leave Requests",
+    "employee_voice":           "Employee Voice",
+    # Calendar & Meetings
+    "calendar_tasks":           "Calendar Tasks",
+    "meetings":                 "Meetings",
+    "meeting_attendees":        "Meeting Attendees",
+    # Other
+    "reminders":                "Reminders",
+    "holidays":                 "Holidays",
+    "holiday_date":             "Holiday Dates",
+    "letterheads":              "Letterheads",
+    "letterhead_serial_counter":"Letterhead Serial Counter",
+}
+
+@app.get("/admin/export/{table_name}")
+def export_table_excel(table_name: str):
+    if table_name not in EXPORTABLE_TABLES:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="Table not allowed for export.")
+
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(f'SELECT * FROM "{table_name}"', conn)
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+
+    output = _io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=EXPORTABLE_TABLES[table_name][:31])
+        ws = writer.sheets[EXPORTABLE_TABLES[table_name][:31]]
+        # Auto-width columns
+        for col in ws.columns:
+            max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col)
+            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
+    output.seek(0)
+
+    filename = f"{table_name}_export.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
