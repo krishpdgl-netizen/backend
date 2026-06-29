@@ -1,5088 +1,1155 @@
-from fastapi import FastAPI, UploadFile, File as FastAPIFile
-from sqlalchemy import create_engine
-from sqlalchemy import text
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional 
-from excel_helper import (
-    add_projection,
-    get_sales,
-    update_achieved,
-    get_all_weeks,
-    get_sales_for_employees,
-    admin_update_projection,
-    raise_change_request,
-    get_change_requests,
-    resolve_change_request,
-    current_week,
-    FILE_NAME
-)
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from pydantic import BaseModel
-from typing import List
-from sqlalchemy import text
-class MeetingRequest(BaseModel):
-    title: str
-    description: str = ""
-    meeting_date: str
-    start_slot: int
-    end_slot: int
-    organizer_id: int
-    location: str = ""
-    attendees: List[int]
-import requests
-import os
-from pydantic import BaseModel
-from typing import Optional
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <link rel="icon" type="image/png" href="static/favicon.png">
 
-class LeaveRequest(BaseModel):
-    user_id: int
-    employee_name: str
-    leave_type: str
-    start_date: str
-    end_date: str
-    reason: str
-    
-app = FastAPI()
-
-from typing import Optional
-from pydantic import BaseModel
-
-class EmployeeVoiceRequest(BaseModel):
-    user_id: int
-    employee_name: str
-    is_anonymous: bool
-    category: str
-    priority: str
-    subject: str
-    description: str
-    attachment: Optional[str] = None
-
-from pydantic import BaseModel
-from typing import Optional
- 
-class VoidRequest(BaseModel):
-    void_reason: str
-
-
-
-# ── AUTO-CREATE TABLES ON STARTUP ────────────────────────
-@app.on_event("startup")
-def create_tables():
-    with engine.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS calendar_tasks (
-                id          SERIAL PRIMARY KEY,
-                user_id     INT NOT NULL,
-                title       TEXT NOT NULL,
-                description TEXT DEFAULT '',
-                task_date   DATE NOT NULL,
-                start_slot  INT NOT NULL,
-                end_slot    INT NOT NULL,
-                color       TEXT DEFAULT '#7c3aed',
-                status      TEXT DEFAULT 'pending',
-                created_at  TIMESTAMP DEFAULT NOW()
-            )
-        """))
-        # Patch any columns missing from an older version of the table
-        for col_sql in [
-            "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'",
-            "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''",
-            "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS color TEXT DEFAULT '#7c3aed'",
-            "ALTER TABLE calendar_tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
-        ]:
-            conn.execute(text(col_sql))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS meetings (
-                id           SERIAL PRIMARY KEY,
-                title        TEXT NOT NULL,
-                description  TEXT DEFAULT '',
-                organizer_id INT NOT NULL,
-                meeting_date DATE NOT NULL,
-                start_slot   INT NOT NULL,
-                end_slot     INT NOT NULL,
-                location     TEXT DEFAULT '',
-                created_at   TIMESTAMP DEFAULT NOW()
-            )
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS meeting_attendees (
-                id              SERIAL PRIMARY KEY,
-                meeting_id      INT NOT NULL,
-                user_id         INT NOT NULL,
-                response_status TEXT DEFAULT 'pending'
-            )
-        """))
-
-
-# ── CORS ─────────────────────────────────────────────────
-# allow_origins=["*"] with allow_credentials=False is correct.
-# We also add an explicit OPTIONS catch-all so Railway's proxy
-# never swallows the preflight before FastAPI can respond to it.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=600,
-)
-
-from fastapi import Request
-from fastapi.responses import Response
-
-@app.options("/{rest_of_path:path}")
-async def preflight_handler(rest_of_path: str, request: Request):
-    return Response(
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin":  "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Max-Age":       "600",
-        },
-    )
-DATABASE_URL = "postgresql://postgres:OJKDsedhwgqyuvTubYNEJssZeJkRUgiS@thomas.proxy.rlwy.net:22127/railway"
-
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"sslmode":"require"}
-)
-
-def slot_to_time(slot):
-
-    hour = slot // 2
-    minute = (slot % 2) * 30
-
-    return f"{hour:02}:{minute:02}"
-
-@app.get("/")
-def home():
-    return {"message":"Panache API Running"}
-
-@app.post("/create-user")
-def create_user():
-
-    with engine.connect() as conn:
-
-        conn.execute(
-            text("""
-            INSERT INTO users
-            (full_name,email,password,role)
-            VALUES
-            (
-                'Admin User',
-                'admin@panache.com',
-                'admin123',
-                'admin'
-            )
-            """)
-        )
-
-        conn.commit()
-
-    return {"message":"User Created"}
-
-
-@app.post("/login")
-def login(email: str, password: str):
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT *
-                FROM users
-                WHERE email=:email
-                AND password=:password
-            """),
-            {
-                "email": email,
-                "password": password
-            }
-        )
-
-        user = result.fetchone()
-
-    if user:
-        return {
-    "success": True,
-    "id": user.id,
-    "name": user.full_name,
-    "email": user.email,
-    "role": user.role
-     
-    }
-
-    return {
-        "success": False
-    }
-
-
-@app.post("/register")
-def register_user(
-    fullname: str,
-    email: str,
-    password: str,
-    role: str
-):
-
-    with engine.connect() as conn:
-
-        existing = conn.execute(
-            text("""
-                SELECT id
-                FROM users
-                WHERE full_name = :full_name
-            """),
-            {
-                "full_name": fullname
-            }
-        ).fetchone()
-
-        if existing:
-            return {
-                "success": False,
-                "message": "Username already exists"
-            }
-
-        conn.execute(
-            text("""
-                INSERT INTO users
-                (full_name,email,password,role)
-                VALUES
-                (:full_name,:email,:password,:role)
-            """),
-            {
-                "full_name": fullname,
-                "email": email,
-                "password": password,
-                "role": role
-            }
-        )
-
-        conn.commit()
-
-    return {
-        "success": True,
-        "message": "User created"
-    }
-
-@app.get("/profile")
-def get_profile(user_id: int):
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT *
-                FROM users
-                WHERE id = :id
-            """),
-            {"id": user_id}
-        )
-
-        user = result.fetchone()
-
-    if not user:
-        return {"success": False}
-
-    return {
-        "success": True,
-        "id": user.id,
-        "name": user.full_name,
-        "email": user.email,
-        "role": user.role
-    }
-
-
-@app.get("/user")
-def get_user(email: str):
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT full_name,
-                       email,
-                       role
-                FROM users
-                WHERE email = :email
-            """),
-            {
-                "email": email
-            }
-        )
-
-        user = result.fetchone()
-
-    if not user:
-        return {
-            "success": False
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Manager Dashboard | Panache</title>
+    <script>
+        const role = localStorage.getItem("userRole");
+        if (!role) { window.location.href = "index.html"; }
+        if (role !== "manager") { window.location.href = "index.html"; }
+    </script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', sans-serif;
         }
 
-    return {
-        "success": True,
-        "full_name": user.full_name,
-        "email": user.email,
-        "role": user.role
-    }
-
-@app.post("/create-task")
-def create_task(
-    title: str,
-    description: str,
-    assigned_to: int,
-    assigned_by: int,
-    priority: str,
-    status: str,
-    due_date: str
-):
-
-    with engine.connect() as conn:
-
-        conn.execute(
-            text("""
-                INSERT INTO tasks
-                (
-                    title,
-                    description,
-                    assigned_to,
-                    assigned_by,
-                    priority,
-                    status,
-                    due_date
-                )
-                VALUES
-                (
-                    :title,
-                    :description,
-                    :assigned_to,
-                    :assigned_by,
-                    :priority,
-                    :status,
-                    :due_date
-                )
-            """),
-            {
-                "title": title,
-                "description": description,
-                "assigned_to": assigned_to,
-                "assigned_by": assigned_by,
-                "priority": priority,
-                "status": status,
-                "due_date": due_date
-            }
-        )
-
-        conn.commit()
-
-    return {
-        "success": True,
-        "message": "Task created"
-    }
-
-@app.get("/my-tasks")
-def my_tasks(user_id: int):
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT *
-                FROM tasks
-                WHERE assigned_to = :user_id
-                AND status != 'Completed'
-                ORDER BY created_at DESC
-            """),
-            {
-                "user_id": user_id
-            }
-        )
-
-        tasks = [
-            dict(row._mapping)
-            for row in result
-        ]
-
-    return tasks
-
-@app.put("/update-task-status")
-def update_task_status(
-    task_id: int,
-    status: str
-):
-
-    with engine.connect() as conn:
-
-        conn.execute(
-            text("""
-                UPDATE tasks
-                SET status = :status
-                WHERE id = :task_id
-            """),
-            {
-                "status": status,
-                "task_id": task_id
-            }
-        )
-
-        conn.commit()
-
-    return {
-        "success": True
-    }
-
-
-@app.get("/dashboard-stats")
-def dashboard_stats():
-
-    with engine.connect() as conn:
-
-        total_users = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM users
-            """)
-        ).scalar()
-
-        total_tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-            """)
-        ).scalar()
-
-        pending_tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE Lower(status) = 'pending'
-            """)
-        ).scalar()
-
-        completed_tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE LOWER(status) = 'complete'
-            """)
-        ).scalar()
-
-    return {
-        "total_users": total_users,
-        "total_tasks": total_tasks,
-        "pending_tasks": pending_tasks,
-        "completed_tasks": completed_tasks
-    }
-
-@app.post("/complete-task")
-def complete_task(task_id:int):
-
-    with engine.connect() as conn:
-
-        task = conn.execute(
-            text("""
-                SELECT *
-                FROM tasks
-                WHERE id=:id
-            """),
-            {"id":task_id}
-        ).fetchone()
-
-        conn.execute(
-            text("""
-                UPDATE tasks
-                SET status='Completed'
-                WHERE id=:id
-            """),
-            {"id":task_id}
-        )
-
-        conn.execute(
-    text("""
-        INSERT INTO task_history
-        (
-            task_id,
-            employee_id,
-            task_title,
-            submitted_at
-        )
-        VALUES
-        (
-            :task_id,
-            :employee_id,
-            :task_title,
-            :submitted_at
-        )
-    """),
-    {
-        "task_id": task.id,
-        "employee_id": task.assigned_to,
-        "task_title": task.title,
-        "submitted_at": datetime.now(
-            ZoneInfo("Asia/Kolkata")
-        ).isoformat()
-    }
-)
-        conn.commit()
-
-    return {"success":True}
-
-@app.get("/history")
-def history(user_id:int):
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT *
-                FROM task_history
-                WHERE employee_id=:id
-                ORDER BY submitted_at DESC
-            """),
-            {"id":user_id}
-        )
-
-        history = [
-            dict(row._mapping)
-            for row in result
-        ]
-
-    return history
-
-
-@app.get("/productivity-score")
-def productivity_score(user_id:int):
-
-    with engine.connect() as conn:
-
-        total = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE assigned_to=:id
-            """),
-            {"id":user_id}
-        ).scalar()
-
-        completed = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE assigned_to=:id
-                AND status='Completed'
-            """),
-            {"id":user_id}
-        ).scalar()
-
-    score = 0
-
-    if total > 0:
-        score = round((completed/total)*100)
-
-    return {
-        "total_tasks": total,
-        "completed_tasks": completed,
-        "score": score
-    }
-
-@app.get("/employees")
-def get_employees():
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT
-                id,
-                full_name,
-                email,
-                role
-                FROM users
-                WHERE role='employee'
-            """)
-        )
-
-        employees = [
-            dict(row._mapping)
-            for row in result
-        ]
-
-    return employees
-
-@app.get("/all-tasks")
-def get_all_tasks():
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT *
-                FROM tasks
-                ORDER BY id DESC
-            """)
-        )
-
-        tasks = [
-            dict(row._mapping)
-            for row in result
-        ]
-
-    return tasks
-
-
-
-@app.post("/delete-task")
-def delete_task(task_id:int):
-
-    with engine.connect() as conn:
-
-        conn.execute(
-            text("""
-                DELETE
-                FROM tasks
-                WHERE id=:id
-            """),
-            {"id":task_id}
-        )
-
-        conn.commit()
-
-    return {
-        "success":True
-    }
-
-@app.get("/employee-performance")
-def employee_performance():
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-            SELECT
-            u.id,
-            u.full_name,
-
-            COUNT(t.id) AS assigned,
-
-            COUNT(
-                CASE
-                WHEN t.status='Completed'
-                THEN 1
-                END
-            ) AS completed
-
-            FROM users u
-
-            LEFT JOIN tasks t
-            ON u.id=t.assigned_to
-
-            WHERE u.role='employee'
-
-            GROUP BY u.id,u.full_name
-            """)
-        )
-
-        data=[]
-
-        for row in result:
-
-            assigned=row.assigned
-            completed=row.completed
-
-            score=0
-
-            if assigned>0:
-                score=round((completed/assigned)*100)
-
-            data.append({
-                "id":row.id,
-                "name":row.full_name,
-                "assigned":assigned,
-                "completed":completed,
-                "score":score
-            })
-
-    return data
-@app.post("/edit-task")
-def edit_task(
-    task_id:int,
-    title:str,
-    description:str,
-    assigned_to:int,
-    priority:str,
-    due_date:str
-):
-
-    with engine.connect() as conn:
-
-        conn.execute(
-            text("""
-                UPDATE tasks
-                SET
-                    title=:title,
-                    description=:description,
-                    assigned_to=:assigned_to,
-                    priority=:priority,
-                    due_date=:due_date
-                WHERE id=:task_id
-            """),
-            {
-                "task_id": task_id,
-                "title": title,
-                "description": description,
-                "assigned_to": assigned_to,
-                "priority": priority,
-                "due_date": due_date
-            }
-        )
-
-        conn.commit()
-
-    return {
-        "success": True
-    }
-
-@app.get("/task")
-def get_task(task_id:int):
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT *
-                FROM tasks
-                WHERE id=:id
-            """),
-            {"id":task_id}
-        )
-
-        task = result.fetchone()
-
-    if not task:
-        return {"success":False}
-
-    return dict(task._mapping)
-
-@app.get("/recent-activity")
-def recent_activity():
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT
-                task_id,
-                employee_id,
-                task_title,
-                completed_at
-                FROM task_history
-                ORDER BY completed_at DESC
-                LIMIT 20
-            """)
-        )
-
-        activity = [
-            dict(row._mapping)
-            for row in result
-        ]
-
-    return activity
-
-@app.get("/dashboard-summary")
-def dashboard_summary():
-
-    with engine.connect() as conn:
-
-        employees = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM users
-                WHERE role='employee'
-            """)
-        ).scalar()
-
-        tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-            """)
-        ).scalar()
-
-        completed = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE status='Completed'
-            """)
-        ).scalar()
-
-    productivity = 0
-
-    if tasks > 0:
-        productivity = round(completed/tasks*100)
-
-    return {
-        "employees": employees,
-        "tasks": tasks,
-        "completed": completed,
-        "productivity": productivity
-    }
-
-@app.get("/search-employee")
-def search_employee(name:str):
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT
-                id,
-                full_name,
-                email
-                FROM users
-                WHERE full_name ILIKE :name
-            """),
-            {
-                "name":f"%{name}%"
-            }
-        )
-
-        employees = [
-            dict(row._mapping)
-            for row in result
-        ]
-
-    return employees
-
-@app.get("/employee-details")
-def employee_details(user_id:int):
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT
-                id,
-                full_name,
-                email,
-                role
-                FROM users
-                WHERE id=:id
-            """),
-            {"id":user_id}
-        )
-
-        employee = result.fetchone()
-
-    if not employee:
-        return {"success":False}
-
-    return dict(employee._mapping)
-
-@app.post("/approve-task")
-def approve_task(task_id:int):
-
-    with engine.connect() as conn:
-
-        # Fetch task details before updating so we can log to history
-        task = conn.execute(
-            text("""
-                SELECT *
-                FROM tasks
-                WHERE id=:id
-            """),
-            {"id":task_id}
-        ).fetchone()
-
-        conn.execute(
-            text("""
-                UPDATE tasks
-                SET status='Completed'
-                WHERE id=:id
-            """),
-            {"id":task_id}
-        )
-
-        # Insert into task_history so the employee's History page is populated
-        if task:
-            conn.execute(
-                text("""
-                    INSERT INTO task_history
-                    (task_id, employee_id, task_title, submitted_at)
-                    VALUES
-                    (:task_id, :employee_id, :task_title, :submitted_at)
-                """),
-                {
-                    "task_id":      task.id,
-                    "employee_id":  task.assigned_to,
-                    "task_title":   task.title,
-                    "submitted_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
-                }
-            )
-
-        conn.commit()
-
-    return {"success":True}
-
-
-@app.get("/review-tasks")
-def review_tasks(manager_id:int):
-
-    with engine.connect() as conn:
-
-        rows = conn.execute(
-            text("""
-            SELECT *
-            FROM tasks
-
-            WHERE assigned_to IN(
-
-                SELECT employee_id
-                FROM team_members
-                WHERE manager_id=:manager_id
-
-            )
-
-            AND LOWER(status)='pending review'
-            """),
-            {"manager_id":manager_id}
-        ).fetchall()
-
-    return [dict(row._mapping) for row in rows]
-
-
-@app.post("/team/remove")
-def remove_team_member(manager_id:int,
-                       employee_id:int):
-
-    print("manager =", manager_id)
-    print("employee =", employee_id)
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                DELETE
-                FROM team_members
-                WHERE manager_id=:manager_id
-                AND employee_id=:employee_id
-            """),
-            {
-                "manager_id":manager_id,
-                "employee_id":employee_id
-            }
-        )
-
-        conn.commit()
-
-    print("rows deleted =", result.rowcount)
-
-    return {"success":True}
-
-@app.get("/team")
-def get_team(manager_id:int):
-
-    with engine.connect() as conn:
-
-        data = conn.execute(
-            text("""
-                SELECT
-                    users.id,
-                    users.full_name,
-                    users.email,
-
-                    COUNT(
-                        CASE
-                        WHEN LOWER(tasks.status) != 'completed'
-                        THEN tasks.id
-                        END
-                    ) AS task_count
-
-                FROM team_members
-
-                JOIN users
-                ON team_members.employee_id = users.id
-
-                LEFT JOIN tasks
-                ON tasks.assigned_to = users.id
-
-                WHERE team_members.manager_id = :manager_id
-
-                GROUP BY
-                    users.id,
-                    users.full_name,
-                    users.email
-
-                ORDER BY users.full_name
-            """),
-            {
-                "manager_id":manager_id
-            }
-        ).fetchall()
-
-    result = []
-
-    for row in data:
-
-        result.append({
-
-            "id":row.id,
-
-            "full_name":row.full_name,
-
-            "email":row.email,
-
-            "task_count":row.task_count
-
-        })
-
-    return result
-
-@app.get("/manager-dashboard-stats")
-def manager_dashboard_stats(manager_id:int):
-
-    with engine.connect() as conn:
-
-        # Team members
-        team_members = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM team_members
-                WHERE manager_id=:manager_id
-            """),
-            {"manager_id":manager_id}
-        ).scalar()
-
-        # Total tasks assigned to team
-        total_tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE assigned_to IN(
-                    SELECT employee_id
-                    FROM team_members
-                    WHERE manager_id=:manager_id
-                )
-            """),
-            {"manager_id":manager_id}
-        ).scalar()
-
-        # Completed tasks
-        completed_tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE assigned_to IN(
-                    SELECT employee_id
-                    FROM team_members
-                    WHERE manager_id=:manager_id
-                )
-                AND LOWER(status)='completed'
-            """),
-            {"manager_id":manager_id}
-        ).scalar()
-
-        # Pending tasks (not completed)
-        pending_tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE assigned_to IN(
-                    SELECT employee_id
-                    FROM team_members
-                    WHERE manager_id=:manager_id
-                )
-                AND LOWER(status)!='completed'
-            """),
-            {"manager_id":manager_id}
-        ).scalar()
-
-        # Tasks pending review
-        review_tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE assigned_to IN(
-                    SELECT employee_id
-                    FROM team_members
-                    WHERE manager_id=:manager_id
-                )
-                AND LOWER(status)='pending review'
-            """),
-            {"manager_id":manager_id}
-        ).scalar()
-
-    # Productivity = completed / total * 100
-    productivity = 0
-    if total_tasks and total_tasks > 0:
-        productivity = round(completed_tasks * 100 / total_tasks)
-
-    return {
-        "team_members":   team_members   or 0,
-        "total_tasks":    total_tasks    or 0,
-        "completed_tasks": completed_tasks or 0,
-        "pending_tasks":  pending_tasks  or 0,
-        "review_tasks":   review_tasks   or 0,
-        "productivity":   productivity
-    }
-
-@app.get("/manager-tasks")
-def manager_tasks(manager_id:int):
-
-    with engine.connect() as conn:
-
-        rows = conn.execute(
-            text("""
-                SELECT
-                    tasks.id,
-                    tasks.title,
-                    users.full_name AS employee_name,
-                    tasks.assigned_to,
-                    tasks.priority,
-                    tasks.status,
-                    tasks.due_date
-
-                FROM tasks
-
-                JOIN users
-                ON tasks.assigned_to = users.id
-
-                WHERE tasks.assigned_to IN (
-
-                    SELECT employee_id
-                    FROM team_members
-                    WHERE manager_id=:manager_id
-
-                )
-
-                ORDER BY tasks.id DESC
-            """),
-            {"manager_id": manager_id}
-        ).fetchall()
-
-    return [dict(row._mapping) for row in rows]
-
-@app.post("/team/add")
-def add_team_member(manager_id:int, employee_id:int):
-
-    with engine.connect() as conn:
-
-        conn.execute(
-            text("""
-                INSERT INTO team_members(manager_id, employee_id)
-                VALUES(:manager_id, :employee_id)
-            """),
-            {
-                "manager_id":manager_id,
-                "employee_id":employee_id
-            }
-        )
-
-        conn.commit()
-
-    return {
-        "success":True
-    }
-
-@app.get("/manager-report")
-def manager_report(manager_id:int):
-
-    with engine.connect() as conn:
-
-        # Team members
-        team_members = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM team_members
-                WHERE manager_id=:manager_id
-            """),
-            {"manager_id":manager_id}
-        ).scalar()
-
-        # Assigned tasks
-        assigned_tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE assigned_to IN(
-
-                    SELECT employee_id
-                    FROM team_members
-                    WHERE manager_id=:manager_id
-
-                )
-            """),
-            {"manager_id":manager_id}
-        ).scalar()
-
-        # Completed tasks
-        completed_tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE assigned_to IN(
-
-                    SELECT employee_id
-                    FROM team_members
-                    WHERE manager_id=:manager_id
-
-                )
-
-                AND LOWER(status)='completed'
-            """),
-            {"manager_id":manager_id}
-        ).scalar()
-
-        # Pending tasks
-        pending_tasks = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM tasks
-                WHERE assigned_to IN(
-
-                    SELECT employee_id
-                    FROM team_members
-                    WHERE manager_id=:manager_id
-
-                )
-
-                AND LOWER(status)!='completed'
-            """),
-            {"manager_id":manager_id}
-        ).scalar()
-
-        # Completion rate
-        if assigned_tasks == 0:
-            completion_rate = 0
-        else:
-            completion_rate = round(
-                completed_tasks * 100 / assigned_tasks
-            )
-
-        # Top performer
-        top_performer_row = conn.execute(
-            text("""
-                SELECT
-                    users.full_name,
-                    COUNT(tasks.id) AS completed_count
-
-                FROM users
-
-                JOIN tasks
-                ON users.id = tasks.assigned_to
-
-                WHERE users.id IN(
-
-                    SELECT employee_id
-                    FROM team_members
-                    WHERE manager_id=:manager_id
-
-                )
-
-                AND LOWER(tasks.status)='completed'
-
-                GROUP BY users.full_name
-
-                ORDER BY completed_count DESC
-
-                LIMIT 1
-            """),
-            {"manager_id":manager_id}
-        ).fetchone()
-
-        top_performer = (
-            top_performer_row.full_name
-            if top_performer_row
-            else "N/A"
-        )
-
-    return {
-
-        "team_members": team_members or 0,
-
-        "assigned_tasks": assigned_tasks or 0,
-
-        "completed_tasks": completed_tasks or 0,
-
-        "pending_tasks": pending_tasks or 0,
-
-        "completion_rate": completion_rate,
-
-        "top_performer": top_performer
-
-    }
-@app.post("/delete-user")
-def delete_user(user_id: int):
-
-    with engine.connect() as conn:
-
-        # Delete tasks assigned to employee
-        conn.execute(
-            text("""
-                DELETE FROM tasks
-                WHERE assigned_to=:user_id
-            """),
-            {"user_id": user_id}
-        )
-
-        # Remove employee from teams
-        conn.execute(
-            text("""
-                DELETE FROM team_members
-                WHERE employee_id=:user_id
-            """),
-            {"user_id": user_id}
-        )
-
-        # Delete the user
-        conn.execute(
-            text("""
-                DELETE FROM users
-                WHERE id=:user_id
-            """),
-            {"user_id": user_id}
-        )
-
-        conn.commit()
-
-    return {
-        "success": True,
-        "message": "User deleted successfully"
-    }
-@app.get("/managers")
-def get_managers():
-
-    with engine.connect() as conn:
-
-        rows = conn.execute(
-            text("""
-                SELECT
-                    id,
-                    full_name,
-                    email,
-                    role
-                FROM users
-                WHERE LOWER(role)='manager'
-                ORDER BY id
-            """)
-        ).fetchall()
-
-    return [dict(row._mapping) for row in rows]
-
-
-# ── UPDATE PROFILE ───────────────────────────────────────────────
-@app.post("/update-profile")
-def update_profile(user_id: int, full_name: str, email: str):
-    with engine.connect() as conn:
- 
-        # Check email not taken by someone else
-        existing = conn.execute(
-            text("SELECT id FROM users WHERE email=:email AND id != :user_id"),
-            {"email": email, "user_id": user_id}
-        ).fetchone()
- 
-        if existing:
-            return {"success": False, "message": "Email already in use by another account"}
- 
-        conn.execute(
-            text("""
-                UPDATE users
-                SET full_name = :full_name, email = :email
-                WHERE id = :user_id
-            """),
-            {"full_name": full_name, "email": email, "user_id": user_id}
-        )
-        conn.commit()
- 
-    return {"success": True, "message": "Profile updated"}
- 
- 
-# ── CHANGE PASSWORD ──────────────────────────────────────────────
-@app.post("/change-password")
-def change_password(user_id: int, current_password: str, new_password: str):
-    with engine.connect() as conn:
- 
-        # Verify current password
-        user = conn.execute(
-            text("SELECT id FROM users WHERE id=:user_id AND password=:password"),
-            {"user_id": user_id, "password": current_password}
-        ).fetchone()
- 
-        if not user:
-            return {"success": False, "message": "Current password is incorrect"}
- 
-        if len(new_password) < 6:
-            return {"success": False, "message": "New password must be at least 6 characters"}
- 
-        conn.execute(
-            text("UPDATE users SET password=:password WHERE id=:user_id"),
-            {"password": new_password, "user_id": user_id}
-        )
-        conn.commit()
- 
-    return {"success": True, "message": "Password changed successfully"}
- 
- 
-# ── GET ALL USERS WITH ROLES (for role management) ───────────────
-@app.get("/all-users")
-def get_all_users():
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("""
-                SELECT id, full_name, email, role
-                FROM users
-                ORDER BY role, full_name
-            """)
-        )
-        users = [dict(row._mapping) for row in result]
-    return users
- 
- 
-# ── UPDATE USER ROLE ─────────────────────────────────────────────
-@app.post("/update-role")
-def update_role(user_id: int, new_role: str):
-    valid_roles = ["employee", "manager", "admin"]
-    if new_role not in valid_roles:
-        return {"success": False, "message": "Invalid role"}
- 
-    with engine.connect() as conn:
-        conn.execute(
-            text("UPDATE users SET role=:role WHERE id=:user_id"),
-            {"role": new_role, "user_id": user_id}
-        )
-        conn.commit()
- 
-    return {"success": True}
-
-
-
-# ==========================================================
-# SALES DASHBOARD ROUTES
-# ==========================================================
-
-from typing import Optional
-
-
-# ----------------------------------------------------------
-# TEAM MEMBER IDS
-# ----------------------------------------------------------
-
-def _team_member_ids(manager_id: int, conn):
-
-    rows = conn.execute(
-        text("""
-            SELECT employee_id
-            FROM team_members
-            WHERE manager_id=:manager_id
-        """),
-        {"manager_id": manager_id}
-    ).fetchall()
-
-    return [row.employee_id for row in rows]
-
-
-# ----------------------------------------------------------
-# CURRENT WEEK
-# ----------------------------------------------------------
-
-@app.get("/sales/current-week")
-def sales_current_week():
-
-    return {
-
-        "week": current_week()
-
-    }
-
-
-# ----------------------------------------------------------
-# ADD PROJECTION
-# ----------------------------------------------------------
-
-from typing import Optional
-
-@app.post("/sales/projection")
-def post_projection(
-    user_id: int,
-    week: int,
-    customer: Optional[str] = "",
-    product: Optional[str] = "",
-    projected: Optional[int] = 0,
-    price: Optional[float] = 0
-):
-
-    if week < current_week():
-
-        return {
-
-            "success": False,
-            "message": "Projections can only be added for current week."
-
+        body {
+            display: flex;
+            background: #f4f6f9;
         }
 
-    try:
-
-        return add_projection(
-
-            user_id=user_id,
-            week=week,
-            customer=customer,
-            product=product,
-            projected=projected,
-            price=price
-
-        )
-
-    except Exception as e:
-
-        return {
-
-            "success": False,
-            "message": str(e)
-
+        /* SIDEBAR */
+        .sidebar {
+            width: 260px;
+            height: 100vh;
+            background: #111827;
+            color: white;
+            position: fixed;
+            left: 0;
+            top: 0;
+            padding: 20px;
         }
 
-
-# ----------------------------------------------------------
-# GET SALES ROWS
-# ----------------------------------------------------------
-
-@app.get("/sales/rows")
-def sales_rows(
-    user_id: int,
-    week: int,
-    viewer_id: int,
-    viewer_role: str
-):
-    if viewer_role == "admin":
-        pass  # admin can view anyone
-    elif viewer_role == "manager":
-        # manager can view their own rows OR their team members'
-        if viewer_id != user_id:
-            with engine.connect() as conn:
-                team = _team_member_ids(viewer_id, conn)
-            if user_id not in team:
-                return {"success": False, "message": "Not your team member"}
-    else:
-        # employee can only view their own rows
-        if viewer_id != user_id:
-            return {"success": False, "message": "Access denied"}
-
-    return {"rows": get_sales(user_id, week)}
-
-
-# ----------------------------------------------------------
-# GET WEEKS
-# ----------------------------------------------------------
-
-@app.get("/sales/weeks")
-def sales_weeks(
-    user_id: int,
-    viewer_id: int,
-    viewer_role: str
-):
-    if viewer_role == "admin":
-        pass  # admin can view anyone
-    elif viewer_role == "manager":
-        # manager can view own weeks OR team members'
-        if viewer_id != user_id:
-            with engine.connect() as conn:
-                team = _team_member_ids(viewer_id, conn)
-            if user_id not in team:
-                return {"success": False}
-    else:
-        if viewer_id != user_id:
-            return {"success": False}
-
-    return {"weeks": get_all_weeks(user_id)}
-
-
-# ----------------------------------------------------------
-# UPDATE ACHIEVED
-# ----------------------------------------------------------
-
-@app.put("/sales/achieved")
-def sales_achieved(
-    user_id: int,
-    week: int,
-    customer: str,
-    product: str,
-    achieved: int
-):
-
-    if week < current_week():
-        return {
-            "success": False,
-            "message": "Only current or future weeks are editable."
+        .logo {
+            font-size: 22px;
+            font-weight: bold;
+            margin-bottom: 30px;
         }
 
-    try:
-
-        return update_achieved(
-
-            user_id,
-            week,
-            customer,
-            product,
-            achieved
-
-        )
-
-    except Exception as e:
-
-        return {
-
-            "success": False,
-            "message": str(e)
-
+        .menu a {
+            display: block;
+            color: white;
+            text-decoration: none;
+            padding: 12px;
+            margin-bottom: 8px;
+            border-radius: 8px;
+            transition: 0.3s;
         }
 
-
-# ----------------------------------------------------------
-# TEAM SALES
-# ----------------------------------------------------------
-
-@app.get("/sales/team")
-def sales_team(
-    manager_id: int,
-    week: int,
-    viewer_role: str
-):
-
-    with engine.connect() as conn:
-
-        if viewer_role == "admin":
-
-            rows = conn.execute(
-                text("""
-                    SELECT id
-                    FROM users
-                    WHERE role='employee'
-                """)
-            ).fetchall()
-
-            employee_ids = [row.id for row in rows]
-
-        else:
-
-            employee_ids = _team_member_ids(
-                manager_id,
-                conn
-            )
-
-    data = get_sales_for_employees(
-        employee_ids,
-        week
-    )
-
-    names = {}
-
-    if employee_ids:
-
-        placeholders = ",".join(
-            str(i)
-            for i in employee_ids
-        )
-
-        with engine.connect() as conn:
-
-            rows = conn.execute(
-                text(f"""
-                    SELECT
-                    id,
-                    full_name
-
-                    FROM users
-
-                    WHERE id IN ({placeholders})
-                """)
-            ).fetchall()
-
-        names = {
-
-            row.id: row.full_name
-
-            for row in rows
-
+        .menu a:hover {
+            background: #2563eb;
         }
 
-    result = []
-
-    for emp_id in employee_ids:
-
-        result.append({
-
-            "id": emp_id,
-            "name": names.get(
-                emp_id,
-                f"Employee {emp_id}"
-            ),
-            "rows": data.get(
-                emp_id,
-                []
-            )
-
-        })
-
-    return {
-
-        "week": week,
-        "employees": result
-
-    }
-
-
-# ----------------------------------------------------------
-# ADMIN / MANAGER EDIT PROJECTION
-# ----------------------------------------------------------
-
-@app.put("/sales/projection/admin-edit")
-def admin_edit_projection_route(
-    viewer_role: str,
-    user_id: int,
-    week: int,
-    customer: str,
-    product: str,
-    new_qty: int
-):
-
-    if viewer_role not in [
-
-        "admin",
-        "manager"
-
-    ]:
-
-        return {
-
-            "success": False
-
+        .menu details summary {
+            color: white;
+            padding: 12px;
+            margin-bottom: 8px;
+            border-radius: 8px;
+            cursor: pointer;
+            list-style: none;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
         }
 
-    try:
-
-        return admin_update_projection(
-
-            user_id,
-            week,
-            customer,
-            product,
-            new_qty
-
-        )
-
-    except Exception as e:
-
-        return {
-
-            "success": False,
-            "message": str(e)
-
+        .menu details summary:hover {
+            background: #2563eb;
         }
 
-
-# ----------------------------------------------------------
-# CHANGE REQUEST
-# ----------------------------------------------------------
-
-@app.post("/sales/change-request")
-def sales_change_request(
-    employee_id: int,
-    week: int,
-    customer: str,
-    product: str,
-    old_qty: int,
-    new_qty: int,
-    reason: str
-):
-
-    return raise_change_request(
-
-        employee_id,
-        week,
-        customer,
-        product,
-        old_qty,
-        new_qty,
-        reason
-
-    )
-
-
-# ----------------------------------------------------------
-# LIST CHANGE REQUESTS
-# ----------------------------------------------------------
-
-@app.get("/sales/change-requests")
-def list_change_requests(
-    viewer_id: int,
-    viewer_role: str,
-    status: Optional[str] = None
-):
-
-    if viewer_role == "employee":
-
-        requests = get_change_requests(
-
-            employee_ids=[viewer_id],
-            status=status
-
-        )
-
-    elif viewer_role == "manager":
-
-        with engine.connect() as conn:
-
-            team = _team_member_ids(
-                viewer_id,
-                conn
-            )
-
-        requests = get_change_requests(
-
-            employee_ids=team,
-            status=status
-
-        )
-
-    elif viewer_role == "admin":
-
-        requests = get_change_requests(
-
-            employee_ids=None,
-            status=status
-
-        )
-
-    else:
-
-        requests = []
-
-    return {
-
-        "requests": requests
-
-    }
-
-
-# ----------------------------------------------------------
-# RESOLVE CHANGE REQUEST
-# ----------------------------------------------------------
-
-@app.post("/sales/change-request/resolve")
-def resolve_request(
-    request_id: str,
-    action: str,
-    manager_note: str = "",
-    viewer_role: str = ""
-):
-
-    if viewer_role not in [
-
-        "admin",
-        "manager"
-
-    ]:
-
-        return {
-
-            "success": False
-
+        .review-badge {
+            background: #ef4444;
+            color: white;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 2px 7px;
+            border-radius: 99px;
+            min-width: 20px;
+            text-align: center;
+            display: none;
         }
 
-    try:
-
-        return resolve_change_request(
-
-            request_id,
-            action,
-            manager_note
-
-        )
-
-    except Exception as e:
-
-        return {
-
-            "success": False,
-            "message": str(e)
-
+        .menu details a {
+            padding-left: 24px;
         }
 
-from fastapi.responses import FileResponse
-
-from fastapi.responses import FileResponse
-
-@app.get("/sales/download")
-def download_sales():
-
-    return FileResponse(
-        FILE_NAME,
-        filename="sales_tracker.xlsx",
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-from openpyxl import load_workbook
-
-@app.get("/sales/debug")
-def sales_debug():
-
-    wb = load_workbook(FILE_NAME)
-    output = {}
-
-    for sheet in wb.sheetnames:
-        ws = wb[sheet]
-        rows = [row for row in ws.iter_rows(values_only=True)]
-        output[sheet] = rows
-
-    return output
-@app.get("/sales/debug-path")
-def debug_path():
-
-    import os
-
-    return {
-
-        "cwd": os.getcwd(),
-
-        "files": os.listdir()
-
-    }
-@app.get("/test123")
-def test123():
-    return {
-        "ok": True
-    }
-import os
-
-@app.get("/testfiles")
-def testfiles():
-
-    try:
-
-        return {
-            "cwd": os.getcwd(),
-            "files": os.listdir(".")
+        /* MAIN */
+        .main {
+            margin-left: 260px;
+            width: 100%;
+            padding: 25px;
         }
 
-    except Exception as e:
-
-        return {
-            "error": str(e)
-        }
-@app.get("/sales/test-add")
-def sales_test_add():
-
-    try:
-
-        return add_projection(
-            user_id=11,
-            week=current_week(),
-            customer="XYZ Company",
-            product="Switch",
-            projected=25,
-            price=800
-        )
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "error": str(e)
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 25px;
         }
 
-
-# ═══════════════════════════════════════════════════════
-# TASK FILE ATTACHMENT
-# ═══════════════════════════════════════════════════════
-# Run once to add the column (idempotent):
-#   ALTER TABLE tasks ADD COLUMN IF NOT EXISTS file_url TEXT;
-#   ALTER TABLE tasks ADD COLUMN IF NOT EXISTS file_name TEXT;
-
-import shutil, os as _os
-
-UPLOAD_DIR = _os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", ".") + "/task_files"
-_os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-@app.post("/submit-task-with-file")
-async def submit_task_with_file(
-    task_id: int,
-    file: UploadFile = FastAPIFile(None)
-):
-    """
-    Employee calls this instead of /update-task-status when submitting
-    for review with an optional file attachment.
-    Saves the file to the persistent volume and stores the path in tasks.
-    """
-    file_url  = None
-    file_name = None
-
-    if file and file.filename:
-        safe_name = f"{task_id}_{file.filename.replace(' ', '_')}"
-        dest      = f"{UPLOAD_DIR}/{safe_name}"
-        with open(dest, "wb") as buf:
-            shutil.copyfileobj(file.file, buf)
-        file_url  = f"/task-file/{safe_name}"
-        file_name = file.filename
-
-    with engine.connect() as conn:
-        conn.execute(
-            text("""
-                UPDATE tasks
-                SET status    = 'Pending Review',
-                    file_url  = :file_url,
-                    file_name = :file_name
-                WHERE id = :task_id
-            """),
-            {"task_id": task_id, "file_url": file_url, "file_name": file_name}
-        )
-        conn.commit()
-
-    return {"success": True, "file_url": file_url, "file_name": file_name}
-
-
-from fastapi.responses import FileResponse as _FileResp
-
-@app.get("/task-file/{filename}")
-def serve_task_file(filename: str):
-    path = f"{UPLOAD_DIR}/{filename}"
-    if not _os.path.exists(path):
-        return {"error": "File not found"}
-    return _FileResp(path, filename=filename)
-
-
-# ═══════════════════════════════════════════════════════
-# TASK REMARKS (manager → employee corrections)
-# ═══════════════════════════════════════════════════════
-# Run once:
-#   CREATE TABLE IF NOT EXISTS task_remarks (
-#       id          SERIAL PRIMARY KEY,
-#       task_id     INT NOT NULL,
-#       manager_id  INT NOT NULL,
-#       employee_id INT NOT NULL,
-#       remark      TEXT NOT NULL,
-#       status      TEXT DEFAULT 'pending',   -- pending | resolved
-#       created_at  TIMESTAMP DEFAULT NOW()
-#   );
-
-@app.post("/send-remark")
-def send_remark(
-    task_id:     int,
-    manager_id:  int,
-    employee_id: int,
-    remark:      str
-):
-    """
-    Manager sends a correction remark on a task.
-    Also resets the task status back to 'In Progress' so employee
-    can fix and re-submit.
-    """
-    with engine.connect() as conn:
-
-        conn.execute(
-            text("""
-                INSERT INTO task_remarks
-                (task_id, manager_id, employee_id, remark, status)
-                VALUES
-                (:task_id, :manager_id, :employee_id, :remark, 'pending')
-            """),
-            {
-                "task_id":     task_id,
-                "manager_id":  manager_id,
-                "employee_id": employee_id,
-                "remark":      remark
-            }
-        )
-
-        # Push task back to In Progress so employee can re-submit
-        conn.execute(
-            text("""
-                UPDATE tasks
-                SET status = 'In Progress'
-                WHERE id = :task_id
-            """),
-            {"task_id": task_id}
-        )
-
-        conn.commit()
-
-    return {"success": True}
-
-
-@app.get("/task-remarks")
-def get_task_remarks(employee_id: int):
-    """
-    Returns all pending remarks for an employee across all tasks.
-    """
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT
-                    tr.id,
-                    tr.task_id,
-                    tr.remark,
-                    tr.status,
-                    tr.created_at,
-                    t.title  AS task_title,
-                    u.full_name AS manager_name
-                FROM task_remarks tr
-                JOIN tasks t  ON tr.task_id    = t.id
-                JOIN users u  ON tr.manager_id = u.id
-                WHERE tr.employee_id = :employee_id
-                ORDER BY tr.created_at DESC
-            """),
-            {"employee_id": employee_id}
-        ).fetchall()
-
-    return [dict(r._mapping) for r in rows]
-
-
-@app.put("/resolve-remark")
-def resolve_remark(remark_id: int):
-    """Employee marks a remark as resolved after fixing."""
-    with engine.connect() as conn:
-        conn.execute(
-            text("UPDATE task_remarks SET status='resolved' WHERE id=:id"),
-            {"id": remark_id}
-        )
-        conn.commit()
-    return {"success": True}
-
-
-@app.get("/manager-remarks")
-def get_manager_remarks(manager_id: int):
-    """Returns all remarks sent by this manager, with current task status."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT
-                    tr.id,
-                    tr.task_id,
-                    tr.remark,
-                    tr.status      AS remark_status,
-                    tr.created_at,
-                    t.title        AS task_title,
-                    t.status       AS task_status,
-                    u.full_name    AS employee_name
-                FROM task_remarks tr
-                JOIN tasks t  ON tr.task_id     = t.id
-                JOIN users u  ON tr.employee_id = u.id
-                WHERE tr.manager_id = :manager_id
-                ORDER BY tr.created_at DESC
-            """),
-            {"manager_id": manager_id}
-        ).fetchall()
-
-    return [dict(r._mapping) for r in rows]
-
-@app.post("/meetings/create")
-def create_meeting(
-    title: str,
-    description: str = "",
-    meeting_date: str = "",
-    start_slot: int = 0,
-    end_slot: int = 0,
-    organizer_id: int = 0,
-    location: str = "",
-    attendees: str = "[]"
-):
-    import json
-    attendee_list = json.loads(attendees)
-
-    with engine.begin() as conn:
-        conflict = conn.execute(
-            text("""
-                SELECT id FROM meetings
-                WHERE meeting_date = :meeting_date
-                AND organizer_id = :organizer_id
-                AND (start_slot < :new_end AND end_slot > :new_start)
-            """),
-            {"meeting_date": meeting_date, "organizer_id": organizer_id,
-             "new_start": start_slot, "new_end": end_slot}
-        ).fetchone()
-
-        if conflict:
-            return {"success": False, "message": "You already have a meeting at that time"}
-
-        meeting_id = conn.execute(
-            text("""
-                INSERT INTO meetings
-                    (title, description, organizer_id, meeting_date, start_slot, end_slot, location)
-                VALUES
-                    (:title, :description, :organizer_id, :meeting_date, :start_slot, :end_slot, :location)
-                RETURNING id
-            """),
-            {"title": title, "description": description, "organizer_id": organizer_id,
-             "meeting_date": meeting_date, "start_slot": start_slot,
-             "end_slot": end_slot, "location": location}
-        ).scalar()
-
-        for uid in attendee_list:
-            conn.execute(
-                text("INSERT INTO meeting_attendees(meeting_id, user_id) VALUES(:mid, :uid)"),
-                {"mid": meeting_id, "uid": uid}
-            )
-
-    return {"success": True, "meeting_id": meeting_id}
-
-
-
-@app.get("/meetings/month")
-def get_month_meetings(user_id: int, month: str):
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT DISTINCT m.id, m.title, m.description,
-                    m.meeting_date, m.start_slot, m.end_slot,
-                    m.location, m.organizer_id
-                FROM meetings m
-                LEFT JOIN meeting_attendees a ON m.id = a.meeting_id
-                WHERE (m.organizer_id = :user_id OR a.user_id = :user_id)
-                AND TO_CHAR(m.meeting_date, 'YYYY-MM') = :month
-                ORDER BY m.meeting_date, m.start_slot
-            """),
-            {"user_id": user_id, "month": month}
-        ).fetchall()
-    return [
-        {"id": r.id, "title": r.title, "description": r.description,
-         "meeting_date": str(r.meeting_date), "date": str(r.meeting_date),
-         "start_slot": r.start_slot, "end_slot": r.end_slot,
-         "location": r.location, "organizer_id": r.organizer_id}
-        for r in rows
-    ]
-    
-@app.get("/meetings/day")
-def get_day_meetings(date: str, user_id: int):
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-            SELECT DISTINCT m.id, m.title, m.description,
-                m.meeting_date, m.start_slot, m.end_slot,
-                m.location, m.organizer_id
-            FROM meetings m
-            LEFT JOIN meeting_attendees a ON m.id = a.meeting_id
-            WHERE m.meeting_date = :date
-            AND (m.organizer_id = :user_id OR a.user_id = :user_id)
-            ORDER BY m.start_slot
-            """),
-            {"date": date, "user_id": user_id}
-        ).fetchall()
-
-    return [
-        {
-            "id":           row.id,
-            "title":        row.title,
-            "description":  row.description,
-            "date":         str(row.meeting_date),
-            "start_slot":   row.start_slot,
-            "end_slot":     row.end_slot,
-            "start_time":   slot_to_time(row.start_slot),
-            "end_time":     slot_to_time(row.end_slot),
-            "location":     row.location,
-            "organizer_id": row.organizer_id,
-        }
-        for row in rows
-    ]
-
-@app.get("/meetings/user-availability")
-def user_availability(user_id:int, date:str):
-
-    availability = [True]*48
-
-    with engine.connect() as conn:
-
-        rows = conn.execute(
-            text("""
-            SELECT
-                start_slot,
-                end_slot
-            FROM meetings
-            WHERE
-                meeting_date=:date
-            AND
-                organizer_id=:user_id
-            """),
-            {
-                "date": date,
-                "user_id": user_id
-            }
-        ).fetchall()
-
-    for row in rows:
-
-        for slot in range(row.start_slot,row.end_slot):
-
-            availability[slot] = False
-
-    return {
-        "slots": availability
-    }
-
-@app.get("/meetings/week")
-def get_week_meetings(user_id: int, week_start: str):
-
-    with engine.connect() as conn:
-
-        rows = conn.execute(
-            text("""
-            SELECT
-                m.id,
-                m.title,
-                m.description,
-                m.meeting_date,
-                m.start_slot,
-                m.end_slot,
-                m.location,
-                m.organizer_id
-            FROM meetings m
-
-            LEFT JOIN meeting_attendees a
-            ON m.id = a.meeting_id
-
-            WHERE
-            (
-                m.organizer_id=:user_id
-                OR
-                a.user_id=:user_id
-            )
-
-            AND
-
-            m.meeting_date BETWEEN
-            :week_start::date
-            AND
-            (:week_start::date + interval '6 days')
-
-            ORDER BY
-            m.meeting_date,
-            m.start_slot
-            """),
-            {
-                "user_id": user_id,
-                "week_start": week_start
-            }
-        ).fetchall()
-
-    output = []
-
-    for row in rows:
-
-        output.append({
-
-            "id": row.id,
-
-            "title": row.title,
-
-            "description": row.description,
-
-            "date": str(row.meeting_date),
-
-            "start_slot": row.start_slot,
-
-            "end_slot": row.end_slot,
-
-            "start_time": slot_to_time(row.start_slot),
-
-            "end_time": slot_to_time(row.end_slot),
-
-            "location": row.location,
-
-            "organizer_id": row.organizer_id
-
-        })
-
-    return output
-
-@app.get("/meetings/{meeting_id}/attendees")
-def get_meeting_attendees(meeting_id: int):
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT u.id AS user_id, u.full_name
-                FROM meeting_attendees ma
-                JOIN users u ON u.id = ma.user_id
-                WHERE ma.meeting_id = :meeting_id
-            """),
-            {"meeting_id": meeting_id}
-        ).fetchall()
-    return [{"user_id": r.user_id, "full_name": r.full_name} for r in rows]
-
-@app.get("/meeting/{meeting_id}")
-def get_meeting_details(meeting_id: int):
-
-    with engine.connect() as conn:
-
-        row = conn.execute(
-            text("""
-            SELECT *
-            FROM meetings
-            WHERE id=:meeting_id
-            """),
-            {
-                "meeting_id": meeting_id
-            }
-        ).fetchone()
-
-        attendees = conn.execute(
-            text("""
-            SELECT
-                u.id,
-                u.full_name,
-                ma.response_status
-            FROM meeting_attendees ma
-
-            JOIN users u
-            ON u.id=ma.user_id
-
-            WHERE ma.meeting_id=:meeting_id
-            """),
-            {
-                "meeting_id": meeting_id
-            }
-        ).fetchall()
-
-    if not row:
-
-        return {"success": False}
-
-    return {
-
-        "success": True,
-
-        "meeting": {
-
-            "id": row.id,
-
-            "title": row.title,
-
-            "description": row.description,
-
-            "date": str(row.meeting_date),
-
-            "start_slot": row.start_slot,
-
-            "end_slot": row.end_slot,
-
-            "start_time": slot_to_time(row.start_slot),
-
-            "end_time": slot_to_time(row.end_slot),
-
-            "location": row.location,
-
-            "organizer_id": row.organizer_id
-
-        },
-
-        "attendees": [
-
-            {
-
-                "id": a.id,
-
-                "name": a.full_name,
-
-                "status": a.response_status
-
-            }
-
-            for a in attendees
-
-        ]
-
-    }
-
-class MeetingResponseRequest(BaseModel):
-
-    meeting_id: int
-
-    user_id: int
-
-    status: str
-
-@app.post("/meeting/respond")
-def respond_to_meeting(req: MeetingResponseRequest):
-
-    with engine.begin() as conn:
-
-        conn.execute(
-
-            text("""
-            UPDATE meeting_attendees
-
-            SET response_status=:status
-
-            WHERE
-
-            meeting_id=:meeting_id
-
-            AND
-
-            user_id=:user_id
-            """),
-
-            req.model_dump()
-
-        )
-
-    return {
-
-        "success": True
-
-    }
-@app.get("/calendar-tasks")
-def get_calendar_tasks(user_id: int, month: Optional[str] = None, date: Optional[str] = None):
-    """
-    Supports two modes:
-      ?user_id=X&month=YYYY-MM   → all tasks for a month (month view)
-      ?user_id=X&date=YYYY-MM-DD → all tasks for a single day (day view)
-    """
-    try:
-        with engine.connect() as conn:
-
-            if date:
-                rows = conn.execute(
-                    text("""
-                    SELECT
-                        id, title, description, task_date,
-                        start_slot, end_slot, color, status
-                    FROM calendar_tasks
-                    WHERE user_id = :user_id
-                    AND task_date = :date
-                    ORDER BY start_slot
-                    """),
-                    {"user_id": user_id, "date": date}
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    text("""
-                    SELECT
-                        id, title, description, task_date,
-                        start_slot, end_slot, color, status
-                    FROM calendar_tasks
-                    WHERE user_id = :user_id
-                    AND TO_CHAR(task_date, 'YYYY-MM') = :month
-                    ORDER BY task_date, start_slot
-                    """),
-                    {"user_id": user_id, "month": month or ""}
-                ).fetchall()
-
-        return [
-            {
-                "id":          row.id,
-                "title":       row.title,
-                "description": row.description,
-                "task_date":   str(row.task_date),
-                "start_slot":  row.start_slot,
-                "end_slot":    row.end_slot,
-                "color":       row.color,
-                "status":      row.status,
-            }
-            for row in rows
-        ]
-    except Exception as e:
-        return []
-
-# ═══════════════════════════════════════════════════════
-# CALENDAR TASKS — CREATE / DELETE
-# ═══════════════════════════════════════════════════════
-# Run once in your DB if the table doesn't exist yet:
-#   CREATE TABLE IF NOT EXISTS calendar_tasks (
-#       id          SERIAL PRIMARY KEY,
-#       user_id     INT NOT NULL,
-#       title       TEXT NOT NULL,
-#       description TEXT DEFAULT '',
-#       task_date   DATE NOT NULL,
-#       start_slot  INT NOT NULL,
-#       end_slot    INT NOT NULL,
-#       color       TEXT DEFAULT '#7c3aed',
-#       status      TEXT DEFAULT 'pending',
-#       created_at  TIMESTAMP DEFAULT NOW()
-#   );
-
-@app.post("/calendar-tasks/create")
-def create_calendar_task(
-    user_id: int,
-    title: str,
-    description: str = "",
-    task_date: str = "",
-    start_slot: int = 0,
-    end_slot: int = 0,
-    color: str = "#7c3aed",
-    sync_gcal: bool = False
-):
-    try:
-        with engine.begin() as conn:
-            task_id = conn.execute(
-                text("""
-                    INSERT INTO calendar_tasks
-                        (user_id, title, description, task_date, start_slot, end_slot, color)
-                    VALUES
-                        (:user_id, :title, :description, :task_date, :start_slot, :end_slot, :color)
-                    RETURNING id
-                """),
-                {"user_id": user_id, "title": title, "description": description,
-                 "task_date": task_date, "start_slot": start_slot,
-                 "end_slot": end_slot, "color": color}
-            ).scalar()
-        return {"success": True, "task_id": task_id, "gcal_synced": False}
-    except Exception as e:
-        print(f"[ERROR] create_calendar_task failed: {e}", flush=True)
-        return {"success": False, "message": str(e)}
-
-
-@app.delete("/calendar-tasks/{task_id}")
-def delete_calendar_task(task_id: int, user_id: int):
-    with engine.begin() as conn:
-        result = conn.execute(
-            text("""
-                DELETE FROM calendar_tasks
-                WHERE id = :task_id AND user_id = :user_id
-            """),
-            {"task_id": task_id, "user_id": user_id}
-        )
-    if result.rowcount == 0:
-        return {"success": False, "message": "Task not found or not yours"}
-    return {"success": True}
-
-
-
-@app.get("/calendar/combined")
-def calendar_combined(user_id: int, date: str):
-
-    with engine.connect() as conn:
-
-        meetings = conn.execute(
-            text("""
-            SELECT DISTINCT m.title, m.start_slot, m.end_slot, 'meeting' as type
-            FROM meetings m
-            LEFT JOIN meeting_attendees a ON m.id = a.meeting_id
-            WHERE m.meeting_date = :date
-            AND (m.organizer_id = :user_id OR a.user_id = :user_id)
-            """),
-            {"date": date, "user_id": user_id}
-        ).fetchall()
-
-        tasks = conn.execute(
-            text("""
-            SELECT
-                title,
-                start_slot,
-                end_slot,
-                'task' as type
-            FROM calendar_tasks
-            WHERE
-            user_id=:user_id
-            AND task_date=:date
-            """),
-            {
-                "user_id": user_id,
-                "date": date
-            }
-        ).fetchall()
-
-    output = []
-
-    for row in meetings:
-        output.append(dict(row._mapping))
-
-    for row in tasks:
-        output.append(dict(row._mapping))
-
-    return output
-
-@app.get("/users")
-def get_all_users():
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT id, full_name, email, role FROM users ORDER BY full_name")
-        )
-        return [dict(row._mapping) for row in result]
-
-
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-
-
-def send_email(to_email, subject, html):
-
-    response = requests.post(
-        "https://api.resend.com/emails",
-        headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "from": "Panache <onboarding@resend.dev>",
-            "to": [to_email],
-            "subject": subject,
-            "html": html
-        }
-    )
-
-    return response.json()
-
-
-@app.post("/test-email")
-def test_email():
-
-    result = send_email(
-        "krishpdgl@gmail.com",
-        "Panache Test",
-        """
-        <h2>Email Working ✅</h2>
-        <p>This email was sent using Resend.</p>
-        """
-    )
-
-    return result
-
-from sqlalchemy import text
-
-def send_sales_projection_reminders():
-
-    with engine.connect() as conn:
-
-        result = conn.execute(text("""
-            SELECT full_name, email
-            FROM users
-            WHERE email IS NOT NULL
-              AND email <> ''
-        """))
-
-        employees = result.fetchall()
-
-    sent = 0
-    failed = 0
-
-    for emp in employees:
-
-        try:
-
-            full_name = emp.full_name
-            email = emp.email
-
-            response = send_email(
-                email,
-                "Sales Projection Reminder",
-                f"""
-                <h2>Weekly Sales Projection Reminder</h2>
-
-                <p>Hi {full_name},</p>
-
-                <p>Please fill your sales projections for this week.</p>
-
-                <p>Login to Panache WMS and update your projections.</p>
-
-                <p>Regards,<br>Panache WMS</p>
-                """
-            )
-
-            if response.get("id"):
-                sent += 1
-            else:
-                failed += 1
-                print(f"Failed email: {email} -> {response}")
-
-        except Exception as e:
-
-            failed += 1
-
-            print(f"Failed email: {email} -> {e}")
-
-            continue
-
-    return {
-        "success": True,
-        "sent": sent,
-        "failed": failed,
-        "total": len(employees)
-    }
-
-@app.post("/send-sales-reminders")
-def send_sales_reminders():
-
-    try:
-        return send_sales_projection_reminders()
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-from sqlalchemy import text
-
-@app.post("/leave-requests")
-def create_leave_request(data: LeaveRequest):
-
-    with engine.begin() as conn:
-
-        result = conn.execute(
-            text("""
-                INSERT INTO leave_requests
-                (
-                    user_id,
-                    employee_name,
-                    leave_type,
-                    start_date,
-                    end_date,
-                    reason
-                )
-                VALUES
-                (
-                    :user_id,
-                    :employee_name,
-                    :leave_type,
-                    :start_date,
-                    :end_date,
-                    :reason
-                )
-                RETURNING id
-            """),
-            {
-                "user_id": data.user_id,
-                "employee_name": data.employee_name,
-                "leave_type": data.leave_type,
-                "start_date": data.start_date,
-                "end_date": data.end_date,
-                "reason": data.reason
-            }
-        )
-
-        leave_id = result.scalar()
-
-    return {
-        "success": True,
-        "leave_id": leave_id
-    }
-
-@app.get("/leave-requests")
-def get_leave_requests():
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT *
-                FROM leave_requests
-                ORDER BY created_at DESC
-            """)
-        )
-
-        rows = result.mappings().all()
-
-    return rows
-
-@app.post("/leave-requests/{leave_id}/approve")
-def approve_leave(leave_id: int):
-
-    with engine.begin() as conn:
-
-        conn.execute(
-            text("""
-                UPDATE leave_requests
-                SET
-                    status = 'Approved',
-                    approved_at = NOW()
-                WHERE id = :leave_id
-            """),
-            {
-                "leave_id": leave_id
-            }
-        )
-
-    return {
-        "success": True
-    }
-
-@app.post("/leave-requests/{leave_id}/reject")
-def reject_leave(leave_id: int):
-
-    with engine.begin() as conn:
-
-        conn.execute(
-            text("""
-                UPDATE leave_requests
-                SET
-                    status = 'Rejected',
-                    approved_at = NOW()
-                WHERE id = :leave_id
-            """),
-            {
-                "leave_id": leave_id
-            }
-        )
-
-    return {
-        "success": True
-    }
-
-@app.get("/leave-stats")
-def leave_stats():
-
-    with engine.connect() as conn:
-
-        total = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM leave_requests
-            """)
-        ).scalar()
-
-        pending = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM leave_requests
-                WHERE status='Pending'
-            """)
-        ).scalar()
-
-        approved = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM leave_requests
-                WHERE status='Approved'
-            """)
-        ).scalar()
-
-        rejected = conn.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM leave_requests
-                WHERE status='Rejected'
-            """)
-        ).scalar()
-
-    return {
-        "total": total,
-        "pending": pending,
-        "approved": approved,
-        "rejected": rejected
-    }
-@app.get("/leave-requests/pending")
-def get_pending_leaves():
-
-    with engine.connect() as conn:
-
-        result = conn.execute(text("""
-            SELECT *
-            FROM leave_requests
-            WHERE status = 'Pending'
-            ORDER BY created_at DESC
-        """))
-
-        return result.mappings().all()
-from sqlalchemy import text
-
-@app.post("/employee-voice")
-def submit_employee_voice(data: EmployeeVoiceRequest):
-
-    with engine.begin() as conn:
-
-        result = conn.execute(
-            text("""
-                INSERT INTO employee_voice
-                (
-                    user_id,
-                    employee_name,
-                    is_anonymous,
-                    category,
-                    priority,
-                    subject,
-                    description,
-                    attachment
-                )
-                VALUES
-                (
-                    :user_id,
-                    :employee_name,
-                    :is_anonymous,
-                    :category,
-                    :priority,
-                    :subject,
-                    :description,
-                    :attachment
-                )
-                RETURNING id
-            """),
-            {
-                "user_id": data.user_id,
-                "employee_name": data.employee_name,
-                "is_anonymous": data.is_anonymous,
-                "category": data.category,
-                "priority": data.priority,
-                "subject": data.subject,
-                "description": data.description,
-                "attachment": data.attachment
-            }
-        )
-
-        new_id = result.scalar()
-
-    return {
-        "success": True,
-        "id": new_id
-    }
-
-@app.get("/employee-voice/my/{user_id}")
-def get_my_voice(user_id: int):
-
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT *
-                FROM employee_voice
-                WHERE
-                    user_id = :user_id
-                AND
-                    is_anonymous = FALSE
-                ORDER BY created_at DESC
-            """),
-            {
-                "user_id": user_id
-            }
-        )
-
-        return result.mappings().all()
-
-@app.get("/employee-voice")
-def get_employee_voice():
-
-    with engine.connect() as conn:
-
-        result = conn.execute(text("""
-            SELECT *
-            FROM employee_voice
-            ORDER BY created_at DESC
-        """))
-
-        rows = result.mappings().all()
-
-    response = []
-
-    for row in rows:
-
-        item = dict(row)
-
-        if item["is_anonymous"]:
-            item["employee_name"] = "Anonymous"
-
-        response.append(item)
-
-    return response
-
-class VoiceStatusUpdate(BaseModel):
-    status: str
-
-@app.post("/employee-voice/{voice_id}/status")
-def update_voice_status(
-    voice_id: int,
-    data: VoiceStatusUpdate
-):
-
-    with engine.begin() as conn:
-
-        conn.execute(
-            text("""
-                UPDATE employee_voice
-                SET
-                    status = :status,
-                    responded_at = NOW()
-                WHERE id = :id
-            """),
-            {
-                "status": data.status,
-                "id": voice_id
-            }
-        )
-
-    return {
-        "success": True
-    }
-def _next_serial(conn) -> str:
-    """Atomically increments the counter → 5-digit serial e.g. LH-00001."""
-    row = conn.execute(
-        text("SELECT last_no FROM letterhead_serial_counter WHERE id=1 FOR UPDATE")
-    ).fetchone()
-    new_no = (row.last_no if row else 0) + 1
-    conn.execute(
-        text("UPDATE letterhead_serial_counter SET last_no = :n WHERE id=1"),
-        {"n": new_no}
-    )
-    return f"LH-{new_no:05d}"
-
-
-# ── GET ALL LETTERHEADS ──────────────────────────────────────
-@app.get("/letterheads")
-def get_letterheads():
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT * FROM letterheads ORDER BY created_at DESC")
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-# ── NEXT SERIAL PREVIEW (no increment) ──────────────────────
-@app.get("/letterheads/next-serial")
-def get_next_serial():
-    with engine.connect() as conn:
-        row = conn.execute(
-            text("SELECT last_no FROM letterhead_serial_counter WHERE id=1")
-        ).fetchone()
-    next_no = (row.last_no if row else 0) + 1
-    return {"next_serial": f"LH-{next_no:05d}"}
-
-
-# ── GENERATE & ISSUE (auto serial) ──────────────────────────
-@app.post("/letterheads/generate")
-def generate_letterhead(
-    department:        str,
-    purpose:           str,
-    recipient:         str,
-    issued_by:         str,
-    authorised_by:     str          = "",
-    body_content:      str          = "",
-    remarks:           str          = "",
-    issued_by_user_id: Optional[int] = None,
-):
-    from datetime import date
-    try:
-        with engine.begin() as conn:
-            serial_no = _next_serial(conn)
-            conn.execute(
-                text("""
-                    INSERT INTO letterheads
-                        (serial_no, date_issued, department, purpose,
-                         recipient, issued_by, authorised_by, body_content,
-                         remarks, issued_by_user_id)
-                    VALUES
-                        (:serial_no, CURRENT_DATE, :department, :purpose,
-                         :recipient, :issued_by, :authorised_by, :body_content,
-                         :remarks, :issued_by_user_id)
-                """),
-                {
-                    "serial_no": serial_no, "department": department,
-                    "purpose": purpose, "recipient": recipient,
-                    "issued_by": issued_by, "authorised_by": authorised_by,
-                    "body_content": body_content, "remarks": remarks,
-                    "issued_by_user_id": issued_by_user_id,
-                }
-            )
-        return {"success": True, "serial_no": serial_no, "date_issued": str(date.today())}
-    except Exception as e:
-        return {"success": False, "message": str(e)}
-
-
-# ── LOG EXISTING PRINTED LETTERHEAD (auto serial) ───────────
-@app.post("/letterheads/log")
-def log_letterhead(
-    date_issued:       str,
-    department:        str,
-    purpose:           str,
-    recipient:         str,
-    issued_by:         str,
-    authorised_by:     str          = "",
-    remarks:           str          = "",
-    issued_by_user_id: Optional[int] = None,
-):
-    """
-    Records a pre-printed letterhead used outside the system.
-    Serial is auto-assigned from the shared counter so the
-    sequence stays continuous across generated and logged entries.
-    """
-    try:
-        with engine.begin() as conn:
-            serial_no = _next_serial(conn)
-            conn.execute(
-                text("""
-                    INSERT INTO letterheads
-                        (serial_no, date_issued, department, purpose,
-                         recipient, issued_by, authorised_by, remarks,
-                         issued_by_user_id)
-                    VALUES
-                        (:serial_no, :date_issued, :department, :purpose,
-                         :recipient, :issued_by, :authorised_by, :remarks,
-                         :issued_by_user_id)
-                """),
-                {
-                    "serial_no": serial_no, "date_issued": date_issued,
-                    "department": department, "purpose": purpose,
-                    "recipient": recipient, "issued_by": issued_by,
-                    "authorised_by": authorised_by, "remarks": remarks,
-                    "issued_by_user_id": issued_by_user_id,
-                }
-            )
-        return {"success": True, "serial_no": serial_no}
-    except Exception as e:
-        return {"success": False, "message": str(e)}
-
-
-# ── RESET: wipe all records + reset counter to 0 ────────────
-@app.post("/letterheads/reset")
-def reset_letterheads():
-    """Admin-only. Clears all letterhead records and resets counter to 0."""
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM letterheads"))
-            conn.execute(text("UPDATE letterhead_serial_counter SET last_no = 0 WHERE id = 1"))
-        return {"success": True, "message": "All records cleared. Next serial: LH-00001"}
-    except Exception as e:
-        return {"success": False, "message": str(e)}
-
-
-# ── VOID A LETTERHEAD ────────────────────────────────────────
-@app.post("/letterheads/{letterhead_id}/void")
-def void_letterhead(letterhead_id: int, data: VoidRequest):
-    with engine.begin() as conn:
-        result = conn.execute(
-            text("""
-                UPDATE letterheads
-                SET status = 'Voided', void_reason = :reason
-                WHERE id = :id RETURNING id
-            """),
-            {"reason": data.void_reason, "id": letterhead_id}
-        )
-        updated = result.fetchone()
-    if not updated:
-        return {"success": False, "message": "Letterhead not found."}
-    return {"success": True}
-
-
-# ── GET SINGLE LETTERHEAD ────────────────────────────────────
-@app.get("/letterheads/{letterhead_id}")
-def get_letterhead(letterhead_id: int):
-    with engine.connect() as conn:
-        row = conn.execute(
-            text("SELECT * FROM letterheads WHERE id = :id"),
-            {"id": letterhead_id}
-        ).mappings().fetchone()
-    if not row:
-        return {"success": False, "message": "Not found."}
-    return dict(row)
-
-
-# ── STATS SUMMARY ────────────────────────────────────────────
-@app.get("/letterheads/stats/summary")
-def letterhead_stats():
-    with engine.connect() as conn:
-        total      = conn.execute(text("SELECT COUNT(*) FROM letterheads")).scalar()
-        voided     = conn.execute(text("SELECT COUNT(*) FROM letterheads WHERE status='Voided'")).scalar()
-        this_month = conn.execute(text("""
-            SELECT COUNT(*) FROM letterheads
-            WHERE DATE_TRUNC('month', date_issued) = DATE_TRUNC('month', CURRENT_DATE)
-        """)).scalar()
-        by_dept = conn.execute(text("""
-            SELECT department, COUNT(*) AS count FROM letterheads
-            WHERE status != 'Voided' GROUP BY department
-        """)).mappings().all()
-        counter_row = conn.execute(
-            text("SELECT last_no FROM letterhead_serial_counter WHERE id=1")
-        ).fetchone()
-    next_no = (counter_row.last_no if counter_row else 0) + 1
-    return {
-        "total": total, "voided": voided, "this_month": this_month,
-        "by_department": [dict(r) for r in by_dept],
-        "next_serial": f"LH-{next_no:05d}",
-    }
-
-# ================================================================
-# ATTENDANCE & PAYROLL MODULE
-# Paste this entire block at the bottom of your existing main.py
-# (before the last closing lines, after the letterhead endpoints)
-# ================================================================
-
-from datetime import date, timedelta
-from decimal import Decimal
-
-
-# ── PYDANTIC MODELS ─────────────────────────────────────────────
-
-class AttendanceRecord(BaseModel):
-    emp_id: str
-    emp_name: str
-    department: str = ""
-    att_date: str                          # YYYY-MM-DD
-    check_in: Optional[str] = None        # HH:MM
-    check_out: Optional[str] = None       # HH:MM
-    working_hours: Optional[str] = "—"
-    status: str = "Present"
-    late_minutes: int = 0
-    early_leaving: int = 0
-    overtime: float = 0.0
-    remarks: str = ""
-    source: str = "manual"
-    created_by: Optional[int] = None
-
-
-class AttendancePatch(BaseModel):
-    check_in: Optional[str] = None
-    check_out: Optional[str] = None
-    working_hours: Optional[str] = None
-    status: Optional[str] = None
-    late_minutes: Optional[int] = None
-    early_leaving: Optional[int] = None
-    overtime: Optional[float] = None
-    remarks: Optional[str] = None
-
-
-class CorrectionRequest(BaseModel):
-    emp_id: str
-    emp_name: str
-    department: str = ""
-    att_date: str
-    issue_type: str
-    req_check_in: Optional[str] = None
-    req_check_out: Optional[str] = None
-    reason: str
-    attachment_url: Optional[str] = None
-
-
-class CorrectionReview(BaseModel):
-    final_check_in: Optional[str] = None
-    final_check_out: Optional[str] = None
-    admin_notes: str = ""
-    reviewed_by: str
-
-
-class SalaryStructure(BaseModel):
-    emp_id: str
-    emp_name: str
-    basic_salary: float = 0
-    hra: float = 0
-    special_allowance: float = 0
-    travel_allowance: float = 0
-    medical_allowance: float = 0
-    bonus: float = 0
-    incentives: float = 0
-    pf_pct: float = 12
-    esic_pct: float = 0.75
-    professional_tax: float = 200
-    income_tax: float = 0
-    other_deductions: float = 0
-    effective_from: Optional[str] = None
-    created_by: Optional[int] = None
-
-
-class PayrollUnlockRequest(BaseModel):
-    unlocked_by: str
-
-
-class HolidayCreate(BaseModel):
-    holiday_date: str
-    name: str
-    holiday_type: str = "Public"
-
-
-class AttendanceSettingsUpdate(BaseModel):
-    correction_window_hours: Optional[int] = None
-    standard_work_hours: Optional[float] = None
-    late_grace_minutes: Optional[int] = None
-    overtime_after_hours: Optional[float] = None
-    office_start_time: Optional[str] = None
-
-
-# ── HELPERS ─────────────────────────────────────────────────────
-
-def _calc_hours(check_in: Optional[str], check_out: Optional[str]) -> str:
-    """Return friendly string e.g. '8h 30m' or '—'."""
-    if not check_in or not check_out:
-        return "—"
-    try:
-        fmt = "%H:%M"
-        from datetime import datetime as _dt
-        ci = _dt.strptime(check_in, fmt)
-        co = _dt.strptime(check_out, fmt)
-        mins = int((co - ci).total_seconds() / 60)
-        if mins <= 0:
-            return "—"
-        h, m = divmod(mins, 60)
-        return f"{h}h {m}m" if m else f"{h}h"
-    except Exception:
-        return "—"
-
-
-def _working_days_in_month(year: int, month: int) -> int:
-    """Count Mon-Fri days in the given month (no holiday awareness)."""
-    import calendar
-    total = 0
-    for d in range(1, calendar.monthrange(year, month)[1] + 1):
-        if date(year, month, d).weekday() < 5:
-            total += 1
-    return total
-
-
-def _get_settings(conn) -> dict:
-    row = conn.execute(text("SELECT * FROM attendance_settings WHERE id=1")).mappings().fetchone()
-    if row:
-        return dict(row)
-    return {
-        "correction_window_hours": 24,
-        "standard_work_hours": 9.0,
-        "late_grace_minutes": 10,
-        "overtime_after_hours": 9.0,
-        "office_start_time": "09:00",
-    }
-
-
-# ================================================================
-# ATTENDANCE SETTINGS
-# ================================================================
-
-@app.get("/attendance/settings")
-def get_attendance_settings():
-    """Return configurable attendance settings."""
-    with engine.connect() as conn:
-        row = conn.execute(
-            text("SELECT * FROM attendance_settings WHERE id=1")
-        ).mappings().fetchone()
-    return dict(row) if row else {}
-
-
-@app.patch("/attendance/settings")
-def update_attendance_settings(data: AttendanceSettingsUpdate):
-    """Update one or more attendance settings fields."""
-    updates = {k: v for k, v in data.dict().items() if v is not None}
-    if not updates:
-        return {"success": False, "message": "Nothing to update."}
-
-    set_clause = ", ".join(f"{k} = :{k}" for k in updates)
-    updates["updated_at_val"] = datetime.now()
-
-    with engine.begin() as conn:
-        conn.execute(
-            text(f"UPDATE attendance_settings SET {set_clause}, updated_at = :updated_at_val WHERE id=1"),
-            updates
-        )
-    return {"success": True}
-
-
-# ================================================================
-# ATTENDANCE RECORDS
-# ================================================================
-
-@app.get("/attendance")
-def get_attendance(
-    emp_id: Optional[str]    = None,
-    att_date: Optional[str]  = None,
-    month: Optional[str]     = None,   # YYYY-MM
-    department: Optional[str]= None,
-    status: Optional[str]    = None,
-    from_date: Optional[str] = None,
-    to_date: Optional[str]   = None,
-):
-    """
-    Fetch attendance records with optional filters.
-    - emp_id      → single employee
-    - att_date    → exact date  (YYYY-MM-DD)
-    - month       → all records for that month  (YYYY-MM)
-    - department  → filter by dept
-    - status      → Present | Absent | …
-    - from_date / to_date → date range
-    """
-    filters = []
-    params: dict = {}
-
-    if emp_id:
-        filters.append("emp_id = :emp_id")
-        params["emp_id"] = emp_id
-    if att_date:
-        filters.append("att_date = :att_date")
-        params["att_date"] = att_date
-    if month:
-        filters.append("TO_CHAR(att_date,'YYYY-MM') = :month")
-        params["month"] = month
-    if department:
-        filters.append("department = :department")
-        params["department"] = department
-    if status:
-        filters.append("status = :status")
-        params["status"] = status
-    if from_date:
-        filters.append("att_date >= :from_date")
-        params["from_date"] = from_date
-    if to_date:
-        filters.append("att_date <= :to_date")
-        params["to_date"] = to_date
-
-    where = ("WHERE " + " AND ".join(filters)) if filters else ""
-    sql = f"SELECT * FROM attendance {where} ORDER BY att_date DESC, emp_id"
-
-    with engine.connect() as conn:
-        rows = conn.execute(text(sql), params).mappings().all()
-
-    return [dict(r) for r in rows]
-
-
-@app.post("/attendance")
-def create_attendance(data: AttendanceRecord):
-    """
-    Create a single attendance record.
-    Raises HTTP 409 if a record already exists for emp_id + att_date.
-    """
-    hours = data.working_hours if data.working_hours and data.working_hours != "—" else _calc_hours(data.check_in, data.check_out)
-
-    try:
-        with engine.begin() as conn:
-            result = conn.execute(
-                text("""
-                    INSERT INTO attendance
-                        (emp_id, emp_name, department, att_date,
-                         check_in, check_out, working_hours, status,
-                         late_minutes, early_leaving, overtime, remarks,
-                         source, created_by, updated_at, created_at)
-                    VALUES
-                        (:emp_id, :emp_name, :department, :att_date,
-                         :check_in, :check_out, :working_hours, :status,
-                         :late_minutes, :early_leaving, :overtime, :remarks,
-                         :source, :created_by, NOW(), NOW())
-                    RETURNING id
-                """),
-                {
-                    "emp_id":       data.emp_id,
-                    "emp_name":     data.emp_name,
-                    "department":   data.department,
-                    "att_date":     data.att_date,
-                    "check_in":     data.check_in,
-                    "check_out":    data.check_out,
-                    "working_hours":hours,
-                    "status":       data.status,
-                    "late_minutes": data.late_minutes,
-                    "early_leaving":data.early_leaving,
-                    "overtime":     data.overtime,
-                    "remarks":      data.remarks,
-                    "source":       data.source,
-                    "created_by":   data.created_by,
-                }
-            )
-            new_id = result.fetchone()[0]
-        return {"success": True, "id": new_id}
-    except Exception as e:
-        if "unique" in str(e).lower():
-            return {"success": False, "message": "Attendance record already exists for this employee on this date."}
-        return {"success": False, "message": str(e)}
-
-
-@app.put("/attendance/{attendance_id}")
-def update_attendance(attendance_id: int, data: AttendancePatch):
-    """Full or partial update of an attendance record."""
-    updates = {k: v for k, v in data.dict().items() if v is not None}
-    if not updates:
-        return {"success": False, "message": "Nothing to update."}
-
-    # Recalculate hours if times changed
-    if "check_in" in updates or "check_out" in updates:
-        with engine.connect() as conn:
-            existing = conn.execute(
-                text("SELECT check_in, check_out FROM attendance WHERE id=:id"),
-                {"id": attendance_id}
-            ).fetchone()
-        ci = updates.get("check_in", str(existing.check_in) if existing and existing.check_in else None)
-        co = updates.get("check_out", str(existing.check_out) if existing and existing.check_out else None)
-        updates["working_hours"] = _calc_hours(ci, co)
-
-    updates["updated_at"] = datetime.now()
-    set_clause = ", ".join(f"{k} = :{k}" for k in updates)
-
-    with engine.begin() as conn:
-        result = conn.execute(
-            text(f"UPDATE attendance SET {set_clause} WHERE id=:att_id RETURNING id"),
-            {**updates, "att_id": attendance_id}
-        )
-        row = result.fetchone()
-
-    if not row:
-        return {"success": False, "message": "Record not found."}
-    return {"success": True}
-
-
-@app.delete("/attendance/{attendance_id}")
-def delete_attendance(attendance_id: int):
-    """Delete an attendance record (admin only — enforce role on frontend)."""
-    with engine.begin() as conn:
-        result = conn.execute(
-            text("DELETE FROM attendance WHERE id=:id RETURNING id"),
-            {"id": attendance_id}
-        )
-        row = result.fetchone()
-    if not row:
-        return {"success": False, "message": "Record not found."}
-    return {"success": True}
-
-
-# ================================================================
-# SELF-SERVICE PUNCH IN / PUNCH OUT
-# ================================================================
-
-@app.post("/attendance/checkin")
-def checkin(emp_id: str):
-    """
-    Employee punches in for today.
-    Creates attendance row with check_in = current IST time.
-    Calculates late_minutes vs office_start_time from attendance_settings.
-    """
-    from datetime import datetime as _dt
-    now_ist = _dt.now(ZoneInfo("Asia/Kolkata"))
-    today   = now_ist.date().isoformat()
-    ci_str  = now_ist.strftime("%H:%M")
-
-    with engine.connect() as conn:
-        user = conn.execute(
-            text("SELECT full_name FROM users WHERE id = :id OR CAST(id AS TEXT) = :ids"),
-            {"id": int(emp_id) if emp_id.isdigit() else -1, "ids": emp_id}
-        ).fetchone()
-        existing = conn.execute(
-            text("SELECT id, check_in FROM attendance WHERE emp_id=:eid AND att_date=:d"),
-            {"eid": emp_id, "d": today}
-        ).fetchone()
-        settings = _get_settings(conn)
-
-    office_start = settings.get("office_start_time", "09:00")
-    grace        = int(settings.get("late_grace_minutes", 10))
-    os_h, os_m   = map(int, office_start.split(":"))
-    ci_h, ci_m   = map(int, ci_str.split(":"))
-    late_mins    = max(0, (ci_h * 60 + ci_m) - (os_h * 60 + os_m) - grace)
-    emp_name     = user.full_name if user else emp_id
-
-    if existing and existing.check_in:
-        # Already checked in — return the existing record id so frontend can handle re-punch via PUT
-        ci_disp = str(existing.check_in)[:5]
-        return {"success": False, "already_checked_in": True, "record_id": existing.id, "check_in": ci_disp, "message": f"Already checked in at {ci_disp}"}
-
-    if existing:
-        with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE attendance SET check_in=:ci, status='Present', late_minutes=:late, updated_at=NOW() WHERE emp_id=:eid AND att_date=:d"),
-                {"ci": ci_str, "late": late_mins, "eid": emp_id, "d": today}
-            )
-    else:
-        with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO attendance (emp_id, emp_name, att_date, check_in, status, late_minutes, source, created_at, updated_at)
-                    VALUES (:eid, :ename, :d, :ci, 'Present', :late, 'self', NOW(), NOW())
-                """),
-                {"eid": emp_id, "ename": emp_name, "d": today, "ci": ci_str, "late": late_mins}
-            )
-
-    return {
-        "success": True,
-        "check_in": ci_str,
-        "late_minutes": late_mins,
-        "message": f"Checked in at {ci_str}" + (f" ({late_mins} min late)" if late_mins > 0 else "")
-    }
-
-
-@app.post("/attendance/checkout")
-def checkout(emp_id: str):
-    """
-    Employee punches out for today.
-    Updates check_out, recalculates working_hours and overtime.
-    """
-    from datetime import datetime as _dt
-    now_ist = _dt.now(ZoneInfo("Asia/Kolkata"))
-    today   = now_ist.date().isoformat()
-    co_str  = now_ist.strftime("%H:%M")
-
-    with engine.connect() as conn:
-        rec = conn.execute(
-            text("SELECT id, check_in, check_out FROM attendance WHERE emp_id=:eid AND att_date=:d"),
-            {"eid": emp_id, "d": today}
-        ).fetchone()
-        settings = _get_settings(conn)
-
-    if not rec:
-        return {"success": False, "message": "No check-in found for today. Please check in first."}
-    if rec.check_out:
-        return {"success": False, "message": f"Already checked out at {str(rec.check_out)[:5]}"}
-
-    ci_str    = str(rec.check_in)[:5] if rec.check_in else None
-    hours_str = _calc_hours(ci_str, co_str)
-    std_hours = float(settings.get("standard_work_hours", 9.0))
-    ot_hours  = 0.0
-    if ci_str:
-        ci_h, ci_m = map(int, ci_str.split(":"))
-        co_h, co_m = map(int, co_str.split(":"))
-        worked_mins = (co_h * 60 + co_m) - (ci_h * 60 + ci_m)
-        ot_hours = round(max(0, worked_mins - std_hours * 60) / 60, 2)
-
-    with engine.begin() as conn:
-        conn.execute(
-            text("UPDATE attendance SET check_out=:co, working_hours=:h, overtime=:ot, updated_at=NOW() WHERE emp_id=:eid AND att_date=:d"),
-            {"co": co_str, "h": hours_str, "ot": ot_hours, "eid": emp_id, "d": today}
-        )
-
-    return {
-        "success": True,
-        "check_out": co_str,
-        "working_hours": hours_str,
-        "overtime": ot_hours,
-        "message": f"Checked out at {co_str}. Total: {hours_str}"
-    }
-
-
-@app.get("/attendance/summary/today")
-def attendance_summary_today():
-    """Quick stat cards for admin dashboard — today's counts."""
-    today_str = date.today().isoformat()
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT status, COUNT(*) AS cnt FROM attendance WHERE att_date=:d GROUP BY status"),
-            {"d": today_str}
-        ).mappings().all()
-        total = conn.execute(text("SELECT COUNT(*) FROM attendance")).scalar()
-        late  = conn.execute(
-            text("SELECT COUNT(*) FROM attendance WHERE att_date=:d AND late_minutes > 0"),
-            {"d": today_str}
-        ).scalar()
-    status_map = {r["status"]: r["cnt"] for r in rows}
-    return {
-        "present": status_map.get("Present", 0) + status_map.get("Work From Home", 0),
-        "absent":  status_map.get("Absent", 0),
-        "leave":   status_map.get("Leave", 0),
-        "late":    late,
-        "total_records": total,
-    }
-
-
-@app.get("/attendance/employee/{emp_id}/monthly-summary")
-def employee_monthly_summary(emp_id: str, month: str):
-    """
-    Returns summary counts for an employee for a given month (YYYY-MM).
-    Used by the employee My Attendance dashboard cards.
-    """
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT status, COUNT(*) AS cnt,
-                       SUM(late_minutes) AS total_late,
-                       SUM(overtime)     AS total_ot
-                FROM attendance
-                WHERE emp_id = :emp_id
-                  AND TO_CHAR(att_date,'YYYY-MM') = :month
-                GROUP BY status
-            """),
-            {"emp_id": emp_id, "month": month}
-        ).mappings().all()
-
-    status_map = {r["status"]: r for r in rows}
-    present = (status_map.get("Present", {}).get("cnt") or 0) + \
-              (status_map.get("Work From Home", {}).get("cnt") or 0) + \
-              (status_map.get("Manual Entry", {}).get("cnt") or 0)
-    return {
-        "present":    present,
-        "absent":     status_map.get("Absent",   {}).get("cnt") or 0,
-        "leave":      status_map.get("Leave",    {}).get("cnt") or 0,
-        "half_day":   status_map.get("Half Day", {}).get("cnt") or 0,
-        "late_days":  sum(1 for r in rows if (r.get("total_late") or 0) > 0),
-        "overtime_hours": float(sum((r.get("total_ot") or 0) for r in rows)),
-    }
-
-
-# ================================================================
-# ATTENDANCE CORRECTION REQUESTS
-# ================================================================
-
-@app.get("/attendance/corrections")
-def get_corrections(
-    emp_id: Optional[str]     = None,
-    status: Optional[str]     = None,
-    department: Optional[str] = None,
-    att_date: Optional[str]   = None,
-):
-    """List correction requests. HR/Admin see all; filter by emp_id for self-service."""
-    filters, params = [], {}
-    if emp_id:
-        filters.append("emp_id = :emp_id"); params["emp_id"] = emp_id
-    if status:
-        filters.append("status = :status"); params["status"] = status
-    if department:
-        filters.append("department = :department"); params["department"] = department
-    if att_date:
-        filters.append("att_date = :att_date"); params["att_date"] = att_date
-
-    where = ("WHERE " + " AND ".join(filters)) if filters else ""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(f"SELECT * FROM attendance_corrections {where} ORDER BY submitted_at DESC"),
-            params
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-@app.get("/attendance/corrections/{correction_id}")
-def get_correction_detail(correction_id: int):
-    """Full detail including timeline for a single correction request."""
-    with engine.connect() as conn:
-        corr = conn.execute(
-            text("SELECT * FROM attendance_corrections WHERE id=:id"),
-            {"id": correction_id}
-        ).mappings().fetchone()
-        if not corr:
-            return {"success": False, "message": "Not found."}
-
-        timeline = conn.execute(
-            text("SELECT * FROM correction_timeline WHERE correction_id=:id ORDER BY created_at"),
-            {"id": correction_id}
-        ).mappings().all()
-
-        # Original attendance record
-        att = conn.execute(
-            text("SELECT * FROM attendance WHERE emp_id=:eid AND att_date=:d"),
-            {"eid": corr["emp_id"], "d": corr["att_date"]}
-        ).mappings().fetchone()
-
-    return {
-        **dict(corr),
-        "timeline": [dict(t) for t in timeline],
-        "original_attendance": dict(att) if att else None,
-    }
-
-
-@app.post("/attendance/corrections")
-def submit_correction(data: CorrectionRequest):
-    """
-    Employee submits a correction request.
-    Enforces the configurable time window (default 24 hours).
-    """
-    with engine.connect() as conn:
-        settings = _get_settings(conn)
-        # Check for duplicate pending request
-        existing = conn.execute(
-            text("""
-                SELECT id FROM attendance_corrections
-                WHERE emp_id=:eid AND att_date=:d AND status='Pending'
-            """),
-            {"eid": data.emp_id, "d": data.att_date}
-        ).fetchone()
-
-    if existing:
-        return {"success": False, "message": "A pending correction request already exists for this date."}
-
-    # Enforce time window
-    att_date_obj = date.fromisoformat(data.att_date)
-    diff_hours = (datetime.now().date() - att_date_obj).days * 24
-    window = settings.get("correction_window_hours", 24)
-    if diff_hours > window:
-        return {
-            "success": False,
-            "message": f"Attendance correction requests can only be submitted within {window} hours. Please contact HR."
+        .header h1 {
+            color: #111827;
         }
 
-    with engine.begin() as conn:
-        # Get linked attendance id
-        att_row = conn.execute(
-            text("SELECT id FROM attendance WHERE emp_id=:eid AND att_date=:d"),
-            {"eid": data.emp_id, "d": data.att_date}
-        ).fetchone()
+        .profile {
+            background: white;
+            padding: 10px 20px;
+            border-radius: 10px;
+            font-weight: bold;
+        }
 
-        result = conn.execute(
-            text("""
-                INSERT INTO attendance_corrections
-                    (emp_id, emp_name, department, att_date, issue_type,
-                     req_check_in, req_check_out, reason, attachment_url,
-                     status, submitted_at, attendance_id)
-                VALUES
-                    (:emp_id, :emp_name, :department, :att_date, :issue_type,
-                     :req_check_in, :req_check_out, :reason, :attachment_url,
-                     'Pending', NOW(), :attendance_id)
-                RETURNING id
-            """),
-            {
-                "emp_id":         data.emp_id,
-                "emp_name":       data.emp_name,
-                "department":     data.department,
-                "att_date":       data.att_date,
-                "issue_type":     data.issue_type,
-                "req_check_in":   data.req_check_in,
-                "req_check_out":  data.req_check_out,
-                "reason":         data.reason,
-                "attachment_url": data.attachment_url,
-                "attendance_id":  att_row[0] if att_row else None,
+        /* CARDS */
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px;
+            margin-bottom: 25px;
+        }
+
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 2px 10px rgba(0,0,0,.08);
+        }
+
+        .card h2 {
+            color: #2563eb;
+            margin-bottom: 10px;
+        }
+
+        /* SECTION */
+        .section {
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            margin-bottom: 25px;
+            box-shadow: 0 2px 10px rgba(0,0,0,.08);
+        }
+
+        .section h2 {
+            margin-bottom: 15px;
+        }
+
+        /* BUTTONS */
+        .assign-btn {
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 14px 25px;
+            border-radius: 10px;
+            cursor: pointer;
+        }
+
+        .assign-btn:hover {
+            background: #1d4ed8;
+        }
+
+        .edit-btn {
+            background: #f59e0b;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+
+        .edit-btn:hover {
+            background: #d97706;
+        }
+
+        .delete-btn {
+            background: #dc2626;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+
+        .delete-btn:hover {
+            background: #b91c1c;
+        }
+
+        .review-btn {
+            background: #f59e0b;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+
+        .review-btn:hover {
+            background: #d97706;
+        }
+
+        .approve-btn {
+            background: #16a34a;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+
+        .approve-btn:hover {
+            background: #15803d;
+        }
+
+        .logout-btn {
+            background: #dc2626;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+
+        .logout-btn:hover {
+            background: #b91c1c;
+        }
+
+        /* TABLE */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            padding: 12px;
+            border-bottom: 1px solid #eee;
+            text-align: left;
+        }
+
+        th {
+            background: #f3f4f6;
+        }
+
+        /* MODAL */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-overlay.active {
+            display: flex;
+        }
+
+        .modal {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            width: 480px;
+            max-width: 95%;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+
+        .modal h2 {
+            margin-bottom: 20px;
+            color: #111827;
+        }
+
+        .modal label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+            color: #374151;
+            font-size: 14px;
+        }
+
+        .modal input, .modal select {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+
+        .modal input:focus, .modal select:focus {
+            outline: none;
+            border-color: #2563eb;
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 5px;
+        }
+
+        .btn-cancel {
+            background: #e5e7eb;
+            color: #374151;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .btn-save {
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .btn-save:hover { background: #1d4ed8; }
+
+        /* FILTER BUTTONS */
+        .filter-bar {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 16px;
+        }
+
+        .filter-btn {
+            border: 1.5px solid #e5e7eb;
+            background: white;
+            color: #6b7280;
+            padding: 6px 16px;
+            border-radius: 99px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+
+        .filter-btn:hover { border-color: #2563eb; color: #2563eb; }
+
+        .filter-btn.active {
+            background: #2563eb;
+            border-color: #2563eb;
+            color: white;
+        }
+
+        /* STATUS BADGES */
+        .badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 99px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .badge-assigned    { background: #dbeafe; color: #1d4ed8; }
+        .badge-inprogress  { background: #fef9c3; color: #a16207; }
+        .badge-review      { background: #ffedd5; color: #c2410c; }
+        .badge-completed   { background: #dcfce7; color: #15803d; }
+
+        /* TOAST */
+        .toast {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: #111827;
+            color: white;
+            padding: 14px 22px;
+            border-radius: 10px;
+            font-size: 14px;
+            opacity: 0;
+            transform: translateY(10px);
+            transition: all 0.3s;
+            z-index: 9999;
+        }
+
+        .toast.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        /* RESPONSIVE */
+        @media (max-width: 900px) {
+            .sidebar { width: 200px; }
+            .main { margin-left: 200px; }
+        }
+
+    .review-btn{
+
+    background:#16a34a;
+    color:white;
+    border:none;
+    padding:8px 14px;
+    border-radius:8px;
+    cursor:pointer;
+
+}
+
+.review-btn:hover{
+
+    background:#15803d;
+
+}
+
+        /* REMINDER WIDGET + BELL */
+        .reminder-widget {
+            background: white; padding: 20px 22px; border-radius: 15px;
+            margin-bottom: 25px; box-shadow: 0 2px 10px rgba(0,0,0,.08);
+        }
+        .reminder-widget-header {
+            display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;
+        }
+        .reminder-widget-header h2 { font-size: 17px; color: #111827; }
+        .reminder-widget-header a { font-size: 13px; color: #2563eb; text-decoration: none; font-weight: 600; }
+        .reminder-list { display: flex; flex-direction: column; gap: 10px; }
+        .reminder-item {
+            display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+            border-radius: 10px; background: #f9fafb; border-left: 4px solid #d1d5db;
+        }
+        .reminder-item.crit  { border-left-color: #dc2626; background: #fef2f2; }
+        .reminder-item.high  { border-left-color: #f97316; background: #fff7ed; }
+        .reminder-item.med   { border-left-color: #f59e0b; background: #fffbeb; }
+        .reminder-item.low   { border-left-color: #6b7280; }
+        .reminder-dot { font-size: 16px; line-height:1; flex-shrink:0; }
+        .reminder-item-body { flex: 1; min-width:0; }
+        .reminder-item-title { font-weight: 600; color: #111827; font-size: 14px; }
+        .reminder-item-sub { font-size: 12px; color: #6b7280; }
+        .reminder-item-amt { font-size: 13px; font-weight: 700; color: #111827; white-space:nowrap; }
+
+        .bell-wrap { position: relative; }
+        .bell-btn {
+            width: 42px; height: 42px; border-radius: 50%; background: white;
+            border: 1px solid #e5e7eb; cursor: pointer; font-size: 18px;
+            display: flex; align-items: center; justify-content: center; position: relative;
+        }
+        .bell-btn:hover { background: #f3f4f6; }
+        .bell-count {
+            position: absolute; top: -4px; right: -4px; background: #dc2626; color: white;
+            font-size: 10px; font-weight: 700; border-radius: 99px; min-width: 17px; height: 17px;
+            display: flex; align-items: center; justify-content: center; padding: 0 4px;
+        }
+        .bell-dropdown {
+            display: none; position: absolute; top: 50px; right: 0; width: 340px;
+            max-height: 420px; overflow-y: auto; background: white; border-radius: 12px;
+            box-shadow: 0 10px 35px rgba(0,0,0,0.18); z-index: 2000; padding: 10px;
+        }
+        .bell-dropdown.active { display: block; }
+        .bell-dropdown-header { font-weight: 700; font-size: 13px; color: #111827; padding: 6px 8px 10px; border-bottom: 1px solid #f3f4f6; margin-bottom: 6px; }
+        .bell-item { padding: 9px 8px; border-radius: 8px; font-size: 13px; }
+        .bell-item:hover { background: #f9fafb; }
+        .bell-item-title { font-weight: 600; color: #111827; }
+        .bell-item-sub { font-size: 12px; color: #6b7280; margin-top:2px; }
+        .bell-empty { text-align:center; padding: 30px 10px; color: #9ca3af; font-size: 13px; }
+
+    </style>
+</head>
+
+<body>
+
+<!-- SIDEBAR -->
+<div class="sidebar">
+    <div class="logo">Panache WMS</div>
+    <div class="menu">
+        <a href="manager-dashboard.html">Dashboard</a><active>
+                
+        </active>
+        <a href="sales-dashboard.html">Sales Dashboard</a>
+        <a href="team-members.html">Team Members</a>
+        <a href="reports.html">Reports</a>
+        <a href="settings.html">Settings</a>
+        <a href="calendar.html">Calendar</a>
+        <a href="employee-hub.html">Employee Hub</a>
+        <a href="letterhead.html">Letter head manager</a>
+        <a href="attendance.html">Attendance manager</a>
+        <a href="reminder.html">Reminders</a>
+    </div>
+<!-- ── PERSONAL TO-DO ─────────────────────────────── -->
+<div style="margin-top:auto;padding-top:20px;border-top:0.5px solid rgba(255,255,255,0.12);">
+    <p style="font-size:11px;font-weight:500;color:rgba(255,255,255,0.4);letter-spacing:0.6px;text-transform:uppercase;margin-bottom:10px;">My notes</p>
+
+    <div id="sidebarTodos" style="display:flex;flex-direction:column;gap:6px;max-height:200px;overflow-y:auto;"></div>
+
+    <div style="display:flex;gap:6px;margin-top:10px;">
+        <input id="sidebarTodoInput"
+               placeholder="Add a task..."
+               style="flex:1;background:rgba(255,255,255,0.08);border:0.5px solid rgba(255,255,255,0.15);border-radius:6px;padding:6px 8px;font-size:12px;color:#fff;outline:none;"
+               onkeydown="if(event.key==='Enter')addSidebarTodo()" />
+        <button onclick="addSidebarTodo()"
+                style="width:28px;height:28px;border-radius:6px;background:#2563eb;border:none;color:#fff;font-size:20px;cursor:pointer;line-height:1;flex-shrink:0;">+</button>
+    </div>
+</div>
+</div>
+<script>
+(function() {
+    const KEY = "panache_todos";
+
+    function load() {
+        try { return JSON.parse(localStorage.getItem(KEY)) || []; }
+        catch { return []; }
+    }
+
+    function save(todos) {
+        localStorage.setItem(KEY, JSON.stringify(todos));
+    }
+
+    function render() {
+        const todos = load();
+        const box   = document.getElementById("sidebarTodos");
+        box.innerHTML = "";
+
+        todos.forEach((text, i) => {
+            const row = document.createElement("div");
+            row.style.cssText = "display:flex;align-items:center;gap:8px;font-size:12px;color:rgba(255,255,255,0.8);line-height:1.4;";
+            row.innerHTML = `
+                <div onclick="completeSidebarTodo(${i})"
+                     title="Mark complete — will be removed"
+                     style="width:16px;height:16px;border-radius:50%;border:1.5px solid rgba(255,255,255,0.3);flex-shrink:0;cursor:pointer;display:flex;align-items:center;justify-content:center;"></div>
+                <span>${text}</span>`;
+            box.appendChild(row);
+        });
+    }
+
+    window.addSidebarTodo = function() {
+        const inp  = document.getElementById("sidebarTodoInput");
+        const text = inp.value.trim();
+        if (!text) return;
+        const todos = load();
+        todos.push(text);
+        save(todos);
+        inp.value = "";
+        render();
+    };
+
+    window.completeSidebarTodo = function(i) {
+        const circle = document.getElementById("sidebarTodos")
+                               .children[i]
+                               .querySelector("div");
+        circle.style.background    = "#22c55e";
+        circle.style.borderColor   = "#22c55e";
+        circle.innerHTML           = `<svg width="10" height="10" viewBox="0 0 10 10"><polyline points="1.5,5 4,7.5 8.5,2.5" fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+        setTimeout(() => {
+            const todos = load();
+            todos.splice(i, 1);
+            save(todos);
+            render();
+        }, 500);
+    };
+
+    render();
+})();
+</script>
+<!-- MAIN -->
+<div class="main">
+
+    <!-- HEADER -->
+    <div class="header">
+        <h1>Manager Dashboard</h1>
+        <div style="display:flex;align-items:center;gap:15px;">
+            <div class="profile">
+                <b id="profileName">Loading...</b><br>
+                <span id="profileEmail"></span><br>
+                <span id="profileId"></span>
+            </div>
+            <div class="bell-wrap" id="bellWrap">
+                <button class="bell-btn" onclick="toggleBellDropdown()">🔔<span class="bell-count" id="bellCount" style="display:none;"></span></button>
+                <div class="bell-dropdown" id="bellDropdown"></div>
+            </div>
+            <button class="logout-btn" onclick="logout()">Logout</button>
+        </div>
+    </div>
+
+    <!-- CARDS -->
+    <!-- REMINDER WIDGET -->
+    <div class="reminder-widget">
+        <div class="reminder-widget-header">
+            <h2>🔔 Upcoming Reminders</h2>
+            <a href="reminder.html">View All</a>
+        </div>
+        <div class="reminder-list" id="reminderWidgetList">
+            <div style="color:#9ca3af;font-size:14px;">Loading reminders...</div>
+        </div>
+    </div>
+
+    <div class="cards">
+        <div class="card">
+            <h2 id="teamCount">—</h2>
+            <p>Team Members</p>
+        </div>
+        <div class="card">
+            <h2 id="totalTasks">—</h2>
+            <p>Total Tasks</p>
+        </div>
+        <div class="card">
+            <h2 id="completedTasks">—</h2>
+            <p>Completed Tasks</p>
+        </div>
+        <div class="card">
+            <h2 id="teamProductivity">—</h2>
+            <p>Team Productivity</p>
+        </div>
+    </div>
+
+    <!-- TASK MANAGEMENT -->
+    <div class="section">
+        <h2>Task Management</h2>
+        <br>
+        <button class="assign-btn" onclick="window.location.href='create-task.html'">
+            Assign New Task
+        </button>
+    </div>
+
+    <!-- ASSIGNED TASKS -->
+    <div class="section">
+        <h2>Assigned Tasks</h2>
+        <br>
+        <div class="filter-bar">
+            <button class="filter-btn active" onclick="filterTasks('All')">All</button>
+            <button class="filter-btn" onclick="filterTasks('In Progress')">In Progress</button>
+            <button class="filter-btn" onclick="filterTasks('Pending Review')">Pending Review</button>
+            <button class="filter-btn" onclick="filterTasks('Completed')">Completed</button>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Task</th>
+                    <th>Employee Name</th>
+                    <th>Priority</th>
+                    <th>Status</th>
+                    <th>Due Date</th>
+                    <th>Edit</th>
+                    <th>Delete</th>
+                </tr>
+            </thead>
+            <tbody id="taskTable"></tbody>
+        </table>
+    </div>
+
+    <div class="section">
+    <div class="section-header">
+        <h2>Tasks Pending Review</h2>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Task</th>
+                <th>Employee</th>
+                <th>Priority</th>
+                <th>Status</th>
+                <th>Attachment</th>
+                <th>Review</th>
+            </tr>
+        </thead>
+
+        <tbody id="reviewTable">
+            <tr>
+                <td colspan="6" style="text-align:center;">
+                    Loading tasks...
+                </td>
+            </tr>
+        </tbody>
+    </table>
+</div>
+
+    <!-- TEAM MEMBERS -->
+    <!-- end .main -->
+
+<!-- EDIT TASK MODAL -->
+<div class="modal-overlay" id="editModal">
+    <div class="modal">
+        <h2>Edit Task</h2>
+        <input type="hidden" id="editTaskId">
+
+        <label>Title</label>
+        <input type="text" id="editTitle">
+
+        <label>Description</label>
+        <input type="text" id="editDescription">
+
+        <label>Assign To (Team Member)</label>
+        <select id="editAssignedTo">
+            <option value="">— Select team member —</option>
+        </select>
+
+        <label>Priority</label>
+        <select id="editPriority">
+            <option value="Low">Low</option>
+            <option value="Medium">Medium</option>
+            <option value="High">High</option>
+        </select>
+
+        <label>Due Date</label>
+        <input type="date" id="editDueDate">
+
+        <div class="modal-actions">
+            <button class="btn-cancel" onclick="closeEditModal()">Cancel</button>
+            <button class="btn-save" onclick="saveEditTask()">Save Changes</button>
+        </div>
+    </div>
+</div>
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<script>
+    const BASE = "https://backend-production-53f3.up.railway.app";
+const managerId =
+localStorage.getItem("userId");
+    // Profile
+    document.getElementById("profileName").innerHTML = localStorage.getItem("userName");
+    document.getElementById("profileEmail").innerHTML = localStorage.getItem("userEmail");
+    document.getElementById("profileId").innerHTML = "Manager ID: " + localStorage.getItem("userId");
+
+    function logout() {
+        localStorage.clear();
+        window.location.href = "index.html";
+    }
+
+    function showToast(msg) {
+        const t = document.getElementById("toast");
+        t.textContent = msg;
+        t.classList.add("show");
+        setTimeout(() => t.classList.remove("show"), 3000);
+    }
+
+    // ── STATS ────────────────────────────────────────────────
+    async function loadStats() {
+        try {
+            const response = await fetch(`${BASE}/manager-dashboard-stats?manager_id=${managerId}`);
+            const data = await response.json();
+
+            document.getElementById("teamCount").innerHTML       = data.team_members;
+            document.getElementById("totalTasks").innerHTML      = data.total_tasks;
+            document.getElementById("completedTasks").innerHTML  = data.completed_tasks;
+            document.getElementById("teamProductivity").innerHTML = data.productivity + "%";
+        } catch (e) {
+            console.error("loadStats error:", e);
+        }
+    }
+    loadStats();
+    // ── TEAM MEMBERS (manager's team only) ──────────────────
+    let teamMembers = [];
+
+    async function loadEmployees() {
+        try {
+            const res = await fetch(`${BASE}/team?manager_id=${managerId}`);
+            teamMembers = await res.json();
+            let html = "";
+            teamMembers.forEach(emp => {
+                html += `
+                    <tr>
+                        <td>${emp.id}</td>
+                        <td>${emp.full_name}</td>
+                        <td>${emp.email}</td>
+                        <td>${emp.task_count}</td>
+                    </tr>`;
+            });
+            document.getElementById("employeeTable").innerHTML = html || `<tr><td colspan="4" style="text-align:center;color:#9ca3af;padding:20px;">No team members found.</td></tr>`;
+        } catch (e) {
+            console.error("loadEmployees error:", e);
+        }
+    }
+
+    // ── ALL TASKS ────────────────────────────────────────────
+    let allTasks        = [];
+    let activeFilter    = "All";
+
+    function statusBadge(status) {
+        const map = {
+            "Assigned":       "badge-assigned",
+            "In Progress":    "badge-inprogress",
+            "Pending Review": "badge-review",
+            "Completed":      "badge-completed"
+        };
+        return `<span class="badge ${map[status] || "badge-assigned"}">${status}</span>`;
+    }
+
+    function formatDate(raw) {
+        if (!raw) return "—";
+        const d = new Date(raw);
+        if (isNaN(d)) return raw;
+        return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+    }
+
+    function renderTasks() {
+        const filtered = activeFilter === "All"
+            ? allTasks
+            : allTasks.filter(t => t.status === activeFilter);
+
+        if (!filtered.length) {
+            document.getElementById("taskTable").innerHTML =
+                `<tr><td colspan="8" style="text-align:center;color:#9ca3af;padding:20px;">No tasks found.</td></tr>`;
+            return;
+        }
+
+        document.getElementById("taskTable").innerHTML = filtered.map(task => `
+            <tr>
+                <td>${task.id}</td>
+                <td><b>${task.title}</b></td>
+                <td>${task.employee_name}</td>
+                <td>${task.priority}</td>
+                <td>${statusBadge(task.status)}</td>
+                <td>${formatDate(task.due_date)}</td>
+                <td><button class="edit-btn" onclick="openEditModal(${task.id})">Edit</button></td>
+                <td><button class="delete-btn" onclick="deleteTask(${task.id})">Delete</button></td>
+            </tr>`).join("");
+    }
+
+    function filterTasks(status) {
+        activeFilter = status;
+        document.querySelectorAll(".filter-btn").forEach(btn => {
+            btn.classList.toggle("active", btn.textContent.trim() === status);
+        });
+        renderTasks();
+    }
+
+    async function loadTasks() {
+        try {
+            const res   = await fetch(`${BASE}/manager-tasks?manager_id=${managerId}`);
+            allTasks    = await res.json();
+            renderTasks();
+        } catch (e) {
+            console.error("loadTasks error:", e);
+        }
+    }
+
+    // ── DELETE TASK ──────────────────────────────────────────
+    async function deleteTask(taskId) {
+        if (!confirm("Are you sure you want to delete this task?")) return;
+        try {
+            const res = await fetch(`${BASE}/delete-task?task_id=${taskId}`, { method: "POST" });
+            const data = await res.json();
+            if (data.success) {
+                showToast("Task deleted.");
+                refreshAll();
             }
-        )
-        new_id = result.fetchone()[0]
+        } catch (e) {
+            console.error("deleteTask error:", e);
+        }
+    }
 
-        # Timeline event
-        conn.execute(
-            text("""
-                INSERT INTO correction_timeline (correction_id, event, done_by, notes)
-                VALUES (:cid, 'Submitted', :by, '')
-            """),
-            {"cid": new_id, "by": data.emp_name}
-        )
+    // ── EDIT MODAL ───────────────────────────────────────────
+    async function openEditModal(taskId) {
+        try {
+            const res = await fetch(`${BASE}/task?task_id=${taskId}`);
+            const task = await res.json();
+            if (!task || task.success === false) { showToast("Could not load task."); return; }
 
-    return {"success": True, "id": new_id}
+            document.getElementById("editTaskId").value      = task.id;
+            document.getElementById("editTitle").value       = task.title;
+            document.getElementById("editDescription").value = task.description || "";
+            document.getElementById("editPriority").value    = task.priority;
+            document.getElementById("editDueDate").value     = task.due_date ? task.due_date.split("T")[0] : "";
 
+            // Populate dropdown with team members only
+            const sel = document.getElementById("editAssignedTo");
+            sel.innerHTML = `<option value="">— Select team member —</option>`;
+            (teamMembers.length ? teamMembers : await fetch(`${BASE}/team?manager_id=${managerId}`).then(r => r.json()))
+                .forEach(emp => {
+                    const opt = document.createElement("option");
+                    opt.value = emp.id;
+                    opt.textContent = `${emp.full_name} (ID: ${emp.id})`;
+                    if (emp.id === task.assigned_to) opt.selected = true;
+                    sel.appendChild(opt);
+                });
 
-@app.post("/attendance/corrections/{correction_id}/approve")
-def approve_correction(correction_id: int, data: CorrectionReview):
-    """
-    HR/Admin approves a correction request.
-    - Updates the attendance record with final times.
-    - Creates an audit log entry.
-    - Warns if payroll is already locked for that month.
-    """
-    with engine.connect() as conn:
-        corr = conn.execute(
-            text("SELECT * FROM attendance_corrections WHERE id=:id"),
-            {"id": correction_id}
-        ).mappings().fetchone()
+            document.getElementById("editModal").classList.add("active");
+        } catch (e) {
+            console.error("openEditModal error:", e);
+        }
+    }
 
-    if not corr:
-        return {"success": False, "message": "Request not found."}
-    if corr["status"] != "Pending":
-        return {"success": False, "message": f"Request is already {corr['status']}."}
+    function closeEditModal() {
+        document.getElementById("editModal").classList.remove("active");
+    }
 
-    payroll_month = corr["att_date"][:7]   # YYYY-MM
-    payroll_locked = False
+    async function saveEditTask() {
+        const taskId      = document.getElementById("editTaskId").value;
+        const title       = document.getElementById("editTitle").value.trim();
+        const description = document.getElementById("editDescription").value.trim();
+        const assignedTo  = document.getElementById("editAssignedTo").value;
+        const priority    = document.getElementById("editPriority").value;
+        const dueDate     = document.getElementById("editDueDate").value;
 
-    with engine.begin() as conn:
-        # Check payroll lock
-        lock = conn.execute(
-            text("SELECT id FROM payroll_locks WHERE payroll_month=:m AND unlocked_at IS NULL"),
-            {"m": payroll_month}
-        ).fetchone()
-        payroll_locked = lock is not None
+        if (!title || !assignedTo || !dueDate) { showToast("Please fill in all required fields."); return; }
 
-        # Fetch original attendance
-        att = conn.execute(
-            text("SELECT * FROM attendance WHERE emp_id=:eid AND att_date=:d"),
-            {"eid": corr["emp_id"], "d": corr["att_date"]}
-        ).mappings().fetchone()
-
-        # Strip seconds from TIME objects returned by PostgreSQL ("HH:MM:SS" → "HH:MM")
-        def _t(val):
-            return str(val)[:5] if val else None
-
-        orig_in  = _t(att["check_in"])  if att else None
-        orig_out = _t(att["check_out"]) if att else None
-
-        final_ci = data.final_check_in  or (_t(att["check_in"])  if att else None)
-        final_co = data.final_check_out or (_t(att["check_out"]) if att else None)
-        new_hours = _calc_hours(final_ci, final_co)
-
-        # Update attendance
-        if att:
-            conn.execute(
-                text("""
-                    UPDATE attendance
-                    SET check_in=:ci, check_out=:co, working_hours=:h,
-                        status='Manual Entry', updated_at=NOW()
-                    WHERE emp_id=:eid AND att_date=:d
-                """),
-                {"ci": final_ci, "co": final_co, "h": new_hours,
-                 "eid": corr["emp_id"], "d": corr["att_date"]}
-            )
-        else:
-            # No existing record — create one
-            conn.execute(
-                text("""
-                    INSERT INTO attendance
-                        (emp_id, emp_name, department, att_date, check_in, check_out,
-                         working_hours, status, source, updated_at, created_at)
-                    VALUES
-                        (:eid, :ename, :dept, :d, :ci, :co,
-                         :h, 'Manual Entry', 'correction', NOW(), NOW())
-                """),
-                {"eid": corr["emp_id"], "ename": corr["emp_name"],
-                 "dept": corr["department"], "d": corr["att_date"],
-                 "ci": final_ci, "co": final_co, "h": new_hours}
-            )
-
-        # Audit log
-        conn.execute(
-            text("""
-                INSERT INTO attendance_audit
-                    (attendance_id, correction_id, emp_id, emp_name, att_date,
-                     orig_check_in, orig_check_out, new_check_in, new_check_out,
-                     change_reason, approved_by, approved_at)
-                VALUES
-                    (:att_id, :cid, :eid, :ename, :d,
-                     :orig_in, :orig_out, :new_in, :new_out,
-                     :reason, :by, NOW())
-            """),
-            {
-                "att_id":   corr.get("attendance_id"),
-                "cid":      correction_id,
-                "eid":      corr["emp_id"],
-                "ename":    corr["emp_name"],
-                "d":        corr["att_date"],
-                "orig_in":  orig_in,
-                "orig_out": orig_out,
-                "new_in":   final_ci,
-                "new_out":  final_co,
-                "reason":   corr["reason"],
-                "by":       data.reviewed_by,
+        try {
+            const params = new URLSearchParams({ task_id: taskId, title, description, assigned_to: assignedTo, priority, due_date: dueDate });
+            const res  = await fetch(`${BASE}/edit-task?${params}`, { method: "POST" });
+            const data = await res.json();
+            if (data.success) {
+                showToast("Task updated successfully.");
+                closeEditModal();
+                refreshAll();
             }
-        )
-
-        # Update correction status
-        conn.execute(
-            text("""
-                UPDATE attendance_corrections
-                SET status='Approved', reviewed_by=:by, reviewed_at=NOW(), admin_notes=:notes
-                WHERE id=:id
-            """),
-            {"by": data.reviewed_by, "notes": data.admin_notes, "id": correction_id}
-        )
-
-        # Timeline
-        conn.execute(
-            text("""
-                INSERT INTO correction_timeline (correction_id, event, done_by, notes)
-                VALUES (:cid, 'Approved', :by, :notes)
-            """),
-            {"cid": correction_id, "by": data.reviewed_by, "notes": data.admin_notes}
-        )
-
-    return {
-        "success": True,
-        "payroll_locked_warning": payroll_locked,
-        "message": "Approved. Payroll recalculation is recommended." if payroll_locked else "Approved."
+        } catch (e) {
+            console.error("saveEditTask error:", e);
+        }
     }
 
+    // ── REVIEW TASKS ─────────────────────────────────────────
+    async function loadReviewTasks() {
+        try {
+            const res   = await fetch(`${BASE}/review-tasks?manager_id=${managerId}`);
+            const tasks = await res.json();
 
-@app.post("/attendance/corrections/{correction_id}/reject")
-def reject_correction(correction_id: int, data: CorrectionReview):
-    """HR/Admin rejects a correction request."""
-    with engine.connect() as conn:
-        corr = conn.execute(
-            text("SELECT status FROM attendance_corrections WHERE id=:id"),
-            {"id": correction_id}
-        ).fetchone()
-
-    if not corr:
-        return {"success": False, "message": "Request not found."}
-    if corr[0] != "Pending":
-        return {"success": False, "message": f"Request is already {corr[0]}."}
-
-    with engine.begin() as conn:
-        conn.execute(
-            text("""
-                UPDATE attendance_corrections
-                SET status='Rejected', reviewed_by=:by, reviewed_at=NOW(), admin_notes=:notes
-                WHERE id=:id
-            """),
-            {"by": data.reviewed_by, "notes": data.admin_notes, "id": correction_id}
-        )
-        conn.execute(
-            text("""
-                INSERT INTO correction_timeline (correction_id, event, done_by, notes)
-                VALUES (:cid, 'Rejected', :by, :notes)
-            """),
-            {"cid": correction_id, "by": data.reviewed_by, "notes": data.admin_notes}
-        )
-    return {"success": True}
-
-
-@app.post("/attendance/corrections/{correction_id}/cancel")
-def cancel_correction(correction_id: int, emp_name: str):
-    """Employee cancels their own pending request."""
-    with engine.begin() as conn:
-        result = conn.execute(
-            text("""
-                UPDATE attendance_corrections
-                SET status='Cancelled'
-                WHERE id=:id AND status='Pending'
-                RETURNING id
-            """),
-            {"id": correction_id}
-        )
-        row = result.fetchone()
-        if row:
-            conn.execute(
-                text("""
-                    INSERT INTO correction_timeline (correction_id, event, done_by)
-                    VALUES (:cid, 'Cancelled', :by)
-                """),
-                {"cid": correction_id, "by": emp_name}
-            )
-    if not row:
-        return {"success": False, "message": "Request not found or already reviewed."}
-    return {"success": True}
-
-
-@app.get("/attendance/corrections/summary/counts")
-def corrections_summary():
-    """Quick counts for the admin cards."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT status, COUNT(*) AS cnt FROM attendance_corrections GROUP BY status")
-        ).mappings().all()
-    m = {r["status"]: r["cnt"] for r in rows}
-    return {
-        "pending":  m.get("Pending", 0),
-        "approved": m.get("Approved", 0),
-        "rejected": m.get("Rejected", 0),
-        "cancelled":m.get("Cancelled", 0),
-    }
-
-
-# ================================================================
-# AUDIT LOG
-# ================================================================
-
-@app.get("/attendance/audit")
-def get_audit_log(
-    emp_id: Optional[str]    = None,
-    from_date: Optional[str] = None,
-    to_date: Optional[str]   = None,
-    search: Optional[str]    = None,
-):
-    filters, params = [], {}
-    if emp_id:
-        filters.append("emp_id = :emp_id"); params["emp_id"] = emp_id
-    if from_date:
-        filters.append("att_date >= :from_date"); params["from_date"] = from_date
-    if to_date:
-        filters.append("att_date <= :to_date"); params["to_date"] = to_date
-    if search:
-        filters.append("(LOWER(emp_name) LIKE :s OR LOWER(emp_id) LIKE :s)")
-        params["s"] = f"%{search.lower()}%"
-
-    where = ("WHERE " + " AND ".join(filters)) if filters else ""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(f"SELECT * FROM attendance_audit {where} ORDER BY approved_at DESC"),
-            params
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-# ================================================================
-# SALARY STRUCTURE
-# ================================================================
-
-@app.get("/salary-structure")
-def get_all_salary_structures():
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT * FROM salary_structure ORDER BY emp_id")
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-@app.get("/salary-structure/{emp_id}")
-def get_salary_structure(emp_id: str):
-    with engine.connect() as conn:
-        row = conn.execute(
-            text("SELECT * FROM salary_structure WHERE emp_id=:eid"),
-            {"eid": emp_id}
-        ).mappings().fetchone()
-    if not row:
-        return {"success": False, "message": "No salary structure found for this employee."}
-    return dict(row)
-
-
-@app.post("/salary-structure")
-def upsert_salary_structure(data: SalaryStructure):
-    """Create or update the salary structure for an employee."""
-    eff = data.effective_from or date.today().isoformat()
-    with engine.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO salary_structure
-                    (emp_id, emp_name, basic_salary, hra, special_allowance,
-                     travel_allowance, medical_allowance, bonus, incentives,
-                     pf_pct, esic_pct, professional_tax, income_tax,
-                     other_deductions, effective_from, created_by, updated_at)
-                VALUES
-                    (:emp_id, :emp_name, :basic_salary, :hra, :special_allowance,
-                     :travel_allowance, :medical_allowance, :bonus, :incentives,
-                     :pf_pct, :esic_pct, :professional_tax, :income_tax,
-                     :other_deductions, :effective_from, :created_by, NOW())
-                ON CONFLICT (emp_id) DO UPDATE SET
-                    emp_name          = EXCLUDED.emp_name,
-                    basic_salary      = EXCLUDED.basic_salary,
-                    hra               = EXCLUDED.hra,
-                    special_allowance = EXCLUDED.special_allowance,
-                    travel_allowance  = EXCLUDED.travel_allowance,
-                    medical_allowance = EXCLUDED.medical_allowance,
-                    bonus             = EXCLUDED.bonus,
-                    incentives        = EXCLUDED.incentives,
-                    pf_pct            = EXCLUDED.pf_pct,
-                    esic_pct          = EXCLUDED.esic_pct,
-                    professional_tax  = EXCLUDED.professional_tax,
-                    income_tax        = EXCLUDED.income_tax,
-                    other_deductions  = EXCLUDED.other_deductions,
-                    effective_from    = EXCLUDED.effective_from,
-                    updated_at        = NOW()
-            """),
-            {
-                "emp_id":           data.emp_id,
-                "emp_name":         data.emp_name,
-                "basic_salary":     data.basic_salary,
-                "hra":              data.hra,
-                "special_allowance":data.special_allowance,
-                "travel_allowance": data.travel_allowance,
-                "medical_allowance":data.medical_allowance,
-                "bonus":            data.bonus,
-                "incentives":       data.incentives,
-                "pf_pct":           data.pf_pct,
-                "esic_pct":         data.esic_pct,
-                "professional_tax": data.professional_tax,
-                "income_tax":       data.income_tax,
-                "other_deductions": data.other_deductions,
-                "effective_from":   eff,
-                "created_by":       data.created_by,
+            // Update sidebar badge
+            const badge = document.getElementById("reviewBadge");
+            if (tasks.length > 0) {
+                badge.textContent = tasks.length;
+                badge.style.display = "inline-block";
+            } else {
+                badge.style.display = "none";
             }
-        )
-    return {"success": True}
 
+            if (!tasks.length) {
+                document.getElementById("reviewTable").innerHTML =
+                    `<tr><td colspan="7" style="color:#9ca3af;text-align:center;padding:20px;">No tasks pending review</td></tr>`;
+                return;
+            }
 
-# ================================================================
-# PAYROLL
-# ================================================================
-
-@app.get("/payroll")
-def get_payroll(month: Optional[str] = None, emp_id: Optional[str] = None):
-    filters, params = [], {}
-    if month:
-        filters.append("payroll_month=:month"); params["month"] = month
-    if emp_id:
-        filters.append("emp_id=:emp_id"); params["emp_id"] = emp_id
-    where = ("WHERE " + " AND ".join(filters)) if filters else ""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(f"SELECT * FROM payroll {where} ORDER BY emp_id"),
-            params
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-@app.post("/payroll/generate")
-def generate_payroll(month: str, generated_by: str = "HR Admin"):
-    """
-    Generates payroll for ALL employees who have a salary structure,
-    for the given month (YYYY-MM).
-    Fails if payroll is already locked for that month.
-    Overwrites any un-locked draft for the same month.
-    """
-    # Validate month format
-    try:
-        year, mon = int(month[:4]), int(month[5:7])
-    except Exception:
-        return {"success": False, "message": "Invalid month format. Use YYYY-MM."}
-
-    with engine.connect() as conn:
-        lock = conn.execute(
-            text("SELECT id FROM payroll_locks WHERE payroll_month=:m AND unlocked_at IS NULL"),
-            {"m": month}
-        ).fetchone()
-        if lock:
-            return {"success": False, "message": "Payroll is locked for this month. Unlock first."}
-
-        # All salary structures
-        structs = conn.execute(
-            text("SELECT * FROM salary_structure")
-        ).mappings().all()
-
-        settings = _get_settings(conn)
-
-    working_days = _working_days_in_month(year, mon)
-    generated_rows = []
-
-    for ss in structs:
-        emp_id_val = ss["emp_id"]
-
-        with engine.connect() as conn:
-            att_rows = conn.execute(
-                text("""
-                    SELECT status, late_minutes, overtime
-                    FROM attendance
-                    WHERE emp_id=:eid
-                      AND TO_CHAR(att_date,'YYYY-MM')=:month
-                """),
-                {"eid": emp_id_val, "month": month}
-            ).mappings().all()
-
-        present    = sum(1 for a in att_rows if a["status"] in ("Present","Work From Home","Manual Entry"))
-        half_days  = sum(1 for a in att_rows if a["status"] == "Half Day")
-        leave_days = sum(1 for a in att_rows if a["status"] == "Leave")
-        ot_hours   = float(sum(a["overtime"] or 0 for a in att_rows))
-
-        effective_present = present + half_days * 0.5 + leave_days
-        lop = max(0.0, working_days - effective_present)
-
-        # Earnings
-        basic  = float(ss["basic_salary"])
-        hra    = float(ss["hra"])
-        spl    = float(ss["special_allowance"])
-        travel = float(ss["travel_allowance"])
-        med    = float(ss["medical_allowance"])
-        bonus  = float(ss["bonus"])
-        inc    = float(ss["incentives"])
-        gross  = basic + hra + spl + travel + med + bonus + inc
-
-        # Deductions
-        lop_ded   = round((basic / working_days) * lop, 2) if working_days > 0 else 0
-        pf_ded    = round(basic * float(ss["pf_pct"]) / 100, 2)
-        esic_ded  = round(gross * float(ss["esic_pct"]) / 100, 2)
-        pt_ded    = float(ss["professional_tax"])
-        it_ded    = float(ss["income_tax"])
-        other_ded = float(ss["other_deductions"])
-        total_ded = pf_ded + esic_ded + pt_ded + it_ded + other_ded + lop_ded
-        net       = gross - total_ded
-
-        generated_rows.append({
-            "month": month, "emp_id": emp_id_val,
-            "emp_name": ss["emp_name"], "dept": "",
-            "working_days": working_days, "present": present,
-            "half_days": half_days, "leave": leave_days, "lop": lop,
-            "ot_hours": ot_hours, "gross": gross,
-            "pf": pf_ded, "esic": esic_ded, "pt": pt_ded, "it": it_ded,
-            "other": other_ded, "lop_ded": lop_ded,
-            "total_ded": total_ded, "net": net,
-        })
-
-    with engine.begin() as conn:
-        # Wipe old draft for this month
-        conn.execute(text("DELETE FROM payroll WHERE payroll_month=:m"), {"m": month})
-        for r in generated_rows:
-            conn.execute(
-                text("""
-                    INSERT INTO payroll
-                        (payroll_month, emp_id, emp_name, department,
-                         working_days, present_days, half_days, leave_days, lop_days,
-                         overtime_hours, gross_salary,
-                         pf_deduction, esic_deduction, pt_deduction, it_deduction,
-                         other_deductions, lop_deduction, total_deductions, net_salary,
-                         status, generated_at)
-                    VALUES
-                        (:m, :eid, :ename, :dept,
-                         :wd, :p, :hd, :l, :lop,
-                         :ot, :gross,
-                         :pf, :esic, :pt, :it,
-                         :other, :lop_ded, :total_ded, :net,
-                         'Generated', NOW())
-                """),
-                {
-                    "m": r["month"], "eid": r["emp_id"], "ename": r["emp_name"], "dept": r["dept"],
-                    "wd": r["working_days"], "p": r["present"], "hd": r["half_days"],
-                    "l": r["leave"], "lop": r["lop"], "ot": r["ot_hours"],
-                    "gross": r["gross"], "pf": r["pf"], "esic": r["esic"],
-                    "pt": r["pt"], "it": r["it"], "other": r["other"],
-                    "lop_ded": r["lop_ded"], "total_ded": r["total_ded"], "net": r["net"],
-                }
-            )
-
-    total_gross = sum(r["gross"] for r in generated_rows)
-    total_net   = sum(r["net"]   for r in generated_rows)
-    return {
-        "success": True,
-        "employees_processed": len(generated_rows),
-        "total_gross": round(total_gross, 2),
-        "total_net": round(total_net, 2),
+            document.getElementById("reviewTable").innerHTML = tasks.map(task => {
+                const fileCell = task.file_url
+                    ? `<a href="${BASE}${task.file_url}" target="_blank"
+                          style="color:#2563eb;font-size:13px;font-weight:600;text-decoration:none;
+                                 display:inline-flex;align-items:center;gap:4px;">
+                           📎 ${task.file_name || "View File"}
+                       </a>`
+                    : `<span style="color:#9ca3af;font-size:12px;">No file</span>`;
+                return `
+                <tr>
+                    <td>${task.id}</td>
+                    <td><b>${task.title}</b></td>
+                    <td>${task.employee_name || task.assigned_to}</td>
+                    <td>${task.priority}</td>
+                    <td>${statusBadge(task.status)}</td>
+                    <td>${fileCell}</td>
+                    <td>
+                        <button class="review-btn" onclick="openEditModal(${task.id})">Review</button>
+                        <button class="approve-btn" onclick="approveTask(${task.id})">Approve</button>
+                        <button onclick="openRemarkModal(${task.id}, ${task.assigned_to}, '${(task.title||'').replace(/'/g,"\\'")}')"
+                                style="background:#f59e0b;color:white;border:none;padding:6px 12px;
+                                       border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;margin-left:4px;">
+                            Send Correction
+                        </button>
+                    </td>
+                </tr>`;
+            }).join("");
+        } catch (e) {
+            console.error("loadReviewTasks error:", e);
+        }
     }
 
-
-@app.post("/payroll/lock")
-def lock_payroll(month: str, locked_by: str = "HR Admin"):
-    """
-    Locks payroll for a month and auto-generates payslips for all employees.
-    After locking, no edits to payroll or attendance corrections are applied
-    to the payroll figures without an explicit unlock.
-    """
-    with engine.connect() as conn:
-        existing_lock = conn.execute(
-            text("SELECT id FROM payroll_locks WHERE payroll_month=:m AND unlocked_at IS NULL"),
-            {"m": month}
-        ).fetchone()
-        if existing_lock:
-            return {"success": False, "message": "Payroll is already locked for this month."}
-
-        payroll_rows = conn.execute(
-            text("SELECT p.*, s.* FROM payroll p LEFT JOIN salary_structure s ON p.emp_id=s.emp_id WHERE p.payroll_month=:m"),
-            {"m": month}
-        ).mappings().all()
-
-    if not payroll_rows:
-        return {"success": False, "message": "No payroll data found. Generate payroll first."}
-
-    mon_num = int(month[5:7])
-    yr_num  = int(month[:4])
-    mon_str = f"{mon_num:02d}"
-
-    with engine.begin() as conn:
-        # Insert lock record
-        conn.execute(
-            text("""
-                INSERT INTO payroll_locks (payroll_month, locked_by, locked_at)
-                VALUES (:m, :by, NOW())
-                ON CONFLICT (payroll_month) DO UPDATE SET locked_by=EXCLUDED.locked_by, locked_at=NOW(), unlocked_at=NULL
-            """),
-            {"m": month, "by": locked_by}
-        )
-
-        # Update all payroll rows to Locked
-        conn.execute(
-            text("UPDATE payroll SET status='Locked' WHERE payroll_month=:m"),
-            {"m": month}
-        )
-
-        # Generate payslips
-        conn.execute(text("DELETE FROM payslips WHERE payroll_month=:m"), {"m": month})
-        for row in payroll_rows:
-            payslip_no = f"PNT-{yr_num}{mon_str}-{row['emp_id']}"
-            conn.execute(
-                text("""
-                    INSERT INTO payslips
-                        (payslip_no, payroll_month, emp_id, emp_name, department, designation,
-                         working_days, present_days, leave_days, lop_days, overtime_hours,
-                         basic_salary, hra, special_allowance, travel_allowance,
-                         medical_allowance, bonus, incentives, gross_salary,
-                         pf_deduction, esic_deduction, pt_deduction, it_deduction,
-                         other_deductions, lop_deduction, total_deductions, net_salary,
-                         generated_at, payroll_id)
-                    VALUES
-                        (:pno, :m, :eid, :ename, :dept, :desig,
-                         :wd, :p, :l, :lop, :ot,
-                         :basic, :hra, :spl, :travel, :med, :bonus, :inc, :gross,
-                         :pf, :esic, :pt, :it, :other, :lop_ded, :total_ded, :net,
-                         NOW(), :pr_id)
-                """),
-                {
-                    "pno":   payslip_no,
-                    "m":     month,
-                    "eid":   row["emp_id"],
-                    "ename": row["emp_name"],
-                    "dept":  row.get("department",""),
-                    "desig": "Team Member",
-                    "wd":    row["working_days"],
-                    "p":     row["present_days"],
-                    "l":     row["leave_days"],
-                    "lop":   row["lop_days"],
-                    "ot":    row["overtime_hours"],
-                    "basic": row.get("basic_salary", 0),
-                    "hra":   row.get("hra", 0),
-                    "spl":   row.get("special_allowance", 0),
-                    "travel":row.get("travel_allowance", 0),
-                    "med":   row.get("medical_allowance", 0),
-                    "bonus": row.get("bonus", 0),
-                    "inc":   row.get("incentives", 0),
-                    "gross": row["gross_salary"],
-                    "pf":    row["pf_deduction"],
-                    "esic":  row["esic_deduction"],
-                    "pt":    row["pt_deduction"],
-                    "it":    row["it_deduction"],
-                    "other": row["other_deductions"],
-                    "lop_ded": row["lop_deduction"],
-                    "total_ded": row["total_deductions"],
-                    "net":   row["net_salary"],
-                    "pr_id": row["id"],
-                }
-            )
-
-        # Audit the lock
-        conn.execute(
-            text("""
-                INSERT INTO attendance_audit
-                    (emp_id, emp_name, att_date, orig_check_in, orig_check_out,
-                     new_check_in, new_check_out, change_reason, approved_by, approved_at)
-                VALUES
-                    ('SYSTEM','System',:d,'UNLOCKED','UNLOCKED','LOCKED','LOCKED',
-                     'Payroll locked by HR', :by, NOW())
-            """),
-            {"d": f"{yr_num}-{mon_str}-01", "by": locked_by}
-        )
-
-    return {"success": True, "payslips_generated": len(payroll_rows)}
-
-
-@app.post("/payroll/unlock")
-def unlock_payroll(month: str, data: PayrollUnlockRequest):
-    """Super Admin unlocks a previously locked payroll month."""
-    with engine.begin() as conn:
-        result = conn.execute(
-            text("""
-                UPDATE payroll_locks
-                SET unlocked_by=:by, unlocked_at=NOW()
-                WHERE payroll_month=:m AND unlocked_at IS NULL
-                RETURNING id
-            """),
-            {"m": month, "by": data.unlocked_by}
-        )
-        row = result.fetchone()
-        if not row:
-            return {"success": False, "message": "Payroll is not locked or already unlocked."}
-
-        conn.execute(
-            text("UPDATE payroll SET status='Generated' WHERE payroll_month=:m"),
-            {"m": month}
-        )
-
-        # Audit
-        conn.execute(
-            text("""
-                INSERT INTO attendance_audit
-                    (emp_id, emp_name, att_date, orig_check_in, orig_check_out,
-                     new_check_in, new_check_out, change_reason, approved_by, approved_at)
-                VALUES
-                    ('SYSTEM','System',:d,'LOCKED','LOCKED','UNLOCKED','UNLOCKED',
-                     'Payroll UNLOCKED by Super Admin', :by, NOW())
-            """),
-            {"d": f"{month}-01", "by": data.unlocked_by}
-        )
-
-    return {"success": True}
-
-
-@app.get("/payroll/lock-status/{month}")
-def payroll_lock_status(month: str):
-    with engine.connect() as conn:
-        row = conn.execute(
-            text("SELECT * FROM payroll_locks WHERE payroll_month=:m"),
-            {"m": month}
-        ).mappings().fetchone()
-    if not row:
-        return {"locked": False}
-    return {**dict(row), "locked": row["unlocked_at"] is None}
-
-
-@app.get("/payroll/summary/{month}")
-def payroll_summary(month: str):
-    """Aggregate totals for a payroll month — used by report cards."""
-    with engine.connect() as conn:
-        row = conn.execute(
-            text("""
-                SELECT COUNT(*) AS employees,
-                       SUM(gross_salary)    AS gross,
-                       SUM(total_deductions)AS deductions,
-                       SUM(net_salary)      AS net,
-                       SUM(CASE WHEN lop_days > 0 THEN 1 ELSE 0 END) AS lop_employees
-                FROM payroll
-                WHERE payroll_month=:m
-            """),
-            {"m": month}
-        ).mappings().fetchone()
-        lock = conn.execute(
-            text("SELECT locked_at, locked_by FROM payroll_locks WHERE payroll_month=:m AND unlocked_at IS NULL"),
-            {"m": month}
-        ).fetchone()
-    return {
-        "month": month,
-        "employees":     row["employees"] or 0,
-        "gross":         float(row["gross"] or 0),
-        "deductions":    float(row["deductions"] or 0),
-        "net":           float(row["net"] or 0),
-        "lop_employees": row["lop_employees"] or 0,
-        "locked":        lock is not None,
-        "locked_at":     str(lock[0]) if lock else None,
-        "locked_by":     lock[1] if lock else None,
+    // ── APPROVE TASK ─────────────────────────────────────────
+    async function approveTask(taskId) {
+        if (!confirm("Approve this task as Completed?")) return;
+        try {
+            const res  = await fetch(`${BASE}/approve-task?task_id=${taskId}`, { method: "POST" });
+            const data = await res.json();
+            if (data.success) {
+                showToast("Task approved and marked as Completed.");
+                refreshAll();
+            }
+        } catch (e) {
+            console.error("approveTask error:", e);
+        }
     }
 
-
-# ================================================================
-# PAYSLIPS
-# ================================================================
-
-@app.get("/payslips")
-def get_payslips(
-    emp_id: Optional[str] = None,
-    month: Optional[str]  = None,
-    year: Optional[str]   = None,
-):
-    filters, params = [], {}
-    if emp_id:
-        filters.append("emp_id=:emp_id"); params["emp_id"] = emp_id
-    if month:
-        filters.append("payroll_month=:month"); params["month"] = month
-    if year:
-        filters.append("payroll_month LIKE :year"); params["year"] = f"{year}-%"
-    where = ("WHERE " + " AND ".join(filters)) if filters else ""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(f"SELECT * FROM payslips {where} ORDER BY payroll_month DESC"),
-            params
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-@app.get("/payslips/{payslip_id}")
-def get_payslip(payslip_id: int):
-    with engine.connect() as conn:
-        row = conn.execute(
-            text("SELECT * FROM payslips WHERE id=:id"),
-            {"id": payslip_id}
-        ).mappings().fetchone()
-    if not row:
-        return {"success": False, "message": "Payslip not found."}
-    return dict(row)
-
-
-@app.get("/payslips/by-no/{payslip_no}")
-def get_payslip_by_no(payslip_no: str):
-    with engine.connect() as conn:
-        row = conn.execute(
-            text("SELECT * FROM payslips WHERE payslip_no=:no"),
-            {"no": payslip_no}
-        ).mappings().fetchone()
-    if not row:
-        return {"success": False, "message": "Payslip not found."}
-    return dict(row)
-
-
-# ================================================================
-# HOLIDAYS
-# ================================================================
-
-@app.get("/holidays")
-def get_holidays(year: Optional[str] = None):
-    filters, params = [], {}
-    if year:
-        filters.append("EXTRACT(YEAR FROM holiday_date)=:year"); params["year"] = int(year)
-    where = ("WHERE " + " AND ".join(filters)) if filters else ""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(f"SELECT * FROM holidays {where} ORDER BY holiday_date"),
-            params
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-@app.post("/holidays")
-def create_holiday(data: HolidayCreate):
-    try:
-        with engine.begin() as conn:
-            result = conn.execute(
-                text("""
-                    INSERT INTO holidays (holiday_date, name, holiday_type)
-                    VALUES (:d, :name, :type)
-                    RETURNING id
-                """),
-                {"d": data.holiday_date, "name": data.name, "type": data.holiday_type}
-            )
-            new_id = result.fetchone()[0]
-        return {"success": True, "id": new_id}
-    except Exception as e:
-        if "unique" in str(e).lower():
-            return {"success": False, "message": "A holiday already exists on this date."}
-        return {"success": False, "message": str(e)}
-
-
-@app.delete("/holidays/{holiday_id}")
-def delete_holiday(holiday_id: int):
-    with engine.begin() as conn:
-        result = conn.execute(
-            text("DELETE FROM holidays WHERE id=:id RETURNING id"),
-            {"id": holiday_id}
-        )
-        row = result.fetchone()
-    if not row:
-        return {"success": False, "message": "Holiday not found."}
-    return {"success": True}
-
-
-# ================================================================
-# REPORTS
-# ================================================================
-
-@app.get("/reports/attendance/late")
-def report_late_employees(month: str):
-    """Employees with late arrivals in a given month."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT emp_id, emp_name, department,
-                       COUNT(*) AS late_days,
-                       SUM(late_minutes) AS total_late_minutes,
-                       ROUND(AVG(late_minutes),0) AS avg_late_minutes
-                FROM attendance
-                WHERE TO_CHAR(att_date,'YYYY-MM')=:month
-                  AND late_minutes > 0
-                GROUP BY emp_id, emp_name, department
-                ORDER BY total_late_minutes DESC
-            """),
-            {"month": month}
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-@app.get("/reports/attendance/absentees")
-def report_absentees(month: str):
-    """Absent / leave / LOP days per employee for a given month."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT emp_id, emp_name, department,
-                       SUM(CASE WHEN status='Absent' THEN 1 ELSE 0 END) AS absent_days,
-                       SUM(CASE WHEN status='Leave'  THEN 1 ELSE 0 END) AS leave_days
-                FROM attendance
-                WHERE TO_CHAR(att_date,'YYYY-MM')=:month
-                GROUP BY emp_id, emp_name, department
-                HAVING SUM(CASE WHEN status IN ('Absent','Leave') THEN 1 ELSE 0 END) > 0
-                ORDER BY absent_days DESC
-            """),
-            {"month": month}
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-@app.get("/reports/attendance/overtime")
-def report_overtime(month: str):
-    """Overtime summary per employee for a given month."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT emp_id, emp_name, department,
-                       COUNT(*) AS ot_days,
-                       SUM(overtime) AS ot_hours
-                FROM attendance
-                WHERE TO_CHAR(att_date,'YYYY-MM')=:month
-                  AND overtime > 0
-                GROUP BY emp_id, emp_name, department
-                ORDER BY ot_hours DESC
-            """),
-            {"month": month}
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-@app.get("/reports/payroll/summary")
-def report_payroll_summary():
-    """Month-wise payroll summary across all months."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT p.payroll_month,
-                       COUNT(*)                AS employees,
-                       SUM(p.gross_salary)     AS gross,
-                       SUM(p.total_deductions) AS deductions,
-                       SUM(p.net_salary)       AS net,
-                       SUM(CASE WHEN p.lop_days>0 THEN 1 ELSE 0 END) AS lop_count,
-                       MAX(pl.locked_at) IS NOT NULL AND MAX(pl.unlocked_at) IS NULL AS is_locked
-                FROM payroll p
-                LEFT JOIN payroll_locks pl ON pl.payroll_month=p.payroll_month
-                GROUP BY p.payroll_month
-                ORDER BY p.payroll_month DESC
-            """)
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-@app.get("/reports/payroll/department")
-def report_department_salary(month: str):
-    """Department-wise salary breakdown for a given month."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT department,
-                       COUNT(*) AS employees,
-                       SUM(gross_salary)     AS gross,
-                       SUM(total_deductions) AS deductions,
-                       SUM(net_salary)       AS net
-                FROM payroll
-                WHERE payroll_month=:month
-                GROUP BY department
-                ORDER BY net DESC
-            """),
-            {"month": month}
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-@app.get("/reports/payroll/employee-history/{emp_id}")
-def report_employee_salary_history(emp_id: str):
-    """All payslips for a single employee — chronological."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT payslip_no, payroll_month, gross_salary, total_deductions, net_salary, generated_at
-                FROM payslips
-                WHERE emp_id=:eid
-                ORDER BY payroll_month DESC
-            """),
-            {"eid": emp_id}
-        ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-# ---------- 2. MODELS + ROUTES ----------
- 
-import json as _json
-from datetime import date as _date
- 
-class ReminderCreate(BaseModel):
-    title: str
-    description: str = ""
-    category: str = "Other"
-    priority: str = "Medium"
-    assigned_to: int
-    created_by: int
-    start_date: Optional[str] = None
-    due_date: str
-    reminder_offsets: List[int] = [7, 3, 1, 0]
-    repeat_after_due: bool = False
-    amount: Optional[float] = None
-    related_module: Optional[str] = None
-    related_record_id: Optional[int] = None
-    remarks: str = ""
- 
- 
-class ReminderUpdate(BaseModel):
-    title: Optional[str] = None
-    description: Optional[str] = None
-    category: Optional[str] = None
-    priority: Optional[str] = None
-    status: Optional[str] = None
-    assigned_to: Optional[int] = None
-    start_date: Optional[str] = None
-    due_date: Optional[str] = None
-    reminder_offsets: Optional[List[int]] = None
-    repeat_after_due: Optional[bool] = None
-    amount: Optional[float] = None
-    remarks: Optional[str] = None
- 
- 
-class ReminderComplete(BaseModel):
-    completed_by: int
-    completion_notes: str = ""
- 
- 
-def _days_remaining(due_date):
-    if isinstance(due_date, str):
-        due_date = _date.fromisoformat(due_date)
-    return (due_date - _date.today()).days
- 
- 
-def _reminder_row_to_dict(r):
-    d = dict(r)
-    try:
-        d["reminder_offsets"] = _json.loads(d.get("reminder_offsets_json") or "[]")
-    except Exception:
-        d["reminder_offsets"] = []
-    d["days_remaining"] = _days_remaining(d["due_date"]) if d.get("due_date") else None
-    if d.get("amount") is not None:
-        d["amount"] = float(d["amount"])
-    for k in ("due_date", "start_date", "completed_on", "created_at", "updated_at"):
-        if d.get(k) is not None:
-            d[k] = str(d[k])
-    return d
- 
- 
-# ---------- LIST / SEARCH / FILTER ----------
-@app.get("/reminders")
-def get_reminders(
-    user_id: Optional[int] = None,
-    role: Optional[str] = None,
-    category: Optional[str] = None,
-    priority: Optional[str] = None,
-    status: Optional[str] = None,
-    assigned_to: Optional[int] = None,
-    overdue: Optional[bool] = None,
-    search: Optional[str] = None,
-):
-    filters, params = [], {}
- 
-    # Role-based visibility: employees only see their own; admins/managers see all
-    # Every user only sees reminders they created
-    if user_id:
-        filters.append("created_by = :uid")
-        params["uid"] = user_id
- 
-    if category:
-        filters.append("category = :cat"); params["cat"] = category
-    if priority:
-        filters.append("priority = :pri"); params["pri"] = priority
-    if status:
-        filters.append("r.status = :st"); params["st"] = status
-    if assigned_to:
-        filters.append("r.assigned_to = :ato"); params["ato"] = assigned_to
-    if search:
-        filters.append("(title ILIKE :s OR description ILIKE :s)")
-        params["s"] = f"%{search}%"
-    if overdue:
-        filters.append("r.due_date < CURRENT_DATE AND r.status = 'Open'")
- 
-    where = ("WHERE " + " AND ".join(filters)) if filters else ""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(f"""
-                SELECT r.*, u.full_name AS assigned_to_name
-                FROM reminders r
-                LEFT JOIN users u ON u.id = r.assigned_to
-                {where}
-                ORDER BY r.due_date ASC
-            """),
-            params
-        ).mappings().all()
- 
-    return [_reminder_row_to_dict(r) for r in rows]
- 
- 
-# ---------- TODAY'S DUE REMINDERS (for dashboard widget) ----------
-@app.get("/reminders/today")
-def get_todays_reminders(user_id: int):
-    """
-    Returns reminders for the logged-in user whose days_remaining matches
-    one of their configured reminder offsets (or are due/overdue).
-    """
-
-    filters = [
-        "r.status = 'Open'",
-        "r.created_by = :uid"
-    ]
-
-    params = {
-        "uid": int(user_id)
+    // ── REFRESH ALL ──────────────────────────────────────────
+    function refreshAll() {
+        loadStats();
+        loadTasks();
+        loadEmployees();
+        loadReviewTasks();
     }
 
-    where = "WHERE " + " AND ".join(filters)
+    // Close modal if clicking outside
+    document.getElementById("editModal").addEventListener("click", function(e) {
+        if (e.target === this) closeEditModal();
+    });
 
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(f"""
-                SELECT r.*
-                FROM reminders r
-                {where}
-                ORDER BY r.due_date ASC
-            """),
-            params
-        ).mappings().all()
+    // Init
+    refreshAll();
+</script>
+<!-- ── SEND CORRECTION MODAL ────────────────────────────────── -->
+<div id="remarkModal" style="display:none;position:fixed;inset:0;
+    background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+    <div style="background:white;border-radius:14px;padding:28px;width:480px;max-width:95vw;">
+        <h2 style="font-size:17px;margin-bottom:6px;color:#111827;">Send Correction</h2>
+        <p id="remarkTaskLabel" style="font-size:13px;color:#6b7280;margin-bottom:18px;"></p>
+        <input type="hidden" id="remarkTaskId" />
+        <input type="hidden" id="remarkEmployeeId" />
 
-    due_now = []
+        <label style="font-size:12px;font-weight:600;color:#6b7280;text-transform:uppercase;
+                      letter-spacing:0.4px;display:block;margin-bottom:6px;">
+            Correction / Remark
+        </label>
+        <textarea id="remarkText" rows="4"
+                  placeholder="Describe what needs to be corrected or improved..."
+                  style="width:100%;padding:10px 12px;border:1.5px solid #e5e7eb;border-radius:8px;
+                         font-size:14px;font-family:'Segoe UI',sans-serif;outline:none;
+                         resize:vertical;margin-bottom:18px;"></textarea>
 
-    for r in rows:
-        d = _reminder_row_to_dict(r)
+        <div style="display:flex;gap:10px;justify-content:flex-end;">
+            <button onclick="closeRemarkModal()"
+                    style="background:#e5e7eb;color:#374151;border:none;padding:10px 20px;
+                           border-radius:8px;cursor:pointer;font-size:14px;">Cancel</button>
+            <button onclick="submitRemark()"
+                    style="background:#f59e0b;color:white;border:none;padding:10px 20px;
+                           border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;">
+                    Send Correction
+            </button>
+        </div>
+    </div>
+</div>
 
-        days = d["days_remaining"]
+<script>
+function openRemarkModal(taskId, employeeId, taskTitle) {
+    document.getElementById("remarkTaskId").value     = taskId;
+    document.getElementById("remarkEmployeeId").value = employeeId;
+    document.getElementById("remarkTaskLabel").textContent = `Task: ${taskTitle}`;
+    document.getElementById("remarkText").value       = "";
+    document.getElementById("remarkModal").style.display = "flex";
+}
 
-        offsets = d.get("reminder_offsets") or [7, 3, 1, 0]
+function closeRemarkModal() {
+    document.getElementById("remarkModal").style.display = "none";
+}
 
-        if (days in offsets) or (days <= 0):
-            due_now.append(d)
+async function submitRemark() {
+    const taskId     = document.getElementById("remarkTaskId").value;
+    const employeeId = document.getElementById("remarkEmployeeId").value;
+    const remark     = document.getElementById("remarkText").value.trim();
 
-    due_now.sort(key=lambda x: x["days_remaining"])
+    if (!remark) { showToast("Please enter a correction remark."); return; }
 
-    return due_now
- 
- 
-# ---------- NOTIFICATION CENTER FEED ----------
-@app.get("/notifications/reminders")
-def get_reminder_notifications(user_id: int, role: str = "employee"):
-    """Same calculation as /reminders/today, shaped for the notification bell."""
-    items = get_todays_reminders(user_id, role)
-    feed = []
-    for r in items:
-        days = r["days_remaining"]
-        if days < 0:
-            line = f"Overdue by {abs(days)} day(s)"
-        elif days == 0:
-            line = "Due Today"
-        else:
-            line = f"Due in {days} day(s)"
-        feed.append({
-            "id": r["id"],
-            "title": r["title"],
-            "category": r["category"],
-            "priority": r["priority"],
-            "line": line,
-            "days_remaining": days,
-            "due_date": r["due_date"],
-        })
-    return feed
- 
- 
-# ---------- CREATE ----------
-@app.post("/reminders")
-def create_reminder(data: ReminderCreate):
-    try:
-        with engine.begin() as conn:
-            result = conn.execute(
-                text("""
-                    INSERT INTO reminders
-                    (title, description, category, priority, assigned_to, created_by,
-                     start_date, due_date, reminder_offsets_json, repeat_after_due,
-                     amount, related_module, related_record_id, remarks, status)
-                    VALUES
-                    (:title, :description, :category, :priority, :assigned_to, :created_by,
-                     :start_date, :due_date, :offsets, :repeat, :amount, :rel_mod, :rel_id,
-                     :remarks, 'Open')
-                    RETURNING id
-                """),
-                {
-                    "title": data.title,
-                    "description": data.description,
-                    "category": data.category,
-                    "priority": data.priority,
-                    "assigned_to": data.assigned_to,
-                    "created_by": data.created_by,
-                    "start_date": data.start_date,
-                    "due_date": data.due_date,
-                    "offsets": _json.dumps(data.reminder_offsets),
-                    "repeat": data.repeat_after_due,
-                    "amount": data.amount,
-                    "rel_mod": data.related_module,
-                    "rel_id": data.related_record_id,
-                    "remarks": data.remarks,
-                }
-            )
-            new_id = result.fetchone()[0]
-        return {"success": True, "id": new_id}
-    except Exception as e:
-        return {"success": False, "message": str(e)}
- 
- 
-# ---------- UPDATE ----------
-@app.put("/reminders/{reminder_id}")
-def update_reminder(reminder_id: int, data: ReminderUpdate):
-    fields, params = [], {"id": reminder_id}
-    payload = data.dict(exclude_unset=True)
- 
-    if "reminder_offsets" in payload:
-        payload["reminder_offsets_json"] = _json.dumps(payload.pop("reminder_offsets"))
- 
-    for k, v in payload.items():
-        fields.append(f"{k} = :{k}")
-        params[k] = v
- 
-    if not fields:
-        return {"success": False, "message": "No fields to update."}
- 
-    fields.append("updated_at = NOW()")
-    with engine.begin() as conn:
-        result = conn.execute(
-            text(f"UPDATE reminders SET {', '.join(fields)} WHERE id = :id RETURNING id"),
-            params
-        )
-        row = result.fetchone()
-    if not row:
-        return {"success": False, "message": "Reminder not found."}
-    return {"success": True}
- 
- 
-# ---------- MARK COMPLETE ----------
-@app.post("/reminders/{reminder_id}/complete")
-def complete_reminder(reminder_id: int, data: ReminderComplete):
-    with engine.begin() as conn:
-        result = conn.execute(
-            text("""
-                UPDATE reminders
-                SET status='Completed', completed_on=NOW(),
-                    completed_by=:cb, completion_notes=:notes, updated_at=NOW()
-                WHERE id=:id
-                RETURNING id
-            """),
-            {"id": reminder_id, "cb": data.completed_by, "notes": data.completion_notes}
-        )
-        row = result.fetchone()
-    if not row:
-        return {"success": False, "message": "Reminder not found."}
-    return {"success": True}
- 
- 
-# ---------- DELETE ----------
-@app.delete("/reminders/{reminder_id}")
-def delete_reminder(reminder_id: int):
-    with engine.begin() as conn:
-        result = conn.execute(
-            text("DELETE FROM reminders WHERE id=:id RETURNING id"),
-            {"id": reminder_id}
-        )
-        row = result.fetchone()
-    if not row:
-        return {"success": False, "message": "Reminder not found."}
-    return {"success": True}
+    const res = await fetch(
+        `${BASE}/send-remark?task_id=${taskId}&manager_id=${managerId}` +
+        `&employee_id=${employeeId}&remark=${encodeURIComponent(remark)}`,
+        { method: "POST" }
+    ).then(r => r.json());
+
+    if (res.success) {
+        showToast("Correction sent. Task moved back to In Progress.");
+        closeRemarkModal();
+        refreshAll();
+    } else {
+        showToast("Failed to send correction.");
+    }
+}
+
+document.getElementById("remarkModal").addEventListener("click", function(e) {
+    if (e.target === this) closeRemarkModal();
+});
+</script>
+
+<script>
+(function() {
+    const RBASE = "https://backend-production-53f3.up.railway.app";
+    const ruid  = localStorage.getItem("userId");
+    const rrole = localStorage.getItem("userRole") || "employee";
+    if (!ruid) return;
+
+    function priorityClass(p) {
+        if (p === "Critical") return "crit";
+        if (p === "High") return "high";
+        if (p === "Medium") return "med";
+        return "low";
+    }
+    function dot(p) {
+        if (p === "Critical" || p === "High") return "🔴";
+        if (p === "Medium") return "🟠";
+        return "🟡";
+    }
+    function lineFor(days) {
+        if (days < 0) return `Overdue by ${Math.abs(days)} day(s)`;
+        if (days === 0) return "Due Today";
+        if (days === 1) return "Due Tomorrow";
+        return `Due in ${days} Days`;
+    }
+
+    async function loadWidgetAndBell() {
+        let items = [];
+        try {
+            const res = await fetch(`${RBASE}/reminders/today?user_id=${ruid}&role=${rrole}`);
+            items = await res.json();
+        } catch (e) { items = []; }
+
+        renderWidget(items);
+        renderBell(items);
+    }
+
+    function renderWidget(items) {
+        const list = document.getElementById("reminderWidgetList");
+        if (!list) return;
+        if (!items || items.length === 0) {
+            list.innerHTML = `<div style="color:#9ca3af;font-size:14px;padding:6px 2px;">No reminders today.</div>`;
+            return;
+        }
+        list.innerHTML = items.slice(0, 6).map(r => `
+            <div class="reminder-item ${priorityClass(r.priority)}">
+                <span class="reminder-dot">${dot(r.priority)}</span>
+                <div class="reminder-item-body">
+                    <div class="reminder-item-title">${r.title}</div>
+                    <div class="reminder-item-sub">${r.category} • ${lineFor(r.days_remaining)}</div>
+                </div>
+                ${r.amount ? `<div class="reminder-item-amt">₹${Number(r.amount).toLocaleString("en-IN")}</div>` : ""}
+            </div>
+        `).join("");
+    }
+
+    function renderBell(items) {
+        const countEl = document.getElementById("bellCount");
+        const dropEl  = document.getElementById("bellDropdown");
+        if (!countEl || !dropEl) return;
+
+        if (!items || items.length === 0) {
+            countEl.style.display = "none";
+            dropEl.innerHTML = `<div class="bell-dropdown-header">Notifications</div><div class="bell-empty">No reminders today.</div>`;
+            return;
+        }
+        countEl.style.display = "flex";
+        countEl.innerText = items.length > 9 ? "9+" : items.length;
+
+        dropEl.innerHTML = `<div class="bell-dropdown-header">Reminders & Notifications</div>` +
+            items.map(r => `
+                <div class="bell-item" onclick="window.location.href='reminder.html'">
+                    <div class="bell-item-title">${dot(r.priority)} ${r.title}</div>
+                    <div class="bell-item-sub">${r.category} • ${lineFor(r.days_remaining)}</div>
+                </div>
+            `).join("");
+    }
+
+    window.toggleBellDropdown = function() {
+        document.getElementById("bellDropdown").classList.toggle("active");
+    };
+    document.addEventListener("click", function(e) {
+        const wrap = document.getElementById("bellWrap");
+        if (wrap && !wrap.contains(e.target)) {
+            document.getElementById("bellDropdown").classList.remove("active");
+        }
+    });
+
+    loadWidgetAndBell();
+})();
+</script>
+
+</body>
+</html>
