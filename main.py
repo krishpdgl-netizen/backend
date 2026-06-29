@@ -3639,10 +3639,6 @@ def checkin(emp_id: str):
         ).fetchone()
         settings = _get_settings(conn)
 
-    if existing and existing.check_in:
-        ci_disp = str(existing.check_in)[:5]
-        return {"success": False, "message": f"Already checked in at {ci_disp}"}
-
     office_start = settings.get("office_start_time", "09:00")
     grace        = int(settings.get("late_grace_minutes", 10))
     os_h, os_m   = map(int, office_start.split(":"))
@@ -3651,9 +3647,10 @@ def checkin(emp_id: str):
     emp_name     = user.full_name if user else emp_id
 
     if existing:
+        # Always allow re-punch-in: overwrite check_in and clear check_out so the day restarts cleanly
         with engine.begin() as conn:
             conn.execute(
-                text("UPDATE attendance SET check_in=:ci, status='Present', late_minutes=:late, updated_at=NOW() WHERE emp_id=:eid AND att_date=:d"),
+                text("UPDATE attendance SET check_in=:ci, check_out=NULL, working_hours=NULL, overtime=0, status='Present', late_minutes=:late, updated_at=NOW() WHERE emp_id=:eid AND att_date=:d"),
                 {"ci": ci_str, "late": late_mins, "eid": emp_id, "d": today}
             )
     else:
