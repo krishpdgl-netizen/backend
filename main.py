@@ -5089,70 +5089,82 @@ def delete_reminder(reminder_id: int):
 
 
 # ── EXCEL EXPORT ──────────────────────────────────────────
-import pandas as pd
 import io as _io
 from fastapi.responses import StreamingResponse
+from openpyxl import Workbook as _Workbook
+from openpyxl.styles import Font as _Font, PatternFill as _PatternFill
+from fastapi import HTTPException as _HTTPException
 
 EXPORTABLE_TABLES = {
-    # People
-    "users":                    "Users",
-    "team_members":             "Team Members",
-    # Tasks
-    "tasks":                    "Tasks",
-    "task_history":             "Task History",
-    "task_remarks":             "Task Remarks",
-    # Attendance
-    "attendance":               "Attendance",
-    "attendance_audit":         "Attendance Audit",
-    "attendance_corrections":   "Attendance Corrections",
-    "attendance_settings":      "Attendance Settings",
-    "correction_timeline":      "Correction Timeline",
-    # Payroll
-    "payroll":                  "Payroll",
-    "payroll_locks":            "Payroll Locks",
-    "payslips":                 "Payslips",
-    "salary_structure":         "Salary Structure",
-    # Leave & HR
-    "leave_requests":           "Leave Requests",
-    "employee_voice":           "Employee Voice",
-    # Calendar & Meetings
-    "calendar_tasks":           "Calendar Tasks",
-    "meetings":                 "Meetings",
-    "meeting_attendees":        "Meeting Attendees",
-    # Other
-    "reminders":                "Reminders",
-    "holidays":                 "Holidays",
-    "holiday_date":             "Holiday Dates",
-    "letterheads":              "Letterheads",
-    "letterhead_serial_counter":"Letterhead Serial Counter",
+    "users":                     "Users",
+    "team_members":              "Team Members",
+    "tasks":                     "Tasks",
+    "task_history":              "Task History",
+    "task_remarks":              "Task Remarks",
+    "attendance":                "Attendance",
+    "attendance_audit":          "Attendance Audit",
+    "attendance_corrections":    "Attendance Corrections",
+    "attendance_settings":       "Attendance Settings",
+    "correction_timeline":       "Correction Timeline",
+    "payroll":                   "Payroll",
+    "payroll_locks":             "Payroll Locks",
+    "payslips":                  "Payslips",
+    "salary_structure":          "Salary Structure",
+    "leave_requests":            "Leave Requests",
+    "employee_voice":            "Employee Voice",
+    "calendar_tasks":            "Calendar Tasks",
+    "meetings":                  "Meetings",
+    "meeting_attendees":         "Meeting Attendees",
+    "reminders":                 "Reminders",
+    "holidays":                  "Holidays",
+    "holiday_date":              "Holiday Dates",
+    "letterheads":               "Letterheads",
+    "letterhead_serial_counter": "Letterhead Serial Counter",
 }
 
 @app.get("/admin/export/{table_name}")
 def export_table_excel(table_name: str):
     if table_name not in EXPORTABLE_TABLES:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=403, detail="Table not allowed for export.")
+        raise _HTTPException(status_code=403, detail="Table not allowed for export.")
 
     try:
         with engine.connect() as conn:
-            df = pd.read_sql(f'SELECT * FROM "{table_name}"', conn)
+            result = conn.execute(text(f'SELECT * FROM "{table_name}"'))
+            rows    = result.fetchall()
+            columns = list(result.keys())
     except Exception as e:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+        raise _HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+
+    wb = _Workbook()
+    ws = wb.active
+    ws.title = EXPORTABLE_TABLES[table_name][:31]
+
+    # Header row with styling
+    header_font = _Font(bold=True, color="FFFFFF")
+    header_fill = _PatternFill("solid", start_color="1E3A5F")
+    for col_idx, col_name in enumerate(columns, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font  = header_font
+        cell.fill  = header_fill
+
+    # Data rows
+    for row_idx, row in enumerate(rows, start=2):
+        for col_idx, value in enumerate(row, start=1):
+            ws.cell(row=row_idx, column=col_idx, value=str(value) if value is not None else "")
+
+    # Auto-size columns
+    for col in ws.columns:
+        max_len = max(
+            (len(str(cell.value)) if cell.value is not None else 0) for cell in col
+        )
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 55)
 
     output = _io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=EXPORTABLE_TABLES[table_name][:31])
-        ws = writer.sheets[EXPORTABLE_TABLES[table_name][:31]]
-        # Auto-width columns
-        for col in ws.columns:
-            max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col)
-            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
+    wb.save(output)
     output.seek(0)
 
-    filename = f"{table_name}_export.xlsx"
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={"Content-Disposition": f"attachment; filename={table_name}_export.xlsx"}
     )
