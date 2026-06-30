@@ -172,6 +172,47 @@ def create_tables():
             conn.execute(text(
                 "ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS escalated BOOLEAN DEFAULT FALSE"
             ))
+            # Backfill: some approved team_requests rows may never have been
+            # mirrored into team_members (e.g. from before this safeguard
+            # existed). This keeps manager<->employee routing correct
+            # everywhere that reads team_members, not just leave requests.
+            conn.execute(text("""
+                INSERT INTO team_members (manager_id, employee_id)
+                SELECT tr.manager_id, tr.employee_id
+                FROM team_requests tr
+                WHERE tr.status = 'approved'
+                AND NOT EXISTS (
+                    SELECT 1 FROM team_members tm
+                    WHERE tm.manager_id = tr.manager_id
+                    AND   tm.employee_id = tr.employee_id
+                )
+            """))
+            # Re-route any still-pending leave requests whose approver_id
+            # currently points at the requester's own manager mismatch
+            # (e.g. were previously mis-routed straight to admin before the
+            # team_members backfill above ran). Only touches requests from
+            # employees (not managers/admins) so manager->admin escalation
+            # behavior is left untouched.
+            pending_employee_requests = conn.execute(text("""
+                SELECT lr.id, lr.user_id
+                FROM leave_requests lr
+                JOIN users u ON u.id = lr.user_id
+                WHERE lr.status = 'Pending'
+                AND   lr.escalated IS NOT TRUE
+                AND   LOWER(u.role) = 'employee'
+            """)).fetchall()
+            for lr_id, lr_user_id in pending_employee_requests:
+                mgr_row = conn.execute(text("""
+                    SELECT manager_id FROM team_members
+                    WHERE employee_id = :uid
+                    ORDER BY id DESC LIMIT 1
+                """), {"uid": lr_user_id}).first()
+                if mgr_row and mgr_row[0]:
+                    conn.execute(text("""
+                        UPDATE leave_requests
+                        SET approver_id = :mgr_id
+                        WHERE id = :lr_id
+                    """), {"mgr_id": mgr_row[0], "lr_id": lr_id})
     except Exception as e:
         print(f"[startup migration warning] leave_requests/team_members migration failed: {e}")
 
@@ -3010,7 +3051,10 @@ def _resolve_approver(conn, user_id: int) -> Optional[int]:
             ).first()
             return admin_row[0] if admin_row else None
 
-        # default: treat as employee -> look up their manager
+        # default: treat as employee -> look up their manager.
+        # Primary source of truth is team_members, but as a safety net
+        # also check for an approved team_requests row in case that
+        # acceptance never got mirrored into team_members for some reason.
         manager_row = conn.execute(
             text("""
                 SELECT manager_id
@@ -3025,7 +3069,22 @@ def _resolve_approver(conn, user_id: int) -> Optional[int]:
         if manager_row and manager_row[0]:
             return manager_row[0]
 
-        # no manager on record -> escalate straight to admin
+        manager_row = conn.execute(
+            text("""
+                SELECT manager_id
+                FROM team_requests
+                WHERE employee_id = :uid
+                  AND status = 'approved'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """),
+            {"uid": user_id}
+        ).first()
+
+        if manager_row and manager_row[0]:
+            return manager_row[0]
+
+        # truly no manager on record -> escalate straight to admin
         admin_row = conn.execute(
             text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
         ).first()
