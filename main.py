@@ -3940,7 +3940,7 @@ def approve_correction(correction_id: int, data: CorrectionReview):
     if corr["status"] != "Pending":
         return {"success": False, "message": f"Request is already {corr['status']}."}
 
-    payroll_month = corr["att_date"][:7]   # YYYY-MM
+    payroll_month = str(corr["att_date"])[:7]   # YYYY-MM (att_date may be a date object or string)
     payroll_locked = False
 
     with engine.begin() as conn:
