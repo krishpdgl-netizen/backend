@@ -1096,7 +1096,7 @@ def respond_team_request(request_id: int, action: str):
             # Check not already on team (safety guard)
             existing = conn.execute(
                 text("""
-                    SELECT id FROM team_members
+                    SELECT manager_id FROM team_members
                     WHERE manager_id  = :manager_id
                     AND   employee_id = :employee_id
                 """),
@@ -1316,7 +1316,7 @@ def add_team_member(manager_id: int, employee_id: int):
 
             on_team = conn.execute(
                 text("""
-                    SELECT id FROM team_members
+                    SELECT manager_id FROM team_members
                     WHERE manager_id  = :manager_id
                     AND   employee_id = :employee_id
                 """),
