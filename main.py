@@ -1166,26 +1166,113 @@ def manager_tasks(manager_id:int):
     return [dict(row._mapping) for row in rows]
 
 @app.post("/team/add")
-def add_team_member(manager_id:int, employee_id:int):
-
+def add_team_member(manager_id: int, employee_id: int):
     with engine.connect() as conn:
+        # Prevent duplicate pending requests
+        existing = conn.execute(
+            text("""
+                SELECT id FROM team_requests
+                WHERE manager_id = :manager_id
+                AND employee_id  = :employee_id
+                AND status       = 'pending'
+            """),
+            {"manager_id": manager_id, "employee_id": employee_id}
+        ).fetchone()
+
+        if existing:
+            return {"success": False, "message": "A request is already pending for this employee."}
 
         conn.execute(
             text("""
-                INSERT INTO team_members(manager_id, employee_id)
-                VALUES(:manager_id, :employee_id)
+                INSERT INTO team_requests (manager_id, employee_id, status)
+                VALUES (:manager_id, :employee_id, 'pending')
             """),
-            {
-                "manager_id":manager_id,
-                "employee_id":employee_id
-            }
+            {"manager_id": manager_id, "employee_id": employee_id}
         )
-
         conn.commit()
 
-    return {
-        "success":True
-    }
+    return {"success": True}
+
+
+# Employee sees pending requests sent to them
+@app.get("/team-requests")
+def get_team_requests(employee_id: int):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT
+                    tr.id,
+                    tr.manager_id,
+                    tr.created_at,
+                    u.full_name AS manager_name,
+                    u.email     AS manager_email
+                FROM team_requests tr
+                JOIN users u ON u.id = tr.manager_id
+                WHERE tr.employee_id = :employee_id
+                AND   tr.status      = 'pending'
+                ORDER BY tr.created_at DESC
+            """),
+            {"employee_id": employee_id}
+        ).fetchall()
+    return [dict(row._mapping) for row in rows]
+
+
+# Manager sees the status of requests they've sent
+@app.get("/team-requests/sent")
+def get_sent_requests(manager_id: int):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT
+                    tr.id,
+                    tr.employee_id,
+                    tr.status,
+                    tr.created_at,
+                    u.full_name AS employee_name,
+                    u.email     AS employee_email
+                FROM team_requests tr
+                JOIN users u ON u.id = tr.employee_id
+                WHERE tr.manager_id = :manager_id
+                ORDER BY tr.created_at DESC
+            """),
+            {"manager_id": manager_id}
+        ).fetchall()
+    return [dict(row._mapping) for row in rows]
+
+
+# Employee approves or rejects
+@app.post("/team-request/respond")
+def respond_team_request(request_id: int, action: str):
+    if action not in ("approved", "rejected"):
+        return {"success": False, "message": "Invalid action."}
+
+    with engine.begin() as conn:
+        request = conn.execute(
+            text("SELECT * FROM team_requests WHERE id = :id"),
+            {"id": request_id}
+        ).fetchone()
+
+        if not request:
+            return {"success": False, "message": "Request not found."}
+
+        conn.execute(
+            text("UPDATE team_requests SET status = :status WHERE id = :id"),
+            {"status": action, "id": request_id}
+        )
+
+        # Only add to team_members if approved
+        if action == "approved":
+            conn.execute(
+                text("""
+                    INSERT INTO team_members (manager_id, employee_id)
+                    VALUES (:manager_id, :employee_id)
+                    ON CONFLICT DO NOTHING
+                """),
+                {"manager_id": request.manager_id, "employee_id": request.employee_id}
+            )
+
+    return {"success": True}
+
 
 @app.get("/manager-report")
 def manager_report(manager_id:int):
