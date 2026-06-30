@@ -131,18 +131,49 @@ def create_tables():
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS file_name TEXT"
         ))
 
-        # ── leave_requests: routing columns (idempotent) ─────────────
-        # approver_id  -> who currently needs to act on this request
-        #                 (the requester's manager, or an admin if the
-        #                 requester IS a manager / has no manager / was
-        #                 escalated)
-        # escalated    -> true once a manager has forwarded an employee's
-        #                 request up to admin
-        for col_sql in [
-            "ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS approver_id INT",
-            "ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS escalated BOOLEAN DEFAULT FALSE",
-        ]:
-            conn.execute(text(col_sql))
+    # ── leave_requests / team_members migrations ─────────────────────
+    # Run in their OWN transaction, isolated from the block above, and
+    # wrapped in try/except so that if anything here doesn't match an
+    # existing schema, it can never prevent the app from starting up
+    # (which is what previously broke EVERY endpoint, surfacing as a
+    # misleading CORS error in the browser).
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS leave_requests (
+                    id            SERIAL PRIMARY KEY,
+                    user_id       INT NOT NULL,
+                    employee_name TEXT NOT NULL,
+                    leave_type    TEXT NOT NULL,
+                    start_date    DATE NOT NULL,
+                    end_date      DATE NOT NULL,
+                    reason        TEXT DEFAULT '',
+                    status        TEXT DEFAULT 'Pending',
+                    created_at    TIMESTAMP DEFAULT NOW(),
+                    approved_at   TIMESTAMP
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS team_members (
+                    id          SERIAL PRIMARY KEY,
+                    manager_id  INT NOT NULL,
+                    employee_id INT NOT NULL
+                )
+            """))
+            # approver_id -> who currently needs to act on this request
+            #                (the requester's manager, or an admin if the
+            #                requester IS a manager / has no manager / was
+            #                escalated)
+            # escalated   -> true once a manager has forwarded an
+            #                employee's request up to admin
+            conn.execute(text(
+                "ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS approver_id INT"
+            ))
+            conn.execute(text(
+                "ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS escalated BOOLEAN DEFAULT FALSE"
+            ))
+    except Exception as e:
+        print(f"[startup migration warning] leave_requests/team_members migration failed: {e}")
 
 
 # ── CORS ─────────────────────────────────────────────────
@@ -2956,52 +2987,69 @@ def _resolve_approver(conn, user_id: int) -> Optional[int]:
       - manager  -> an admin (managers' leaves go straight to admin)
       - admin    -> no approver (auto, nothing to route)
       - employee with no manager assigned -> fall back to an admin
+
+    Defensive by design: if anything here goes wrong (e.g. an
+    unexpected schema), we log it and return None rather than letting
+    leave submission fail outright.
     """
-    user_row = conn.execute(
-        text("SELECT role FROM users WHERE id = :uid"),
-        {"uid": user_id}
-    ).mappings().first()
+    try:
+        user_row = conn.execute(
+            text("SELECT role FROM users WHERE id = :uid"),
+            {"uid": user_id}
+        ).mappings().first()
 
-    role = (user_row["role"] if user_row else "") or ""
-    role = role.lower()
+        role = (user_row["role"] if user_row else "") or ""
+        role = role.lower()
 
-    if role == "admin":
-        return None
+        if role == "admin":
+            return None
 
-    if role == "manager":
+        if role == "manager":
+            admin_row = conn.execute(
+                text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+            ).first()
+            return admin_row[0] if admin_row else None
+
+        # default: treat as employee -> look up their manager
+        manager_row = conn.execute(
+            text("""
+                SELECT manager_id
+                FROM team_members
+                WHERE employee_id = :uid
+                ORDER BY id DESC
+                LIMIT 1
+            """),
+            {"uid": user_id}
+        ).first()
+
+        if manager_row and manager_row[0]:
+            return manager_row[0]
+
+        # no manager on record -> escalate straight to admin
         admin_row = conn.execute(
             text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
         ).first()
         return admin_row[0] if admin_row else None
-
-    # default: treat as employee -> look up their manager
-    manager_row = conn.execute(
-        text("""
-            SELECT manager_id
-            FROM team_members
-            WHERE employee_id = :uid
-            ORDER BY id DESC
-            LIMIT 1
-        """),
-        {"uid": user_id}
-    ).first()
-
-    if manager_row and manager_row[0]:
-        return manager_row[0]
-
-    # no manager on record -> escalate straight to admin
-    admin_row = conn.execute(
-        text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
-    ).first()
-    return admin_row[0] if admin_row else None
+    except Exception as e:
+        print(f"[_resolve_approver warning] could not resolve approver for user {user_id}: {e}")
+        return None
 
 
 @app.post("/leave-requests")
 def create_leave_request(data: LeaveRequest):
 
-    with engine.begin() as conn:
+    # Resolve the approver in its own connection/transaction first, so
+    # that if this lookup ever fails for any reason, it can't poison the
+    # transaction used for the actual insert below.
+    approver_id = None
+    try:
+        with engine.connect() as lookup_conn:
+            approver_id = _resolve_approver(lookup_conn, data.user_id)
+    except Exception as e:
+        print(f"[create_leave_request warning] approver lookup failed: {e}")
+        approver_id = None
 
-        approver_id = _resolve_approver(conn, data.user_id)
+    with engine.begin() as conn:
 
         result = conn.execute(
             text("""
