@@ -3991,9 +3991,27 @@ def checkin(emp_id: str):
     emp_name     = user.full_name if user else emp_id
 
     if existing and existing.check_in:
-        # Already checked in — return the existing record id so frontend can handle re-punch via PUT
-        ci_disp = str(existing.check_in)[:5]
-        return {"success": False, "already_checked_in": True, "record_id": existing.id, "check_in": ci_disp, "message": f"Already checked in at {ci_disp}"}
+        # Already punched in today (possibly already checked out too).
+        # Re-punching in restarts today's record cleanly: reset check_out/hours/overtime
+        # explicitly here (rather than relying on a generic PATCH, which ignores null
+        # values and would leave a stale check_out behind).
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE attendance
+                    SET check_in=:ci, check_out=NULL, working_hours=NULL, overtime=0,
+                        status='Present', late_minutes=:late, updated_at=NOW()
+                    WHERE emp_id=:eid AND att_date=:d
+                """),
+                {"ci": ci_str, "late": late_mins, "eid": emp_id, "d": today}
+            )
+        return {
+            "success": True,
+            "check_in": ci_str,
+            "late_minutes": late_mins,
+            "restarted": True,
+            "message": f"Punched in at {ci_str}" + (f" ({late_mins} min late)" if late_mins > 0 else "")
+        }
 
     if existing:
         with engine.begin() as conn:
