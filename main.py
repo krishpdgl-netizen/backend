@@ -1143,8 +1143,7 @@ def manager_tasks(manager_id:int):
                     tasks.assigned_to,
                     tasks.priority,
                     tasks.status,
-                    tasks.due_date,
-                    tasks.created_at
+                    tasks.due_date
 
                 FROM tasks
 
