@@ -113,7 +113,8 @@ def create_tables():
                 response_status TEXT DEFAULT 'pending'
             )
         """))
-
+        conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS file_url TEXT"))
+        conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS file_name TEXT"))
 
 # ── CORS ─────────────────────────────────────────────────
 # allow_origins=["*"] with allow_credentials=False is correct.
@@ -929,30 +930,25 @@ def approve_task(task_id:int):
 
 
 @app.get("/review-tasks")
-def review_tasks(manager_id:int):
-
+def review_tasks(manager_id: int):
     with engine.connect() as conn:
-
         rows = conn.execute(
             text("""
-            SELECT *
-            FROM tasks
-
-            WHERE assigned_to IN(
-
-                SELECT employee_id
-                FROM team_members
-                WHERE manager_id=:manager_id
-
-            )
-
-            AND LOWER(status)='pending review'
+                SELECT
+                    tasks.*,
+                    users.full_name AS employee_name
+                FROM tasks
+                JOIN users ON users.id = tasks.assigned_to
+                WHERE tasks.assigned_to IN (
+                    SELECT employee_id
+                    FROM team_members
+                    WHERE manager_id = :manager_id
+                )
+                AND LOWER(tasks.status) = 'pending review'
             """),
-            {"manager_id":manager_id}
+            {"manager_id": manager_id}
         ).fetchall()
-
     return [dict(row._mapping) for row in rows]
-
 
 @app.post("/team/remove")
 def remove_team_member(manager_id:int,
