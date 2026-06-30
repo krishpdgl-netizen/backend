@@ -160,6 +160,29 @@ async def preflight_handler(rest_of_path: str, request: Request):
             "Access-Control-Max-Age":       "600",
         },
     )
+
+# ── GLOBAL ERROR HANDLER ─────────────────────────────────
+# Railway's proxy sometimes strips CORS headers from raw 500 responses
+# that bubble up from an unhandled exception, which makes the browser
+# report a misleading "CORS policy" error instead of the real failure.
+# This handler guarantees every error response still carries CORS
+# headers, and logs the real exception server-side.
+import traceback
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print(f"[UNHANDLED ERROR] {request.method} {request.url} -> {exc}", flush=True)
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"success": False, "message": f"Internal server error: {exc}"},
+        headers={
+            "Access-Control-Allow-Origin":  "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
 DATABASE_URL = "postgresql://postgres:OJKDsedhwgqyuvTubYNEJssZeJkRUgiS@thomas.proxy.rlwy.net:22127/railway"
 
 engine = create_engine(
@@ -1277,37 +1300,49 @@ def manager_tasks(manager_id:int):
 
 @app.post("/team/add")
 def add_team_member(manager_id: int, employee_id: int):
-    with engine.connect() as conn:
-        existing = conn.execute(
-            text("""
-                SELECT id FROM team_requests
-                WHERE manager_id  = :manager_id
-                AND   employee_id = :employee_id
-                AND   status      = 'pending'
-            """),
-            {"manager_id": manager_id, "employee_id": employee_id}
-        ).fetchone()
-        if existing:
-            return {"success": False, "message": "A request is already pending for this employee."}
-        on_team = conn.execute(
-            text("""
-                SELECT id FROM team_members
-                WHERE manager_id  = :manager_id
-                AND   employee_id = :employee_id
-            """),
-            {"manager_id": manager_id, "employee_id": employee_id}
-        ).fetchone()
-        if on_team:
-            return {"success": False, "message": "This employee is already on your team."}
-        conn.execute(
-            text("""
-                INSERT INTO team_requests (manager_id, employee_id, status)
-                VALUES (:manager_id, :employee_id, 'pending')
-            """),
-            {"manager_id": manager_id, "employee_id": employee_id}
-        )
-        conn.commit()
-    return {"success": True}
+    try:
+        with engine.begin() as conn:
+            existing = conn.execute(
+                text("""
+                    SELECT id FROM team_requests
+                    WHERE manager_id  = :manager_id
+                    AND   employee_id = :employee_id
+                    AND   status      = 'pending'
+                """),
+                {"manager_id": manager_id, "employee_id": employee_id}
+            ).fetchone()
+            if existing:
+                return {"success": False, "message": "A request is already pending for this employee."}
+
+            on_team = conn.execute(
+                text("""
+                    SELECT id FROM team_members
+                    WHERE manager_id  = :manager_id
+                    AND   employee_id = :employee_id
+                """),
+                {"manager_id": manager_id, "employee_id": employee_id}
+            ).fetchone()
+            if on_team:
+                return {"success": False, "message": "This employee is already on your team."}
+
+            target_user = conn.execute(
+                text("SELECT id FROM users WHERE id = :id"),
+                {"id": employee_id}
+            ).fetchone()
+            if not target_user:
+                return {"success": False, "message": "Employee not found."}
+
+            conn.execute(
+                text("""
+                    INSERT INTO team_requests (manager_id, employee_id, status)
+                    VALUES (:manager_id, :employee_id, 'pending')
+                """),
+                {"manager_id": manager_id, "employee_id": employee_id}
+            )
+        return {"success": True}
+    except Exception as e:
+        print(f"[ERROR] /team/add failed: {e}", flush=True)
+        return {"success": False, "message": f"Server error: {e}"}
 
 @app.get("/manager-report")
 def manager_report(manager_id:int):
