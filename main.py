@@ -3416,15 +3416,19 @@ def _working_days_in_month(year: int, month: int) -> int:
 
 def _get_settings(conn) -> dict:
     row = conn.execute(text("SELECT * FROM attendance_settings WHERE id=1")).mappings().fetchone()
-    if row:
-        return dict(row)
-    return {
+    settings = dict(row) if row else {
         "correction_window_hours": 24,
         "standard_work_hours": 9.0,
         "late_grace_minutes": 10,
         "overtime_after_hours": 9.0,
         "office_start_time": "09:00",
     }
+    # Postgres TIME columns come back as datetime.time objects, not strings.
+    # Normalize to "HH:MM" so downstream .split(":") calls always work.
+    ost = settings.get("office_start_time")
+    if ost is not None and not isinstance(ost, str):
+        settings["office_start_time"] = ost.strftime("%H:%M")
+    return settings
 
 
 # ================================================================
