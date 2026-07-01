@@ -4757,7 +4757,18 @@ def lock_payroll(month: str, locked_by: str = "HR Admin"):
             return {"success": False, "message": "Payroll is already locked for this month."}
 
         payroll_rows = conn.execute(
-            text("SELECT p.*, s.* FROM payroll p LEFT JOIN salary_structure s ON p.emp_id=s.emp_id WHERE p.payroll_month=:m"),
+            text("""
+                SELECT
+                    p.id AS payroll_id, p.payroll_month, p.emp_id, p.emp_name, p.department,
+                    p.working_days, p.present_days, p.leave_days, p.lop_days, p.overtime_hours,
+                    p.gross_salary, p.pf_deduction, p.esic_deduction, p.pt_deduction, p.it_deduction,
+                    p.other_deductions, p.lop_deduction, p.total_deductions, p.net_salary,
+                    s.basic_salary, s.hra, s.special_allowance, s.travel_allowance,
+                    s.medical_allowance, s.bonus, s.incentives
+                FROM payroll p
+                LEFT JOIN salary_structure s ON p.emp_id = s.emp_id
+                WHERE p.payroll_month=:m
+            """),
             {"m": month}
         ).mappings().all()
 
@@ -4834,7 +4845,7 @@ def lock_payroll(month: str, locked_by: str = "HR Admin"):
                     "lop_ded": row["lop_deduction"],
                     "total_ded": row["total_deductions"],
                     "net":   row["net_salary"],
-                    "pr_id": row["id"],
+                    "pr_id": row["payroll_id"],
                 }
             )
 
