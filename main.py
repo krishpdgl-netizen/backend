@@ -703,7 +703,7 @@ def get_employees():
                 email,
                 role
                 FROM users
-                WHERE role='employee'
+                WHERE role IN ('employee', 'intern')
             """)
         )
 
@@ -781,7 +781,7 @@ def employee_performance():
             LEFT JOIN tasks t
             ON u.id=t.assigned_to
 
-            WHERE u.role='employee'
+            WHERE u.role IN ('employee', 'intern')
 
             GROUP BY u.id,u.full_name
             """)
