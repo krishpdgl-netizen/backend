@@ -4189,6 +4189,20 @@ class PrintLogRequest(BaseModel):
     given_to:       str
 
 
+# print_logs.printed_at is stored as clock-time IST (not UTC). We deliberately
+# compute it in Python rather than relying on the DB's NOW() (which is UTC on
+# Railway's Postgres), then always hand it back to clients with an explicit
+# "+05:30" suffix so nothing downstream can misinterpret it as UTC.
+def _ist_now_naive():
+    return datetime.now(ZoneInfo("Asia/Kolkata")).replace(microsecond=0, tzinfo=None)
+
+
+def _fmt_ist(dt):
+    if dt is None:
+        return None
+    return dt.isoformat() + "+05:30"
+
+
 # ── CREATE: log a print action (server time + identity are authoritative) ──
 @app.post("/print-logs")
 def create_print_log(data: PrintLogRequest, user: dict = Depends(get_current_user)):
@@ -4200,14 +4214,15 @@ def create_print_log(data: PrintLogRequest, user: dict = Depends(get_current_use
                 {"id": user_id}
             ).fetchone()
         user_name = name_row.full_name if name_row else "User"
+        printed_at_ist = _ist_now_naive()
 
         with engine.begin() as conn:
             row = conn.execute(
                 text("""
                     INSERT INTO print_logs
-                        (user_id, user_name, document_title, printed_for, given_to)
+                        (user_id, user_name, document_title, printed_for, given_to, printed_at)
                     VALUES
-                        (:user_id, :user_name, :document_title, :printed_for, :given_to)
+                        (:user_id, :user_name, :document_title, :printed_for, :given_to, :printed_at)
                     RETURNING id, printed_at
                 """),
                 {
@@ -4216,12 +4231,13 @@ def create_print_log(data: PrintLogRequest, user: dict = Depends(get_current_use
                     "document_title": data.document_title,
                     "printed_for":    data.printed_for,
                     "given_to":       data.given_to,
+                    "printed_at":     printed_at_ist,
                 }
             ).fetchone()
         return {
             "success": True,
             "id": row.id,
-            "printed_at": row.printed_at.isoformat(),
+            "printed_at": _fmt_ist(row.printed_at),
             "user_name": user_name,
         }
     except Exception as e:
@@ -4240,7 +4256,12 @@ def get_my_print_logs(user: dict = Depends(get_current_user)):
             """),
             {"uid": user["uid"]}
         ).mappings().all()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["printed_at"] = _fmt_ist(d.get("printed_at"))
+        out.append(d)
+    return out
 
 
 # ── LIST: admin-only organization-wide print log ────────────────
@@ -4250,7 +4271,12 @@ def get_print_logs(_admin: dict = Depends(require_roles("admin"))):
         rows = conn.execute(
             text("SELECT * FROM print_logs ORDER BY printed_at DESC")
         ).mappings().all()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["printed_at"] = _fmt_ist(d.get("printed_at"))
+        out.append(d)
+    return out
 
 
 # ── STATS: admin-only summary cards ─────────────────────────────
