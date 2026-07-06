@@ -18,6 +18,9 @@ from excel_helper import (
 )
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from datetime import date, timedelta
+import json
+import secrets
 from pydantic import BaseModel
 from typing import List
 from sqlalchemy import text
@@ -31,6 +34,7 @@ class MeetingRequest(BaseModel):
     location: str = ""
     attendees: List[int]
 import requests
+from pywebpush import webpush, WebPushException
 import os
 from pydantic import BaseModel
 from typing import Optional
@@ -39,6 +43,7 @@ class LeaveRequest(BaseModel):
     user_id: int
     employee_name: str
     leave_type: str
+    leave_type_id: Optional[int] = None
     start_date: str
     end_date: str
     reason: str
@@ -216,6 +221,92 @@ def create_tables():
     except Exception as e:
         print(f"[startup migration warning] leave_requests/team_members migration failed: {e}")
 
+    # ── password reset / push notifications / leave balances ─────────
+    # Own isolated try/except, same reasoning as above: a problem here
+    # must never prevent the whole app from starting.
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     INT NOT NULL,
+                    token       TEXT NOT NULL UNIQUE,
+                    expires_at  TIMESTAMP NOT NULL,
+                    used        BOOLEAN DEFAULT FALSE,
+                    created_at  TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS push_subscriptions (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     INT NOT NULL,
+                    endpoint    TEXT NOT NULL UNIQUE,
+                    p256dh      TEXT NOT NULL,
+                    auth        TEXT NOT NULL,
+                    created_at  TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS leave_types (
+                    id                 SERIAL PRIMARY KEY,
+                    name               TEXT NOT NULL UNIQUE,
+                    annual_quota       NUMERIC,             -- NULL = not balance-tracked (e.g. WFH)
+                    carry_forward      BOOLEAN DEFAULT FALSE,
+                    is_balance_tracked BOOLEAN DEFAULT TRUE,
+                    created_at         TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS leave_balances (
+                    id            SERIAL PRIMARY KEY,
+                    user_id       INT NOT NULL,
+                    leave_type_id INT NOT NULL REFERENCES leave_types(id),
+                    year          INT NOT NULL,
+                    allocated     NUMERIC NOT NULL DEFAULT 0,
+                    used          NUMERIC NOT NULL DEFAULT 0,
+                    created_at    TIMESTAMP DEFAULT NOW(),
+                    UNIQUE (user_id, leave_type_id, year)
+                )
+            """))
+            # Link leave_requests to a real leave type + day count, without
+            # touching the existing free-text leave_type column (old rows
+            # keep working, nothing already stored gets orphaned).
+            conn.execute(text("ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS leave_type_id INT"))
+            conn.execute(text("ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS days NUMERIC"))
+
+            # Seed sensible default leave types, once.
+            existing_types = conn.execute(text("SELECT COUNT(*) FROM leave_types")).scalar()
+            if existing_types == 0:
+                conn.execute(text("""
+                    INSERT INTO leave_types (name, annual_quota, carry_forward, is_balance_tracked) VALUES
+                    ('Casual Leave', 12, FALSE, TRUE),
+                    ('Sick Leave', 8, FALSE, TRUE),
+                    ('Earned Leave', 15, TRUE, TRUE),
+                    ('Maternity / Paternity Leave', 90, FALSE, TRUE),
+                    ('Work From Home', NULL, FALSE, FALSE),
+                    ('Half Day', NULL, FALSE, FALSE)
+                """))
+    except Exception as e:
+        print(f"[startup migration warning] password reset / push / leave balance migration failed: {e}")
+
+    # ── print tracking (Print Center) ─────────────────────────────
+    # Own isolated try/except, same reasoning as above.
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS print_logs (
+                    id              SERIAL PRIMARY KEY,
+                    user_id         INT NOT NULL,
+                    user_name       TEXT NOT NULL,
+                    document_title  TEXT DEFAULT '',
+                    printed_for     TEXT NOT NULL,
+                    given_to        TEXT NOT NULL,
+                    printed_at      TIMESTAMP DEFAULT NOW()
+                )
+            """))
+    except Exception as e:
+        print(f"[startup migration warning] print_logs migration failed: {e}")
+
 
 # ── CORS ─────────────────────────────────────────────────
 # allow_origins=["*"] with allow_credentials=False is correct.
@@ -245,12 +336,76 @@ async def preflight_handler(rest_of_path: str, request: Request):
             "Access-Control-Max-Age":       "600",
         },
     )
-DATABASE_URL = "postgresql://postgres:OJKDsedhwgqyuvTubYNEJssZeJkRUgiS@thomas.proxy.rlwy.net:22127/railway"
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:OJKDsedhwgqyuvTubYNEJssZeJkRUgiS@thomas.proxy.rlwy.net:22127/railway"
+)
 
 engine = create_engine(
     DATABASE_URL,
     connect_args={"sslmode":"require"}
 )
+
+# ================================================================
+# AUTH -- signed session tokens + role guards
+# ================================================================
+import hmac, hashlib, base64
+import json as _auth_json
+import time as _auth_time
+from fastapi import Header, Depends, HTTPException
+
+AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY", "panache-dev-secret-CHANGE-ME-IN-PRODUCTION")
+TOKEN_VALID_HOURS = 12
+
+
+def _create_token(user_id: int, role: str) -> str:
+    payload = {
+        "uid": user_id,
+        "role": role,
+        "exp": int(_auth_time.time()) + TOKEN_VALID_HOURS * 3600,
+    }
+    raw = _auth_json.dumps(payload, separators=(",", ":")).encode()
+    payload_b64 = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    sig = hmac.new(AUTH_SECRET_KEY.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+    return f"{payload_b64}.{sig}"
+
+
+def _verify_token(token: str):
+    try:
+        payload_b64, sig = token.split(".", 1)
+        expected_sig = hmac.new(AUTH_SECRET_KEY.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = _auth_json.loads(base64.urlsafe_b64decode(padded))
+        if payload.get("exp", 0) < _auth_time.time():
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def get_current_user(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Not logged in. Please log in again.")
+    token = authorization.split(" ", 1)[1].strip()
+    payload = _verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Session expired or invalid. Please log in again.")
+    return payload
+
+
+def require_roles(*roles):
+    def _checker(user: dict = Depends(get_current_user)):
+        if user["role"] not in roles:
+            raise HTTPException(status_code=403, detail="You don't have permission to do that.")
+        return user
+    return _checker
+
+
+def _ist_today():
+    return datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
 
 def slot_to_time(slot):
 
@@ -264,7 +419,7 @@ def home():
     return {"message":"Panache API Running"}
 
 @app.post("/create-user")
-def create_user():
+def create_user(_admin: dict = Depends(require_roles("admin"))):
 
     with engine.connect() as conn:
 
@@ -308,18 +463,118 @@ def login(email: str, password: str):
         user = result.fetchone()
 
     if user:
+        token = _create_token(user.id, user.role)
         return {
     "success": True,
     "id": user.id,
     "name": user.full_name,
     "email": user.email,
-    "role": user.role
+    "role": user.role,
+    "token": token
      
     }
 
     return {
         "success": False
     }
+
+
+# ── PASSWORD RESET ─────────────────────────────────────────
+# Frontend origin the reset link points back to.
+FRONTEND_URL = "https://panache-workforce-management.vercel.app"
+
+
+@app.post("/forgot-password")
+def forgot_password(email: str):
+    user = None
+    token = None
+
+    with engine.begin() as conn:
+        user = conn.execute(
+            text("SELECT id, full_name FROM users WHERE email=:email"), {"email": email}
+        ).mappings().first()
+
+        if user:
+            token = secrets.token_urlsafe(32)
+            expires = datetime.utcnow() + timedelta(minutes=30)
+            conn.execute(
+                text("""
+                    INSERT INTO password_reset_tokens (user_id, token, expires_at)
+                    VALUES (:uid, :token, :exp)
+                """),
+                {"uid": user["id"], "token": token, "exp": expires}
+            )
+
+    # Send the email outside the transaction. Always return the SAME
+    # generic message regardless of whether the account existed, so this
+    # endpoint can't be used to check which emails are registered.
+    if user:
+        try:
+            reset_link = f"{FRONTEND_URL}/reset-password.html?token={token}"
+            send_email(
+                email,
+                "Reset your Panache WMS password",
+                f"""
+                <h2>Password Reset Requested</h2>
+                <p>Hi {user['full_name']},</p>
+                <p>Click the link below to set a new password. This link expires in 30 minutes.</p>
+                <p><a href="{reset_link}">{reset_link}</a></p>
+                <p>If you didn't request this, you can safely ignore this email — your password won't change.</p>
+                <p>Regards,<br>Panache WMS</p>
+                """
+            )
+        except Exception as e:
+            print(f"[forgot-password email warning] {e}")
+
+    return {
+        "success": True,
+        "message": "If that email is registered, a reset link has been sent."
+    }
+
+
+@app.get("/verify-reset-token")
+def verify_reset_token(token: str):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT expires_at, used FROM password_reset_tokens WHERE token=:token"),
+            {"token": token}
+        ).mappings().first()
+
+    if not row:
+        return {"valid": False, "reason": "not_found"}
+    if row["used"]:
+        return {"valid": False, "reason": "already_used"}
+    if row["expires_at"] < datetime.utcnow():
+        return {"valid": False, "reason": "expired"}
+    return {"valid": True}
+
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    new_password: str
+
+
+@app.post("/reset-password")
+def reset_password(data: ResetPasswordIn):
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT id, user_id, expires_at, used FROM password_reset_tokens WHERE token=:token"),
+            {"token": data.token}
+        ).mappings().first()
+
+        if not row:
+            return {"success": False, "message": "Invalid or expired reset link."}
+        if row["used"]:
+            return {"success": False, "message": "This reset link has already been used."}
+        if row["expires_at"] < datetime.utcnow():
+            return {"success": False, "message": "This reset link has expired. Please request a new one."}
+        if len(data.new_password) < 6:
+            return {"success": False, "message": "Password must be at least 6 characters."}
+
+        conn.execute(text("UPDATE users SET password=:pw WHERE id=:uid"), {"pw": data.new_password, "uid": row["user_id"]})
+        conn.execute(text("UPDATE password_reset_tokens SET used=TRUE WHERE id=:id"), {"id": row["id"]})
+
+    return {"success": True, "message": "Password updated successfully. You can now log in."}
 
 
 @app.post("/register")
@@ -480,6 +735,11 @@ def create_task(
 
         conn.commit()
 
+    try:
+        send_push(assigned_to, "New Task Assigned 📋", f"{title} — due {due_date}")
+    except Exception as e:
+        print(f"[push warning] {e}")
+
     return {
         "success": True,
         "message": "Task created"
@@ -509,6 +769,43 @@ def my_tasks(user_id: int):
         ]
 
     return tasks
+
+
+@app.post("/cron/task-due-reminders")
+def task_due_reminders():
+    """
+    Pushes one reminder per employee for tasks due TODAY that aren't done
+    yet. Not triggered automatically — schedule an external cron (Railway
+    Cron, cron-job.org, GitHub Actions, etc) to POST here once a day.
+    """
+    today = date.today().isoformat()
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT assigned_to, COUNT(*) AS cnt
+                FROM tasks
+                WHERE due_date = :today
+                AND status NOT IN ('Completed', 'Pending Review')
+                GROUP BY assigned_to
+            """),
+            {"today": today}
+        ).mappings().all()
+
+    sent = 0
+    for row in rows:
+        try:
+            n = row["cnt"]
+            send_push(
+                row["assigned_to"],
+                "Task Due Today ⏰",
+                f"You have {n} task{'s' if n != 1 else ''} due today."
+            )
+            sent += 1
+        except Exception as e:
+            print(f"[push warning] {e}")
+
+    return {"success": True, "reminders_sent": sent}
+
 
 @app.put("/update-task-status")
 def update_task_status(
@@ -737,7 +1034,7 @@ def get_all_tasks():
 
 
 @app.post("/delete-task")
-def delete_task(task_id:int):
+def delete_task(task_id:int, _staff: dict = Depends(require_roles("admin", "manager"))):
 
     with engine.connect() as conn:
 
@@ -985,7 +1282,7 @@ def employee_details(user_id:int):
     return dict(employee._mapping)
 
 @app.post("/approve-task")
-def approve_task(task_id:int):
+def approve_task(task_id:int, _staff: dict = Depends(require_roles("admin", "manager"))):
 
     with engine.connect() as conn:
 
@@ -1055,7 +1352,8 @@ def review_tasks(manager_id: int):
 
 @app.post("/team/remove")
 def remove_team_member(manager_id:int,
-                       employee_id:int):
+                       employee_id:int,
+                       _staff: dict = Depends(require_roles("admin", "manager"))):
 
     print("manager =", manager_id)
     print("employee =", employee_id)
@@ -1361,7 +1659,7 @@ def manager_tasks(manager_id:int):
     return [dict(row._mapping) for row in rows]
 
 @app.post("/team/add")
-def add_team_member(manager_id: int, employee_id: int):
+def add_team_member(manager_id: int, employee_id: int, _staff: dict = Depends(require_roles("admin", "manager"))):
     with engine.connect() as conn:
         existing = conn.execute(
             text("""
@@ -1522,7 +1820,7 @@ def manager_report(manager_id:int):
 
     }
 @app.post("/delete-user")
-def delete_user(user_id: int):
+def delete_user(user_id: int, _admin: dict = Depends(require_roles("admin"))):
 
     with engine.connect() as conn:
 
@@ -1650,7 +1948,7 @@ def get_all_users():
  
 # ── UPDATE USER ROLE ─────────────────────────────────────────────
 @app.post("/update-role")
-def update_role(user_id: int, new_role: str):
+def update_role(user_id: int, new_role: str, _admin: dict = Depends(require_roles("admin"))):
     valid_roles = ["employee", "manager", "admin"]
     if new_role not in valid_roles:
         return {"success": False, "message": "Invalid role"}
@@ -2945,6 +3243,102 @@ def test_email():
 
     return result
 
+
+# ── WEB PUSH NOTIFICATIONS ────────────────────────────────
+# VAPID key pair identifies this server to push services (Chrome/FCM etc).
+# Generated once — the private key must stay secret. It's fine hardcoded
+# here in the same way DATABASE_URL is, but can be moved to an env var
+# (VAPID_PRIVATE_KEY) later without changing any other code.
+VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", """-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgVtRyMHbi7bvYntxV
+4ABOS8En2ntbgGqgGVNR6fA9/+uhRANCAARJyJjPkQmN9eWwto5jq6Gefk2zVj9E
+7Uqp77Bf5kz/Mms6h8S2ukGr1p4/oZ5nR1/DimNWSTyy2QMrlTYGBU50
+-----END PRIVATE KEY-----
+""")
+VAPID_PUBLIC_KEY = os.getenv(
+    "VAPID_PUBLIC_KEY",
+    "BEnImM-RCY315bC2jmOroZ5-TbNWP0TtSqnvsF_mTP8yazqHxLa6QavWnj-hnmdHX8OKY1ZJPLLZAyuVNgYFTnQ"
+)
+VAPID_CLAIMS = {"sub": "mailto:admin@panache-wms.example"}
+
+
+@app.get("/push/vapid-public-key")
+def get_vapid_public_key():
+    return {"publicKey": VAPID_PUBLIC_KEY}
+
+
+class PushSubscriptionIn(BaseModel):
+    user_id: int
+    endpoint: str
+    p256dh: str
+    auth: str
+
+
+@app.post("/push/subscribe")
+def push_subscribe(data: PushSubscriptionIn):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+                VALUES (:uid, :endpoint, :p256dh, :auth)
+                ON CONFLICT (endpoint) DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    p256dh  = EXCLUDED.p256dh,
+                    auth    = EXCLUDED.auth
+            """),
+            {"uid": data.user_id, "endpoint": data.endpoint, "p256dh": data.p256dh, "auth": data.auth}
+        )
+    return {"success": True}
+
+
+class PushUnsubscribeIn(BaseModel):
+    endpoint: str
+
+
+@app.post("/push/unsubscribe")
+def push_unsubscribe(data: PushUnsubscribeIn):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM push_subscriptions WHERE endpoint=:endpoint"), {"endpoint": data.endpoint})
+    return {"success": True}
+
+
+def send_push(user_id, title, body, url=None):
+    """
+    Sends a web push notification to every device this user is subscribed on.
+    Never raises — a failed/expired subscription is silently cleaned up, and
+    any other error is logged so it can never break the calling endpoint
+    (task creation, payroll lock, leave approval, etc).
+    """
+    try:
+        with engine.begin() as conn:
+            subs = conn.execute(
+                text("SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE user_id=:uid"),
+                {"uid": user_id}
+            ).mappings().all()
+
+            payload = json.dumps({"title": title, "body": body, "url": url or "index.html"})
+
+            for sub in subs:
+                try:
+                    webpush(
+                        subscription_info={
+                            "endpoint": sub["endpoint"],
+                            "keys": {"p256dh": sub["p256dh"], "auth": sub["auth"]}
+                        },
+                        data=payload,
+                        vapid_private_key=VAPID_PRIVATE_KEY,
+                        vapid_claims=dict(VAPID_CLAIMS)
+                    )
+                except WebPushException as e:
+                    status = getattr(e.response, "status_code", None)
+                    if status in (404, 410):
+                        # Subscription is dead (user uninstalled / cleared data) — remove it.
+                        conn.execute(text("DELETE FROM push_subscriptions WHERE id=:id"), {"id": sub["id"]})
+                    else:
+                        print(f"[push warning] user {user_id}: {e}")
+    except Exception as e:
+        print(f"[send_push warning] user {user_id}: {e}")
+
 from sqlalchemy import text
 
 def send_sales_projection_reminders():
@@ -3094,6 +3488,88 @@ def _resolve_approver(conn, user_id: int) -> Optional[int]:
         return None
 
 
+# ── LEAVE TYPES & BALANCES ────────────────────────────────
+@app.get("/leave-types")
+def get_leave_types():
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT * FROM leave_types ORDER BY id")).mappings().all()
+    return rows
+
+
+class LeaveTypeIn(BaseModel):
+    name: str
+    annual_quota: Optional[float] = None
+    carry_forward: bool = False
+    is_balance_tracked: bool = True
+
+
+@app.post("/leave-types")
+def upsert_leave_type(data: LeaveTypeIn, _admin: dict = Depends(require_roles("admin"))):
+    """Admin: create a new leave type, or update one if the name already exists."""
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO leave_types (name, annual_quota, carry_forward, is_balance_tracked)
+                VALUES (:name, :quota, :cf, :bt)
+                ON CONFLICT (name) DO UPDATE SET
+                    annual_quota       = EXCLUDED.annual_quota,
+                    carry_forward      = EXCLUDED.carry_forward,
+                    is_balance_tracked = EXCLUDED.is_balance_tracked
+            """),
+            {"name": data.name, "quota": data.annual_quota, "cf": data.carry_forward, "bt": data.is_balance_tracked}
+        )
+    return {"success": True}
+
+
+def _get_or_create_balance(conn, user_id, leave_type_id, year):
+    """
+    Lazily ensures a leave_balances row exists for this user/type/year,
+    allocating from that leave type's annual_quota the first time it's
+    touched. Must be called with an already-open (engine.begin()) conn.
+    """
+    row = conn.execute(
+        text("SELECT allocated, used FROM leave_balances WHERE user_id=:uid AND leave_type_id=:ltid AND year=:yr"),
+        {"uid": user_id, "ltid": leave_type_id, "yr": year}
+    ).mappings().first()
+    if row:
+        return row
+
+    lt = conn.execute(text("SELECT annual_quota FROM leave_types WHERE id=:id"), {"id": leave_type_id}).mappings().first()
+    allocated = lt["annual_quota"] if lt and lt["annual_quota"] is not None else 0
+
+    conn.execute(
+        text("""
+            INSERT INTO leave_balances (user_id, leave_type_id, year, allocated, used)
+            VALUES (:uid, :ltid, :yr, :alloc, 0)
+        """),
+        {"uid": user_id, "ltid": leave_type_id, "yr": year, "alloc": allocated}
+    )
+    return {"allocated": allocated, "used": 0}
+
+
+@app.get("/leave-balance")
+def get_leave_balance(user_id: int, year: Optional[int] = None):
+    yr = year or datetime.utcnow().year
+    with engine.begin() as conn:
+        types = conn.execute(text("SELECT id, name, is_balance_tracked FROM leave_types ORDER BY id")).mappings().all()
+        out = []
+        for lt in types:
+            if not lt["is_balance_tracked"]:
+                out.append({
+                    "leave_type_id": lt["id"], "name": lt["name"],
+                    "allocated": None, "used": None, "remaining": None
+                })
+                continue
+            bal = _get_or_create_balance(conn, user_id, lt["id"], yr)
+            allocated = float(bal["allocated"])
+            used = float(bal["used"])
+            out.append({
+                "leave_type_id": lt["id"], "name": lt["name"],
+                "allocated": allocated, "used": used, "remaining": allocated - used
+            })
+    return out
+
+
 @app.post("/leave-requests")
 def create_leave_request(data: LeaveRequest):
 
@@ -3108,7 +3584,31 @@ def create_leave_request(data: LeaveRequest):
         print(f"[create_leave_request warning] approver lookup failed: {e}")
         approver_id = None
 
+    try:
+        start_d = date.fromisoformat(data.start_date)
+        end_d = date.fromisoformat(data.end_date)
+    except ValueError:
+        return {"success": False, "message": "Invalid date format."}
+
+    days = (end_d - start_d).days + 1
+    if days <= 0:
+        return {"success": False, "message": "End date must be on or after the start date."}
+
     with engine.begin() as conn:
+
+        # Balance check — only for leave types that are actually balance-tracked.
+        if data.leave_type_id:
+            lt = conn.execute(
+                text("SELECT is_balance_tracked FROM leave_types WHERE id=:id"), {"id": data.leave_type_id}
+            ).mappings().first()
+            if lt and lt["is_balance_tracked"]:
+                bal = _get_or_create_balance(conn, data.user_id, data.leave_type_id, start_d.year)
+                remaining = float(bal["allocated"]) - float(bal["used"])
+                if days > remaining:
+                    return {
+                        "success": False,
+                        "message": f"Insufficient balance: requested {days} day(s) but only {remaining:g} remaining."
+                    }
 
         result = conn.execute(
             text("""
@@ -3117,20 +3617,24 @@ def create_leave_request(data: LeaveRequest):
                     user_id,
                     employee_name,
                     leave_type,
+                    leave_type_id,
                     start_date,
                     end_date,
                     reason,
-                    approver_id
+                    approver_id,
+                    days
                 )
                 VALUES
                 (
                     :user_id,
                     :employee_name,
                     :leave_type,
+                    :leave_type_id,
                     :start_date,
                     :end_date,
                     :reason,
-                    :approver_id
+                    :approver_id,
+                    :days
                 )
                 RETURNING id
             """),
@@ -3138,18 +3642,27 @@ def create_leave_request(data: LeaveRequest):
                 "user_id": data.user_id,
                 "employee_name": data.employee_name,
                 "leave_type": data.leave_type,
+                "leave_type_id": data.leave_type_id,
                 "start_date": data.start_date,
                 "end_date": data.end_date,
                 "reason": data.reason,
-                "approver_id": approver_id
+                "approver_id": approver_id,
+                "days": days
             }
         )
 
         leave_id = result.scalar()
 
+    if approver_id:
+        try:
+            send_push(approver_id, "New Leave Request", f"{data.employee_name} requested {days:g} day(s) of {data.leave_type}.")
+        except Exception as e:
+            print(f"[push warning] {e}")
+
     return {
         "success": True,
-        "leave_id": leave_id
+        "leave_id": leave_id,
+        "days": days
     }
 
 @app.get("/leave-requests")
@@ -3170,9 +3683,13 @@ def get_leave_requests():
     return rows
 
 @app.post("/leave-requests/{leave_id}/approve")
-def approve_leave(leave_id: int):
+def approve_leave(leave_id: int, _staff: dict = Depends(require_roles("admin", "manager"))):
 
     with engine.begin() as conn:
+
+        lr = conn.execute(text("SELECT * FROM leave_requests WHERE id=:id"), {"id": leave_id}).mappings().first()
+        if not lr:
+            return {"success": False, "message": "Leave request not found."}
 
         conn.execute(
             text("""
@@ -3187,14 +3704,38 @@ def approve_leave(leave_id: int):
             }
         )
 
+        # Deduct from balance, only if this request maps to a balance-tracked leave type.
+        if lr["leave_type_id"] and lr["days"]:
+            lt = conn.execute(
+                text("SELECT is_balance_tracked FROM leave_types WHERE id=:id"), {"id": lr["leave_type_id"]}
+            ).mappings().first()
+            if lt and lt["is_balance_tracked"]:
+                start_val = lr["start_date"]
+                yr = start_val.year if hasattr(start_val, "year") else date.fromisoformat(str(start_val)).year
+                _get_or_create_balance(conn, lr["user_id"], lr["leave_type_id"], yr)
+                conn.execute(
+                    text("""
+                        UPDATE leave_balances SET used = used + :days
+                        WHERE user_id=:uid AND leave_type_id=:ltid AND year=:yr
+                    """),
+                    {"days": lr["days"], "uid": lr["user_id"], "ltid": lr["leave_type_id"], "yr": yr}
+                )
+
+    try:
+        send_push(lr["user_id"], "Leave Approved ✅", f"Your {lr['leave_type']} request has been approved.")
+    except Exception as e:
+        print(f"[push warning] {e}")
+
     return {
         "success": True
     }
 
 @app.post("/leave-requests/{leave_id}/reject")
-def reject_leave(leave_id: int):
+def reject_leave(leave_id: int, _staff: dict = Depends(require_roles("admin", "manager"))):
 
     with engine.begin() as conn:
+
+        lr = conn.execute(text("SELECT user_id, leave_type FROM leave_requests WHERE id=:id"), {"id": leave_id}).mappings().first()
 
         conn.execute(
             text("""
@@ -3209,12 +3750,18 @@ def reject_leave(leave_id: int):
             }
         )
 
+    if lr:
+        try:
+            send_push(lr["user_id"], "Leave Rejected", f"Your {lr['leave_type']} request was not approved.")
+        except Exception as e:
+            print(f"[push warning] {e}")
+
     return {
         "success": True
     }
 
 @app.post("/leave-requests/{leave_id}/escalate")
-def escalate_leave(leave_id: int):
+def escalate_leave(leave_id: int, _staff: dict = Depends(require_roles("admin", "manager"))):
     """
     Manager-only action: forward a (still pending) employee leave request
     straight to admin, just in case that's needed in the moment.
@@ -3562,7 +4109,7 @@ def log_letterhead(
 
 # ── RESET: wipe all records + reset counter to 0 ────────────
 @app.post("/letterheads/reset")
-def reset_letterheads():
+def reset_letterheads(_admin: dict = Depends(require_roles("admin"))):
     """Admin-only. Clears all letterhead records and resets counter to 0."""
     try:
         with engine.begin() as conn:
@@ -3575,7 +4122,7 @@ def reset_letterheads():
 
 # ── VOID A LETTERHEAD ────────────────────────────────────────
 @app.post("/letterheads/{letterhead_id}/void")
-def void_letterhead(letterhead_id: int, data: VoidRequest):
+def void_letterhead(letterhead_id: int, data: VoidRequest, _staff: dict = Depends(require_roles("admin", "manager"))):
     with engine.begin() as conn:
         result = conn.execute(
             text("""
@@ -3627,6 +4174,83 @@ def letterhead_stats():
         "by_department": [dict(r) for r in by_dept],
         "next_serial": f"LH-{next_no:05d}",
     }
+
+# ================================================================
+# PRINT CENTER MODULE
+# Organization-wide log of every document printed through the
+# system. Any page can call POST /print-logs right before it opens
+# the print dialog; the returned id/printed_at is what gets encoded
+# into the QR code and printed in the document footer.
+# ================================================================
+
+class PrintLogRequest(BaseModel):
+    user_id:        int
+    user_name:      str
+    document_title: str = ""
+    printed_for:    str
+    given_to:       str
+
+
+# ── CREATE: log a print action (server time is authoritative) ──
+@app.post("/print-logs")
+def create_print_log(data: PrintLogRequest):
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                text("""
+                    INSERT INTO print_logs
+                        (user_id, user_name, document_title, printed_for, given_to)
+                    VALUES
+                        (:user_id, :user_name, :document_title, :printed_for, :given_to)
+                    RETURNING id, printed_at
+                """),
+                {
+                    "user_id":        data.user_id,
+                    "user_name":      data.user_name,
+                    "document_title": data.document_title,
+                    "printed_for":    data.printed_for,
+                    "given_to":       data.given_to,
+                }
+            ).fetchone()
+        return {"success": True, "id": row.id, "printed_at": row.printed_at.isoformat()}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+# ── LIST: admin-only organization-wide print log ────────────────
+@app.get("/print-logs")
+def get_print_logs(_admin: dict = Depends(require_roles("admin"))):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT * FROM print_logs ORDER BY printed_at DESC")
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+# ── STATS: admin-only summary cards ─────────────────────────────
+@app.get("/print-logs/stats/summary")
+def print_log_stats(_admin: dict = Depends(require_roles("admin"))):
+    with engine.connect() as conn:
+        total = conn.execute(text("SELECT COUNT(*) FROM print_logs")).scalar()
+        today = conn.execute(text("""
+            SELECT COUNT(*) FROM print_logs
+            WHERE DATE(printed_at) = CURRENT_DATE
+        """)).scalar()
+        this_month = conn.execute(text("""
+            SELECT COUNT(*) FROM print_logs
+            WHERE DATE_TRUNC('month', printed_at) = DATE_TRUNC('month', CURRENT_DATE)
+        """)).scalar()
+        by_user = conn.execute(text("""
+            SELECT user_name, COUNT(*) AS count FROM print_logs
+            GROUP BY user_name ORDER BY count DESC LIMIT 10
+        """)).mappings().all()
+    return {
+        "total": total,
+        "today": today,
+        "this_month": this_month,
+        "by_user": [dict(r) for r in by_user],
+    }
+
 
 # ================================================================
 # ATTENDANCE & PAYROLL MODULE
@@ -3786,7 +4410,7 @@ def get_attendance_settings():
 
 
 @app.patch("/attendance/settings")
-def update_attendance_settings(data: AttendanceSettingsUpdate):
+def update_attendance_settings(data: AttendanceSettingsUpdate, _admin: dict = Depends(require_roles("admin"))):
     """Update one or more attendance settings fields."""
     updates = {k: v for k, v in data.dict().items() if v is not None}
     if not updates:
@@ -3910,7 +4534,7 @@ def create_attendance(data: AttendanceRecord):
 
 
 @app.put("/attendance/{attendance_id}")
-def update_attendance(attendance_id: int, data: AttendancePatch):
+def update_attendance(attendance_id: int, data: AttendancePatch, _staff: dict = Depends(require_roles("admin", "manager"))):
     """Full or partial update of an attendance record."""
     updates = {k: v for k, v in data.dict().items() if v is not None}
     if not updates:
@@ -3943,7 +4567,7 @@ def update_attendance(attendance_id: int, data: AttendancePatch):
 
 
 @app.delete("/attendance/{attendance_id}")
-def delete_attendance(attendance_id: int):
+def delete_attendance(attendance_id: int, _admin: dict = Depends(require_roles("admin"))):
     """Delete an attendance record (admin only — enforce role on frontend)."""
     with engine.begin() as conn:
         result = conn.execute(
@@ -4088,7 +4712,7 @@ def checkout(emp_id: str):
 @app.get("/attendance/summary/today")
 def attendance_summary_today():
     """Quick stat cards for admin dashboard — today's counts."""
-    today_str = date.today().isoformat()
+    today_str = _ist_today().isoformat()
     with engine.connect() as conn:
         rows = conn.execute(
             text("SELECT status, COUNT(*) AS cnt FROM attendance WHERE att_date=:d GROUP BY status"),
@@ -4225,7 +4849,7 @@ def submit_correction(data: CorrectionRequest):
 
     # Enforce time window
     att_date_obj = date.fromisoformat(data.att_date)
-    diff_hours = (datetime.now().date() - att_date_obj).days * 24
+    diff_hours = (_ist_today() - att_date_obj).days * 24
     window = settings.get("correction_window_hours", 24)
     if diff_hours > window:
         return {
@@ -4280,7 +4904,7 @@ def submit_correction(data: CorrectionRequest):
 
 
 @app.post("/attendance/corrections/{correction_id}/approve")
-def approve_correction(correction_id: int, data: CorrectionReview):
+def approve_correction(correction_id: int, data: CorrectionReview, _staff: dict = Depends(require_roles("admin", "manager"))):
     """
     HR/Admin approves a correction request.
     - Updates the attendance record with final times.
@@ -4408,7 +5032,7 @@ def approve_correction(correction_id: int, data: CorrectionReview):
 
 
 @app.post("/attendance/corrections/{correction_id}/reject")
-def reject_correction(correction_id: int, data: CorrectionReview):
+def reject_correction(correction_id: int, data: CorrectionReview, _staff: dict = Depends(require_roles("admin", "manager"))):
     """HR/Admin rejects a correction request."""
     with engine.connect() as conn:
         corr = conn.execute(
@@ -4540,7 +5164,7 @@ def get_salary_structure(emp_id: str):
 
 
 @app.post("/salary-structure")
-def upsert_salary_structure(data: SalaryStructure):
+def upsert_salary_structure(data: SalaryStructure, _admin: dict = Depends(require_roles("admin"))):
     """Create or update the salary structure for an employee."""
     eff = data.effective_from or date.today().isoformat()
     with engine.begin() as conn:
@@ -4616,7 +5240,7 @@ def get_payroll(month: Optional[str] = None, emp_id: Optional[str] = None):
 
 
 @app.post("/payroll/generate")
-def generate_payroll(month: str, generated_by: str = "HR Admin"):
+def generate_payroll(month: str, generated_by: str = "HR Admin", _admin: dict = Depends(require_roles("admin"))):
     """
     Generates payroll for ALL employees who have a salary structure,
     for the given month (YYYY-MM).
@@ -4742,7 +5366,7 @@ def generate_payroll(month: str, generated_by: str = "HR Admin"):
 
 
 @app.post("/payroll/lock")
-def lock_payroll(month: str, locked_by: str = "HR Admin"):
+def lock_payroll(month: str, locked_by: str = "HR Admin", _admin: dict = Depends(require_roles("admin"))):
     """
     Locks payroll for a month and auto-generates payslips for all employees.
     After locking, no edits to payroll or attendance corrections are applied
@@ -4862,11 +5486,17 @@ def lock_payroll(month: str, locked_by: str = "HR Admin"):
             {"d": f"{yr_num}-{mon_str}-01", "by": locked_by}
         )
 
+    for row in payroll_rows:
+        try:
+            send_push(row["emp_id"], "Payslip Ready 💰", f"Your payslip for {month} has been generated.")
+        except Exception as e:
+            print(f"[push warning] {e}")
+
     return {"success": True, "payslips_generated": len(payroll_rows)}
 
 
 @app.post("/payroll/unlock")
-def unlock_payroll(month: str, data: PayrollUnlockRequest):
+def unlock_payroll(month: str, data: PayrollUnlockRequest, _admin: dict = Depends(require_roles("admin"))):
     """Super Admin unlocks a previously locked payroll month."""
     with engine.begin() as conn:
         result = conn.execute(
@@ -5017,7 +5647,7 @@ def get_holidays(year: Optional[str] = None):
 
 
 @app.post("/holidays")
-def create_holiday(data: HolidayCreate):
+def create_holiday(data: HolidayCreate, _admin: dict = Depends(require_roles("admin"))):
     try:
         with engine.begin() as conn:
             result = conn.execute(
@@ -5037,7 +5667,7 @@ def create_holiday(data: HolidayCreate):
 
 
 @app.delete("/holidays/{holiday_id}")
-def delete_holiday(holiday_id: int):
+def delete_holiday(holiday_id: int, _admin: dict = Depends(require_roles("admin"))):
     with engine.begin() as conn:
         result = conn.execute(
             text("DELETE FROM holidays WHERE id=:id RETURNING id"),
@@ -5361,7 +5991,7 @@ def get_reminder_notifications(user_id: int, role: str = "employee"):
  
 # ---------- CREATE ----------
 @app.post("/reminders")
-def create_reminder(data: ReminderCreate):
+def create_reminder(data: ReminderCreate, _staff: dict = Depends(require_roles("admin", "manager"))):
     try:
         with engine.begin() as conn:
             result = conn.execute(
@@ -5401,7 +6031,7 @@ def create_reminder(data: ReminderCreate):
  
 # ---------- UPDATE ----------
 @app.put("/reminders/{reminder_id}")
-def update_reminder(reminder_id: int, data: ReminderUpdate):
+def update_reminder(reminder_id: int, data: ReminderUpdate, _staff: dict = Depends(require_roles("admin", "manager"))):
     fields, params = [], {"id": reminder_id}
     payload = data.dict(exclude_unset=True)
  
@@ -5449,7 +6079,7 @@ def complete_reminder(reminder_id: int, data: ReminderComplete):
  
 # ---------- DELETE ----------
 @app.delete("/reminders/{reminder_id}")
-def delete_reminder(reminder_id: int):
+def delete_reminder(reminder_id: int, _staff: dict = Depends(require_roles("admin", "manager"))):
     with engine.begin() as conn:
         result = conn.execute(
             text("DELETE FROM reminders WHERE id=:id RETURNING id"),
@@ -5493,10 +6123,11 @@ EXPORTABLE_TABLES = {
     "holiday_date":              "Holiday Dates",
     "letterheads":               "Letterheads",
     "letterhead_serial_counter": "Letterhead Serial Counter",
+    "print_logs":                "Print Logs",
 }
 
 @app.get("/admin/export/{table_name}")
-def export_table_excel(table_name: str):
+def export_table_excel(table_name: str, _admin: dict = Depends(require_roles("admin"))):
     if table_name not in EXPORTABLE_TABLES:
         raise _HTTPException(status_code=403, detail="Table not allowed for export.")
 
