@@ -4184,17 +4184,23 @@ def letterhead_stats():
 # ================================================================
 
 class PrintLogRequest(BaseModel):
-    user_id:        int
-    user_name:      str
     document_title: str = ""
     printed_for:    str
     given_to:       str
 
 
-# ── CREATE: log a print action (server time is authoritative) ──
+# ── CREATE: log a print action (server time + identity are authoritative) ──
 @app.post("/print-logs")
-def create_print_log(data: PrintLogRequest):
+def create_print_log(data: PrintLogRequest, user: dict = Depends(get_current_user)):
     try:
+        user_id = user["uid"]
+        with engine.connect() as conn:
+            name_row = conn.execute(
+                text("SELECT full_name FROM users WHERE id = :id"),
+                {"id": user_id}
+            ).fetchone()
+        user_name = name_row.full_name if name_row else "User"
+
         with engine.begin() as conn:
             row = conn.execute(
                 text("""
@@ -4205,16 +4211,36 @@ def create_print_log(data: PrintLogRequest):
                     RETURNING id, printed_at
                 """),
                 {
-                    "user_id":        data.user_id,
-                    "user_name":      data.user_name,
+                    "user_id":        user_id,
+                    "user_name":      user_name,
                     "document_title": data.document_title,
                     "printed_for":    data.printed_for,
                     "given_to":       data.given_to,
                 }
             ).fetchone()
-        return {"success": True, "id": row.id, "printed_at": row.printed_at.isoformat()}
+        return {
+            "success": True,
+            "id": row.id,
+            "printed_at": row.printed_at.isoformat(),
+            "user_name": user_name,
+        }
     except Exception as e:
         return {"success": False, "message": str(e)}
+
+
+# ── LIST (MINE): every logged-in user's own print history ──────
+@app.get("/print-logs/mine")
+def get_my_print_logs(user: dict = Depends(get_current_user)):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT * FROM print_logs
+                WHERE user_id = :uid
+                ORDER BY printed_at DESC
+            """),
+            {"uid": user["uid"]}
+        ).mappings().all()
+    return [dict(r) for r in rows]
 
 
 # ── LIST: admin-only organization-wide print log ────────────────
