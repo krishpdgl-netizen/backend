@@ -4282,16 +4282,19 @@ def get_print_logs(_admin: dict = Depends(require_roles("admin"))):
 # ── STATS: admin-only summary cards ─────────────────────────────
 @app.get("/print-logs/stats/summary")
 def print_log_stats(_admin: dict = Depends(require_roles("admin"))):
+    # printed_at is stored as IST clock time, so "today"/"this month" must be
+    # computed against IST boundaries, not Postgres's own (UTC) CURRENT_DATE —
+    # otherwise counts drift for the first ~5.5 hours of every IST day.
+    ist_today       = _ist_now_naive().date()
+    ist_month_start = ist_today.replace(day=1)
     with engine.connect() as conn:
         total = conn.execute(text("SELECT COUNT(*) FROM print_logs")).scalar()
         today = conn.execute(text("""
-            SELECT COUNT(*) FROM print_logs
-            WHERE DATE(printed_at) = CURRENT_DATE
-        """)).scalar()
+            SELECT COUNT(*) FROM print_logs WHERE DATE(printed_at) = :d
+        """), {"d": ist_today}).scalar()
         this_month = conn.execute(text("""
-            SELECT COUNT(*) FROM print_logs
-            WHERE DATE_TRUNC('month', printed_at) = DATE_TRUNC('month', CURRENT_DATE)
-        """)).scalar()
+            SELECT COUNT(*) FROM print_logs WHERE printed_at >= :m
+        """), {"m": ist_month_start}).scalar()
         by_user = conn.execute(text("""
             SELECT user_name, COUNT(*) AS count FROM print_logs
             GROUP BY user_name ORDER BY count DESC LIMIT 10
