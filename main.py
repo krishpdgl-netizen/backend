@@ -6179,6 +6179,8 @@ EXPORTABLE_TABLES = {
     "letterheads":               "Letterheads",
     "letterhead_serial_counter": "Letterhead Serial Counter",
     "print_logs":                "Print Logs",
+    "insurance_policies":        "Insurance Policies",
+    "insurance_claims":          "Insurance Claims",
 }
 
 @app.get("/admin/export/{table_name}")
@@ -6227,3 +6229,520 @@ def export_table_excel(table_name: str, _admin: dict = Depends(require_roles("ad
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={table_name}_export.xlsx"}
     )
+
+
+# ════════════════════════════════════════════════════════════════════════
+# INSURANCE TRACKING MODULE
+# Covers all policy types (Life, Health, Car, Property, Travel, Other).
+# Renewal + no-claim-bonus reminders piggyback on the existing `reminders`
+# table so they show up in the same bell/widget the rest of the app uses.
+# ════════════════════════════════════════════════════════════════════════
+
+import base64 as _b64
+
+# ---------- TABLES (idempotent, safe to run on every startup) ----------
+with engine.begin() as conn:
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS insurance_policies (
+            id SERIAL PRIMARY KEY,
+            policy_type TEXT NOT NULL,                 -- Life, Health, Car, Property, Travel, Other
+            policy_number TEXT NOT NULL,
+            insurer_name TEXT NOT NULL,
+            employee_id INTEGER,
+            employee_name TEXT,
+            covers_dependents BOOLEAN DEFAULT FALSE,
+            dependent_names TEXT,
+            vehicle_reg_no TEXT,
+            vehicle_details TEXT,
+            start_date DATE,
+            expiry_date DATE NOT NULL,
+            premium_amount NUMERIC,
+            premium_frequency TEXT DEFAULT 'Annual',
+            sum_insured NUMERIC,
+            no_claim_bonus_percent NUMERIC DEFAULT 0,
+            cumulative_bonus_percent NUMERIC DEFAULT 0,
+            nominee_name TEXT,
+            nominee_relation TEXT,
+            broker_name TEXT,
+            broker_contact TEXT,
+            status TEXT DEFAULT 'Active',              -- Active, Expired, Renewed, Lapsed
+            file_url TEXT,
+            file_name TEXT,
+            notes TEXT,
+            linked_reminder_id INTEGER,
+            created_by INTEGER,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS insurance_claims (
+            id SERIAL PRIMARY KEY,
+            policy_id INTEGER REFERENCES insurance_policies(id) ON DELETE CASCADE,
+            claim_date DATE NOT NULL,
+            claim_amount NUMERIC,
+            claim_reason TEXT,
+            status TEXT DEFAULT 'Filed',               -- Filed, Approved, Rejected, Settled
+            settled_amount NUMERIC,
+            notes TEXT,
+            created_by INTEGER,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """))
+
+INSURANCE_UPLOAD_DIR = _os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", ".") + "/insurance_files"
+_os.makedirs(INSURANCE_UPLOAD_DIR, exist_ok=True)
+
+ANTHROPIC_API_KEY = _os.getenv("ANTHROPIC_API_KEY")
+
+
+# ---------- Pydantic models ----------
+class InsurancePolicyIn(BaseModel):
+    policy_type: str
+    policy_number: str
+    insurer_name: str
+    employee_id: Optional[int] = None
+    employee_name: Optional[str] = None
+    covers_dependents: bool = False
+    dependent_names: Optional[str] = None
+    vehicle_reg_no: Optional[str] = None
+    vehicle_details: Optional[str] = None
+    start_date: Optional[str] = None
+    expiry_date: str
+    premium_amount: Optional[float] = None
+    premium_frequency: str = "Annual"
+    sum_insured: Optional[float] = None
+    no_claim_bonus_percent: Optional[float] = 0
+    cumulative_bonus_percent: Optional[float] = 0
+    nominee_name: Optional[str] = None
+    nominee_relation: Optional[str] = None
+    broker_name: Optional[str] = None
+    broker_contact: Optional[str] = None
+    notes: Optional[str] = None
+    created_by: int
+    role: str  # manual role check -- this app's frontend doesn't send bearer tokens
+
+
+class InsurancePolicyUpdate(BaseModel):
+    policy_type: Optional[str] = None
+    policy_number: Optional[str] = None
+    insurer_name: Optional[str] = None
+    employee_id: Optional[int] = None
+    employee_name: Optional[str] = None
+    covers_dependents: Optional[bool] = None
+    dependent_names: Optional[str] = None
+    vehicle_reg_no: Optional[str] = None
+    vehicle_details: Optional[str] = None
+    start_date: Optional[str] = None
+    expiry_date: Optional[str] = None
+    premium_amount: Optional[float] = None
+    premium_frequency: Optional[str] = None
+    sum_insured: Optional[float] = None
+    no_claim_bonus_percent: Optional[float] = None
+    cumulative_bonus_percent: Optional[float] = None
+    nominee_name: Optional[str] = None
+    nominee_relation: Optional[str] = None
+    broker_name: Optional[str] = None
+    broker_contact: Optional[str] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
+    role: str
+
+
+class InsuranceRenewIn(BaseModel):
+    new_start_date: str
+    new_expiry_date: str
+    new_premium_amount: Optional[float] = None
+    carry_forward_bonus: bool = True
+    bonus_increment_percent: Optional[float] = 5
+    reset_bonus: bool = False
+    created_by: int
+    role: str
+
+
+class InsuranceClaimIn(BaseModel):
+    policy_id: int
+    claim_date: str
+    claim_amount: Optional[float] = None
+    claim_reason: Optional[str] = None
+    status: str = "Filed"
+    settled_amount: Optional[float] = None
+    notes: Optional[str] = None
+    created_by: int
+    role: str
+
+
+# ---------- Helpers ----------
+def _insurance_row_to_dict(r):
+    d = dict(r)
+    for k in ("start_date", "expiry_date", "created_at", "updated_at"):
+        if d.get(k) is not None:
+            d[k] = str(d[k])
+    if d.get("expiry_date"):
+        try:
+            d["days_to_expiry"] = (_date.fromisoformat(str(d["expiry_date"])[:10]) - _date.today()).days
+        except Exception:
+            d["days_to_expiry"] = None
+    for k in ("premium_amount", "sum_insured", "no_claim_bonus_percent", "cumulative_bonus_percent"):
+        if d.get(k) is not None:
+            d[k] = float(d[k])
+    return d
+
+
+def _sync_insurance_reminder(conn, policy_id, expiry_date, policy_number, policy_type,
+                              premium_amount, created_by, linked_reminder_id):
+    """Create/update the reminders row so renewals surface in the existing bell + widget."""
+    title = f"{policy_type} insurance renewal — {policy_number}"
+    if linked_reminder_id:
+        conn.execute(text("""
+            UPDATE reminders SET title=:t, due_date=:d, amount=:a, status='Open', updated_at=NOW()
+            WHERE id=:rid
+        """), {"t": title, "d": expiry_date, "a": premium_amount, "rid": linked_reminder_id})
+        return linked_reminder_id
+    result = conn.execute(text("""
+        INSERT INTO reminders
+            (title, description, category, priority, assigned_to, created_by,
+             due_date, reminder_offsets_json, amount, related_module, related_record_id, status)
+        VALUES
+            (:t, :desc, 'Insurance', 'High', :cb, :cb, :d, :offsets, :a, 'insurance', :pid, 'Open')
+        RETURNING id
+    """), {
+        "t": title, "desc": f"Renewal due for policy {policy_number}.",
+        "cb": created_by, "d": expiry_date,
+        "offsets": _json.dumps([60, 30, 7, 0]), "a": premium_amount, "pid": policy_id
+    })
+    return result.fetchone()[0]
+
+
+# ---------- CREATE ----------
+@app.post("/insurance/policies")
+def create_insurance_policy(data: InsurancePolicyIn):
+    if data.role not in ("admin", "manager"):
+        return {"success": False, "message": "You don't have permission to add insurance policies."}
+    try:
+        payload = data.dict(exclude={"role"})
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                INSERT INTO insurance_policies
+                    (policy_type, policy_number, insurer_name, employee_id, employee_name,
+                     covers_dependents, dependent_names, vehicle_reg_no, vehicle_details,
+                     start_date, expiry_date, premium_amount, premium_frequency, sum_insured,
+                     no_claim_bonus_percent, cumulative_bonus_percent, nominee_name, nominee_relation,
+                     broker_name, broker_contact, notes, created_by)
+                VALUES
+                    (:policy_type,:policy_number,:insurer_name,:employee_id,:employee_name,
+                     :covers_dependents,:dependent_names,:vehicle_reg_no,:vehicle_details,
+                     :start_date,:expiry_date,:premium_amount,:premium_frequency,:sum_insured,
+                     :no_claim_bonus_percent,:cumulative_bonus_percent,:nominee_name,:nominee_relation,
+                     :broker_name,:broker_contact,:notes,:created_by)
+                RETURNING id
+            """), payload)
+            new_id = result.fetchone()[0]
+            rid = _sync_insurance_reminder(conn, new_id, data.expiry_date, data.policy_number,
+                                            data.policy_type, data.premium_amount, data.created_by, None)
+            conn.execute(text("UPDATE insurance_policies SET linked_reminder_id=:rid WHERE id=:id"),
+                         {"rid": rid, "id": new_id})
+        return {"success": True, "id": new_id}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+# ---------- LIST / SEARCH / FILTER ----------
+@app.get("/insurance/policies")
+def list_insurance_policies(
+    role: str = "employee",
+    user_id: Optional[int] = None,
+    policy_type: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    filters, params = [], {}
+    if role == "employee":
+        filters.append("employee_id = :uid")
+        params["uid"] = user_id
+    if policy_type:
+        filters.append("policy_type = :pt"); params["pt"] = policy_type
+    if status:
+        filters.append("status = :st"); params["st"] = status
+    if search:
+        filters.append("(policy_number ILIKE :s OR insurer_name ILIKE :s OR employee_name ILIKE :s)")
+        params["s"] = f"%{search}%"
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"SELECT * FROM insurance_policies {where} ORDER BY expiry_date ASC"), params
+        ).mappings().all()
+    return [_insurance_row_to_dict(r) for r in rows]
+
+
+# ---------- EXPIRING SOON (for renewal reminder widgets) ----------
+@app.get("/insurance/expiring")
+def insurance_expiring(days: int = 30):
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT * FROM insurance_policies
+            WHERE status = 'Active' AND expiry_date <= CURRENT_DATE + (:days || ' days')::interval
+            ORDER BY expiry_date ASC
+        """), {"days": days}).mappings().all()
+    return [_insurance_row_to_dict(r) for r in rows]
+
+
+# ---------- DASHBOARD STATS WIDGET ----------
+@app.get("/insurance/stats")
+def insurance_stats():
+    with engine.connect() as conn:
+        total = conn.execute(text(
+            "SELECT COUNT(*) FROM insurance_policies WHERE status='Active'"
+        )).scalar()
+        expiring_30 = conn.execute(text("""
+            SELECT COUNT(*) FROM insurance_policies
+            WHERE status='Active' AND expiry_date <= CURRENT_DATE + INTERVAL '30 days'
+        """)).scalar()
+        expired = conn.execute(text("""
+            SELECT COUNT(*) FROM insurance_policies
+            WHERE expiry_date < CURRENT_DATE AND status NOT IN ('Renewed')
+        """)).scalar()
+        total_premium = conn.execute(text(
+            "SELECT COALESCE(SUM(premium_amount),0) FROM insurance_policies WHERE status='Active'"
+        )).scalar()
+        bonus_at_risk = conn.execute(text("""
+            SELECT COUNT(*) FROM insurance_policies
+            WHERE status='Active' AND cumulative_bonus_percent > 0
+              AND expiry_date <= CURRENT_DATE + INTERVAL '30 days'
+        """)).scalar()
+        by_type = conn.execute(text("""
+            SELECT policy_type, COUNT(*) AS cnt, COALESCE(SUM(premium_amount),0) AS total_premium
+            FROM insurance_policies WHERE status='Active' GROUP BY policy_type
+        """)).mappings().all()
+    return {
+        "active_policies": total,
+        "expiring_within_30_days": expiring_30,
+        "expired": expired,
+        "total_annual_premium": float(total_premium),
+        "bonus_at_risk_count": bonus_at_risk,
+        "by_type": [{"policy_type": r["policy_type"], "count": r["cnt"], "total_premium": float(r["total_premium"])} for r in by_type],
+    }
+
+
+# ---------- GET SINGLE ----------
+@app.get("/insurance/policies/{policy_id}")
+def get_insurance_policy(policy_id: int):
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT * FROM insurance_policies WHERE id=:id"), {"id": policy_id}).mappings().first()
+    if not row:
+        return {"success": False, "message": "Policy not found."}
+    return _insurance_row_to_dict(row)
+
+
+# ---------- UPDATE ----------
+@app.put("/insurance/policies/{policy_id}")
+def update_insurance_policy(policy_id: int, data: InsurancePolicyUpdate):
+    if data.role not in ("admin", "manager"):
+        return {"success": False, "message": "You don't have permission to edit insurance policies."}
+    payload = data.dict(exclude={"role"}, exclude_unset=True)
+    if not payload:
+        return {"success": False, "message": "No fields to update."}
+    fields, params = [], {"id": policy_id}
+    for k, v in payload.items():
+        fields.append(f"{k} = :{k}")
+        params[k] = v
+    fields.append("updated_at = NOW()")
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(f"UPDATE insurance_policies SET {', '.join(fields)} WHERE id=:id RETURNING *"), params
+        ).mappings().first()
+        if row and "expiry_date" in payload:
+            _sync_insurance_reminder(conn, policy_id, row["expiry_date"], row["policy_number"],
+                                      row["policy_type"], row["premium_amount"],
+                                      row["created_by"] or 0, row["linked_reminder_id"])
+    if not row:
+        return {"success": False, "message": "Policy not found."}
+    return {"success": True}
+
+
+# ---------- RENEW (carries forward / resets no-claim bonus) ----------
+@app.post("/insurance/policies/{policy_id}/renew")
+def renew_insurance_policy(policy_id: int, data: InsuranceRenewIn):
+    if data.role not in ("admin", "manager"):
+        return {"success": False, "message": "You don't have permission to renew insurance policies."}
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT * FROM insurance_policies WHERE id=:id"), {"id": policy_id}).mappings().first()
+        if not row:
+            return {"success": False, "message": "Policy not found."}
+
+        claims_count = conn.execute(text("""
+            SELECT COUNT(*) FROM insurance_claims WHERE policy_id=:id AND claim_date >= :sd
+        """), {"id": policy_id, "sd": row["start_date"]}).scalar()
+
+        if data.reset_bonus or claims_count > 0:
+            new_bonus = 0
+        elif data.carry_forward_bonus:
+            new_bonus = float(row["cumulative_bonus_percent"] or 0) + float(data.bonus_increment_percent or 0)
+        else:
+            new_bonus = float(row["cumulative_bonus_percent"] or 0)
+
+        new_premium = data.new_premium_amount if data.new_premium_amount is not None else row["premium_amount"]
+
+        conn.execute(text("""
+            UPDATE insurance_policies
+            SET start_date=:sd, expiry_date=:ed, premium_amount=:pa,
+                cumulative_bonus_percent=:bonus, status='Active', updated_at=NOW()
+            WHERE id=:id
+        """), {"sd": data.new_start_date, "ed": data.new_expiry_date, "pa": new_premium,
+               "bonus": new_bonus, "id": policy_id})
+
+        _sync_insurance_reminder(conn, policy_id, data.new_expiry_date, row["policy_number"],
+                                  row["policy_type"], new_premium, data.created_by, row["linked_reminder_id"])
+
+    return {"success": True, "claims_since_last_cycle": claims_count, "new_bonus_percent": new_bonus}
+
+
+# ---------- DELETE ----------
+@app.delete("/insurance/policies/{policy_id}")
+def delete_insurance_policy(policy_id: int, role: str = "employee"):
+    if role not in ("admin", "manager"):
+        return {"success": False, "message": "You don't have permission to delete insurance policies."}
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT linked_reminder_id FROM insurance_policies WHERE id=:id"),
+                            {"id": policy_id}).mappings().first()
+        if not row:
+            return {"success": False, "message": "Policy not found."}
+        conn.execute(text("DELETE FROM insurance_policies WHERE id=:id"), {"id": policy_id})
+        if row["linked_reminder_id"]:
+            conn.execute(text("DELETE FROM reminders WHERE id=:rid"), {"rid": row["linked_reminder_id"]})
+    return {"success": True}
+
+
+# ---------- CLAIMS ----------
+@app.post("/insurance/claims")
+def add_insurance_claim(data: InsuranceClaimIn):
+    if data.role not in ("admin", "manager"):
+        return {"success": False, "message": "You don't have permission to log claims."}
+    try:
+        payload = data.dict(exclude={"role"})
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                INSERT INTO insurance_claims
+                    (policy_id, claim_date, claim_amount, claim_reason, status, settled_amount, notes, created_by)
+                VALUES
+                    (:policy_id,:claim_date,:claim_amount,:claim_reason,:status,:settled_amount,:notes,:created_by)
+                RETURNING id
+            """), payload)
+            new_id = result.fetchone()[0]
+        return {"success": True, "id": new_id}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@app.get("/insurance/policies/{policy_id}/claims")
+def get_policy_claims(policy_id: int):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT * FROM insurance_claims WHERE policy_id=:id ORDER BY claim_date DESC"),
+            {"id": policy_id}
+        ).mappings().all()
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k in ("claim_date", "created_at"):
+            if d.get(k) is not None:
+                d[k] = str(d[k])
+        for k in ("claim_amount", "settled_amount"):
+            if d.get(k) is not None:
+                d[k] = float(d[k])
+        out.append(d)
+    return out
+
+
+# ---------- POLICY DOCUMENT UPLOAD / SERVE ----------
+@app.post("/insurance/policies/{policy_id}/upload-document")
+async def upload_insurance_document(policy_id: int, file: UploadFile = FastAPIFile(...)):
+    safe_name = f"{policy_id}_{int(_auth_time.time())}_{file.filename.replace(' ', '_')}"
+    dest = f"{INSURANCE_UPLOAD_DIR}/{safe_name}"
+    with open(dest, "wb") as buf:
+        shutil.copyfileobj(file.file, buf)
+    file_url = f"/insurance/document/{safe_name}"
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE insurance_policies SET file_url=:u, file_name=:n WHERE id=:id"),
+            {"u": file_url, "n": file.filename, "id": policy_id}
+        )
+    return {"success": True, "file_url": file_url, "file_name": file.filename}
+
+
+@app.get("/insurance/document/{filename}")
+def serve_insurance_document(filename: str):
+    path = f"{INSURANCE_UPLOAD_DIR}/{filename}"
+    if not _os.path.exists(path):
+        return {"error": "File not found"}
+    return _FileResp(path, filename=filename)
+
+
+# ---------- AI DOCUMENT EXTRACTION (pre-fill the Add Policy form) ----------
+@app.post("/insurance/extract-document")
+async def extract_insurance_document(file: UploadFile = FastAPIFile(...)):
+    """
+    Reads an uploaded policy document (PDF or image) and asks Claude to pull out
+    structured fields. Returns a best-effort JSON the frontend uses to pre-fill
+    the Add Policy form -- the user should still review before saving.
+    """
+    if not ANTHROPIC_API_KEY:
+        return {"success": False, "message": "Document extraction isn't configured yet. Set ANTHROPIC_API_KEY on the server."}
+
+    raw = await file.read()
+    b64data = _b64.b64encode(raw).decode()
+    ext = (file.filename or "").lower().split(".")[-1]
+    if ext == "pdf":
+        block_type, media_type = "document", "application/pdf"
+    else:
+        block_type = "image"
+        media_type = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
+
+    prompt = (
+        "You are reading an insurance policy document. Extract the following fields and reply with "
+        "ONLY a strict JSON object -- no markdown fences, no commentary. Use null for anything not present.\n"
+        "{\n"
+        '  "policy_type": one of "Life", "Health", "Car", "Property", "Travel", "Other",\n'
+        '  "policy_number": string,\n'
+        '  "insurer_name": string,\n'
+        '  "start_date": "YYYY-MM-DD",\n'
+        '  "expiry_date": "YYYY-MM-DD",\n'
+        '  "premium_amount": number,\n'
+        '  "sum_insured": number,\n'
+        '  "no_claim_bonus_percent": number,\n'
+        '  "nominee_name": string,\n'
+        '  "nominee_relation": string,\n'
+        '  "vehicle_reg_no": string\n'
+        "}"
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-5",
+                "max_tokens": 1000,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": block_type, "source": {"type": "base64", "media_type": media_type, "data": b64data}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            },
+            timeout=60,
+        )
+        result = resp.json()
+        if "content" not in result:
+            return {"success": False, "message": result.get("error", {}).get("message", "Extraction failed.")}
+        text_out = "".join(b.get("text", "") for b in result.get("content", []) if b.get("type") == "text")
+        cleaned = text_out.replace("```json", "").replace("```", "").strip()
+        extracted = _json.loads(cleaned)
+        return {"success": True, "data": extracted}
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't read that document automatically: {e}"}
