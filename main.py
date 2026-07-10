@@ -47,6 +47,23 @@ class LeaveRequest(BaseModel):
     start_date: str
     end_date: str
     reason: str
+
+class TravelRequestIn(BaseModel):
+    user_id: int
+    employee_name: str
+    origin: str
+    destination: str
+    travel_mode: str = "Flight"
+    start_date: str
+    end_date: str
+    purpose: str
+    estimated_cost: Optional[float] = None
+
+class TravelMeetingIn(BaseModel):
+    meeting_date: str
+    start_slot: int
+    end_slot: int
+    location: str = ""
     
 app = FastAPI()
 
@@ -306,6 +323,37 @@ def create_tables():
             """))
     except Exception as e:
         print(f"[startup migration warning] print_logs migration failed: {e}")
+
+    # ── travel_requests (Business Travel Requests) ────────────────
+    # Own isolated try/except, same reasoning as above.
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS travel_requests (
+                    id                SERIAL PRIMARY KEY,
+                    user_id           INT NOT NULL,
+                    employee_name     TEXT NOT NULL,
+                    origin            TEXT NOT NULL,
+                    destination       TEXT NOT NULL,
+                    travel_mode       TEXT DEFAULT 'Flight',
+                    start_date        DATE NOT NULL,
+                    end_date          DATE NOT NULL,
+                    purpose           TEXT DEFAULT '',
+                    estimated_cost    NUMERIC,
+                    status            TEXT DEFAULT 'Pending',
+                    meeting_id        INT,
+                    created_at        TIMESTAMP DEFAULT NOW(),
+                    approved_at       TIMESTAMP,
+                    last_reminder_at  TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            for col_sql in [
+                "ALTER TABLE travel_requests ADD COLUMN IF NOT EXISTS meeting_id INT",
+                "ALTER TABLE travel_requests ADD COLUMN IF NOT EXISTS last_reminder_at TIMESTAMP DEFAULT NOW()",
+            ]:
+                conn.execute(text(col_sql))
+    except Exception as e:
+        print(f"[startup migration warning] travel_requests migration failed: {e}")
 
 
 # ── CORS ─────────────────────────────────────────────────
@@ -3805,6 +3853,254 @@ def escalate_leave(leave_id: int, _staff: dict = Depends(require_roles("admin", 
     return {
         "success": True
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+# BUSINESS TRAVEL REQUESTS
+# ══════════════════════════════════════════════════════════════════
+
+def _admin_ids(conn):
+    rows = conn.execute(text("SELECT id FROM users WHERE LOWER(role) = 'admin'")).fetchall()
+    return [r[0] for r in rows]
+
+
+@app.post("/travel-requests")
+def create_travel_request(data: TravelRequestIn):
+
+    try:
+        start_d = date.fromisoformat(data.start_date)
+        end_d = date.fromisoformat(data.end_date)
+    except ValueError:
+        return {"success": False, "message": "Invalid date format."}
+
+    if end_d < start_d:
+        return {"success": False, "message": "End date must be on or after the start date."}
+
+    with engine.begin() as conn:
+        travel_id = conn.execute(
+            text("""
+                INSERT INTO travel_requests
+                (user_id, employee_name, origin, destination, travel_mode,
+                 start_date, end_date, purpose, estimated_cost, last_reminder_at)
+                VALUES
+                (:user_id, :employee_name, :origin, :destination, :travel_mode,
+                 :start_date, :end_date, :purpose, :estimated_cost, NOW())
+                RETURNING id
+            """),
+            {
+                "user_id": data.user_id,
+                "employee_name": data.employee_name,
+                "origin": data.origin,
+                "destination": data.destination,
+                "travel_mode": data.travel_mode,
+                "start_date": data.start_date,
+                "end_date": data.end_date,
+                "purpose": data.purpose,
+                "estimated_cost": data.estimated_cost,
+            }
+        )
+        travel_id = travel_id.scalar()
+        admins = _admin_ids(conn)
+
+    for admin_id in admins:
+        try:
+            send_push(
+                admin_id,
+                "New Travel Request ✈️",
+                f"{data.employee_name} requested travel to {data.destination} ({data.start_date} – {data.end_date})."
+            )
+        except Exception as e:
+            print(f"[push warning] {e}")
+
+    return {"success": True, "travel_id": travel_id}
+
+
+@app.get("/travel-requests")
+def get_travel_requests(user_id: Optional[int] = None, status: Optional[str] = None):
+    """
+    Admin/manager view (all requests) when no user_id is given, or a
+    single employee's own requests when user_id is passed. Optional
+    status filter, e.g. status=Pending.
+    """
+    query = "SELECT * FROM travel_requests WHERE 1=1"
+    params = {}
+    if user_id is not None:
+        query += " AND user_id = :user_id"
+        params["user_id"] = user_id
+    if status is not None:
+        query += " AND status = :status"
+        params["status"] = status
+    query += " ORDER BY created_at DESC"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(query), params).mappings().all()
+
+    return rows
+
+
+@app.post("/travel-requests/{travel_id}/approve")
+def approve_travel_request(travel_id: int, _staff: dict = Depends(require_roles("admin"))):
+
+    with engine.begin() as conn:
+        tr = conn.execute(text("SELECT * FROM travel_requests WHERE id=:id"), {"id": travel_id}).mappings().first()
+        if not tr:
+            return {"success": False, "message": "Travel request not found."}
+
+        conn.execute(
+            text("""
+                UPDATE travel_requests
+                SET status = 'Approved', approved_at = NOW()
+                WHERE id = :travel_id
+            """),
+            {"travel_id": travel_id}
+        )
+
+    try:
+        send_push(tr["user_id"], "Travel Request Approved ✅", f"Your trip to {tr['destination']} has been approved.")
+    except Exception as e:
+        print(f"[push warning] {e}")
+
+    return {"success": True}
+
+
+@app.post("/travel-requests/{travel_id}/reject")
+def reject_travel_request(travel_id: int, _staff: dict = Depends(require_roles("admin"))):
+
+    with engine.begin() as conn:
+        tr = conn.execute(text("SELECT * FROM travel_requests WHERE id=:id"), {"id": travel_id}).mappings().first()
+        if not tr:
+            return {"success": False, "message": "Travel request not found."}
+
+        conn.execute(
+            text("""
+                UPDATE travel_requests
+                SET status = 'Rejected', approved_at = NOW()
+                WHERE id = :travel_id
+            """),
+            {"travel_id": travel_id}
+        )
+
+    try:
+        send_push(tr["user_id"], "Travel Request Rejected", f"Your trip to {tr['destination']} was not approved.")
+    except Exception as e:
+        print(f"[push warning] {e}")
+
+    return {"success": True}
+
+
+@app.post("/travel-requests/{travel_id}/schedule-meeting")
+def schedule_travel_meeting(travel_id: int, data: TravelMeetingIn, _staff: dict = Depends(require_roles("admin"))):
+    """
+    Admin books a discussion meeting about a pending (or already
+    approved) travel request. Creates a real entry in the existing
+    meetings/calendar system with both the admin and the requester
+    as attendees, and links it back onto the travel request.
+    """
+    with engine.begin() as conn:
+        tr = conn.execute(text("SELECT * FROM travel_requests WHERE id=:id"), {"id": travel_id}).mappings().first()
+        if not tr:
+            return {"success": False, "message": "Travel request not found."}
+
+        conflict = conn.execute(
+            text("""
+                SELECT id FROM meetings
+                WHERE meeting_date = :meeting_date
+                AND organizer_id = :organizer_id
+                AND (start_slot < :new_end AND end_slot > :new_start)
+            """),
+            {"meeting_date": data.meeting_date, "organizer_id": _staff["uid"],
+             "new_start": data.start_slot, "new_end": data.end_slot}
+        ).fetchone()
+
+        if conflict:
+            return {"success": False, "message": "You already have a meeting at that time."}
+
+        organizer_id = _staff["uid"]
+
+        meeting_id = conn.execute(
+            text("""
+                INSERT INTO meetings
+                    (title, description, organizer_id, meeting_date, start_slot, end_slot, location)
+                VALUES
+                    (:title, :description, :organizer_id, :meeting_date, :start_slot, :end_slot, :location)
+                RETURNING id
+            """),
+            {
+                "title": f"Travel Request Discussion — {tr['employee_name']}",
+                "description": f"Trip: {tr['origin']} → {tr['destination']} ({tr['start_date']} – {tr['end_date']}). Purpose: {tr['purpose']}",
+                "organizer_id": organizer_id,
+                "meeting_date": data.meeting_date,
+                "start_slot": data.start_slot,
+                "end_slot": data.end_slot,
+                "location": data.location,
+            }
+        ).scalar()
+
+        for uid in {organizer_id, tr["user_id"]}:
+            conn.execute(
+                text("INSERT INTO meeting_attendees(meeting_id, user_id) VALUES(:mid, :uid)"),
+                {"mid": meeting_id, "uid": uid}
+            )
+
+        conn.execute(
+            text("UPDATE travel_requests SET meeting_id = :mid WHERE id = :tid"),
+            {"mid": meeting_id, "tid": travel_id}
+        )
+
+    try:
+        send_push(
+            tr["user_id"],
+            "Meeting Scheduled 📅",
+            f"A meeting about your trip to {tr['destination']} was scheduled for {data.meeting_date}."
+        )
+    except Exception as e:
+        print(f"[push warning] {e}")
+
+    return {"success": True, "meeting_id": meeting_id}
+
+
+@app.post("/cron/travel-request-reminders")
+def travel_request_reminders():
+    """
+    Pushes a reminder to every admin for each travel request that is
+    still Pending and hasn't had a reminder sent in the last 4 hours.
+    Not triggered automatically — schedule an external cron (Railway
+    Cron, cron-job.org, GitHub Actions, etc) to POST here periodically
+    (e.g. every 30 minutes); this endpoint enforces the actual 4-hour
+    gap itself via last_reminder_at, so calling it more often than
+    that is safe and just makes the reminder timing more precise.
+    """
+    with engine.begin() as conn:
+        due = conn.execute(
+            text("""
+                SELECT * FROM travel_requests
+                WHERE status = 'Pending'
+                AND (last_reminder_at IS NULL OR last_reminder_at <= NOW() - INTERVAL '4 hours')
+            """)
+        ).mappings().all()
+
+        admins = _admin_ids(conn)
+
+        sent = 0
+        for tr in due:
+            for admin_id in admins:
+                try:
+                    send_push(
+                        admin_id,
+                        "Travel Request Awaiting Approval ⏳",
+                        f"{tr['employee_name']}'s trip to {tr['destination']} is still pending. "
+                        f"Approve it or set up a meeting."
+                    )
+                    sent += 1
+                except Exception as e:
+                    print(f"[push warning] {e}")
+            conn.execute(
+                text("UPDATE travel_requests SET last_reminder_at = NOW() WHERE id = :id"),
+                {"id": tr["id"]}
+            )
+
+    return {"success": True, "reminders_sent": sent, "requests_due": len(due)}
+
 
 @app.get("/leave-stats")
 def leave_stats():
