@@ -6269,10 +6269,14 @@ def get_reminders(
  
 # ---------- TODAY'S DUE REMINDERS (for dashboard widget) ----------
 @app.get("/reminders/today")
-def get_todays_reminders(user_id: int):
+def get_todays_reminders(user_id: int, role: Optional[str] = "employee"):
     """
     Returns reminders for the logged-in user whose days_remaining matches
-    one of their configured reminder offsets (or are due/overdue).
+    one of their configured reminder offsets (or are due/overdue), plus
+    any pending travel requests that need this user's attention (all
+    pending requests for admins who approve them, or the user's own
+    still-pending requests otherwise) so they surface in the same
+    dashboard widget / bell / reminders page.
     """
 
     filters = [
@@ -6297,6 +6301,16 @@ def get_todays_reminders(user_id: int):
             params
         ).mappings().all()
 
+        if role == "admin":
+            travel_rows = conn.execute(
+                text("SELECT * FROM travel_requests WHERE status = 'Pending' ORDER BY created_at ASC")
+            ).mappings().all()
+        else:
+            travel_rows = conn.execute(
+                text("SELECT * FROM travel_requests WHERE status = 'Pending' AND user_id = :uid ORDER BY created_at ASC"),
+                {"uid": int(user_id)}
+            ).mappings().all()
+
     due_now = []
 
     for r in rows:
@@ -6308,6 +6322,26 @@ def get_todays_reminders(user_id: int):
 
         if (days in offsets) or (days <= 0):
             due_now.append(d)
+
+    for tr in travel_rows:
+        due_now.append({
+            "id": f"travel-{tr['id']}",
+            "travel_id": tr["id"],
+            "is_travel_request": True,
+            "title": (
+                f"Travel Request: {tr['employee_name']} → {tr['destination']}"
+                if role == "admin" else
+                f"Your travel request to {tr['destination']}"
+            ),
+            "category": "Travel Request",
+            "description": tr["purpose"],
+            "due_date": str(tr["start_date"]),
+            "days_remaining": 0,
+            "priority": "High" if role == "admin" else "Medium",
+            "amount": float(tr["estimated_cost"]) if tr["estimated_cost"] is not None else None,
+            "status": "Open",
+            "assigned_to_name": tr["employee_name"],
+        })
 
     due_now.sort(key=lambda x: x["days_remaining"])
 
