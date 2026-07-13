@@ -672,7 +672,7 @@ class RegisterRequest(BaseModel):
 
 
 @app.post("/register")
-def register_user(data: RegisterRequest):
+def register_user(data: RegisterRequest, _admin: dict = Depends(require_roles("admin"))):
 
     with engine.connect() as conn:
 
@@ -1278,6 +1278,120 @@ def recent_activity():
         ]
 
     return activity
+
+@app.get("/ceo/overview")
+def ceo_overview(_staff: dict = Depends(require_roles("ceo", "admin"))):
+    """
+    Single aggregated payload for the CEO/management dashboard.
+    Read-only — pulls headcount, attendance, payroll, sales, leave,
+    travel and task numbers across the whole company in one call.
+    """
+    today = _ist_today().isoformat()
+    month_start = _ist_today().replace(day=1).isoformat()
+    payroll_month = _ist_today().strftime("%Y-%m")
+
+    with engine.connect() as conn:
+
+        # ── headcount by role ─────────────────────────────
+        headcount_rows = conn.execute(
+            text("SELECT role, COUNT(*) AS cnt FROM users GROUP BY role")
+        ).mappings().all()
+        headcount = {r["role"]: r["cnt"] for r in headcount_rows}
+        total_headcount = sum(headcount.values())
+
+        # ── attendance today ──────────────────────────────
+        att_today_rows = conn.execute(
+            text("SELECT status, COUNT(*) AS cnt FROM attendance WHERE att_date=:d GROUP BY status"),
+            {"d": today}
+        ).mappings().all()
+        att_today = {r["status"]: r["cnt"] for r in att_today_rows}
+        present_today = att_today.get("Present", 0) + att_today.get("Work From Home", 0)
+
+        # ── attendance this month (company-wide %) ────────
+        month_att = conn.execute(
+            text("""
+                SELECT
+                    COUNT(*) FILTER (WHERE status IN ('Present','Work From Home')) AS present,
+                    COUNT(*) AS total
+                FROM attendance
+                WHERE att_date >= :m
+            """),
+            {"m": month_start}
+        ).mappings().first()
+        attendance_pct = round((month_att["present"] / month_att["total"]) * 100, 1) if month_att and month_att["total"] else 0
+
+        # ── payroll cost, latest generated month ──────────
+        payroll_row = conn.execute(
+            text("""
+                SELECT payroll_month, SUM(net_salary) AS total_cost, COUNT(*) AS emp_count,
+                       BOOL_AND(status='Locked') AS all_locked
+                FROM payroll
+                WHERE payroll_month = (SELECT MAX(payroll_month) FROM payroll)
+                GROUP BY payroll_month
+            """)
+        ).mappings().first()
+
+        # ── sales this week ────────────────────────────────
+        try:
+            all_emp_ids = [row["id"] for row in conn.execute(text("SELECT id FROM users")).mappings().all()]
+            this_week = current_week()
+            sales_rows = get_sales_for_employees(all_emp_ids, this_week)
+            sales_projected = sum(float(r.get("projected") or 0) for r in sales_rows) if sales_rows else 0
+            sales_achieved  = sum(float(r.get("achieved") or 0) for r in sales_rows) if sales_rows else 0
+        except Exception:
+            sales_projected, sales_achieved = 0, 0
+
+        # ── leave: pending + approved this month ──────────
+        leave_row = conn.execute(
+            text("""
+                SELECT
+                    COUNT(*) FILTER (WHERE status='Pending') AS pending,
+                    COUNT(*) FILTER (WHERE status='Approved' AND start_date >= :m) AS approved_this_month
+                FROM leave_requests
+            """),
+            {"m": month_start}
+        ).mappings().first()
+
+        # ── travel: pending, flagged if estimated cost is high ─
+        travel_pending = conn.execute(
+            text("""
+                SELECT id, employee_name, destination, estimated_cost, start_date
+                FROM travel_requests
+                WHERE status='Pending'
+                ORDER BY estimated_cost DESC NULLS LAST
+                LIMIT 10
+            """)
+        ).mappings().all()
+        high_value_threshold = 25000  # tune to your org's approval policy
+        travel_high_value = [dict(r) for r in travel_pending if (r["estimated_cost"] or 0) >= high_value_threshold]
+
+        # ── tasks: company-wide completion rate ────────────
+        task_row = conn.execute(
+            text("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE status='Completed') AS completed
+                FROM tasks
+            """)
+        ).mappings().first()
+        task_completion_pct = round((task_row["completed"] / task_row["total"]) * 100, 1) if task_row and task_row["total"] else 0
+
+    return {
+        "headcount": {"total": total_headcount, "by_role": headcount},
+        "attendance_today": {"present": present_today, "total": total_headcount, "breakdown": dict(att_today)},
+        "attendance_month_pct": attendance_pct,
+        "payroll": {
+            "month": payroll_row["payroll_month"] if payroll_row else payroll_month,
+            "total_cost": float(payroll_row["total_cost"]) if payroll_row and payroll_row["total_cost"] else 0,
+            "employee_count": payroll_row["emp_count"] if payroll_row else 0,
+            "locked": bool(payroll_row["all_locked"]) if payroll_row else False,
+        },
+        "sales": {"projected_this_week": sales_projected, "achieved_this_week": sales_achieved},
+        "leave": {"pending": leave_row["pending"] if leave_row else 0, "approved_this_month": leave_row["approved_this_month"] if leave_row else 0},
+        "travel": {"pending_count": len(travel_pending), "high_value_pending": travel_high_value, "threshold": high_value_threshold},
+        "tasks": {"total": task_row["total"] if task_row else 0, "completed": task_row["completed"] if task_row else 0, "completion_pct": task_completion_pct},
+    }
+
 
 @app.get("/dashboard-summary")
 def dashboard_summary():
@@ -3986,7 +4100,7 @@ def get_travel_requests(user_id: Optional[int] = None, status: Optional[str] = N
 
 
 @app.post("/travel-requests/{travel_id}/approve")
-def approve_travel_request(travel_id: int, _staff: dict = Depends(require_roles("admin"))):
+def approve_travel_request(travel_id: int, _staff: dict = Depends(require_roles("admin", "ceo"))):
 
     with engine.begin() as conn:
         tr = conn.execute(text("SELECT * FROM travel_requests WHERE id=:id"), {"id": travel_id}).mappings().first()
@@ -4011,7 +4125,7 @@ def approve_travel_request(travel_id: int, _staff: dict = Depends(require_roles(
 
 
 @app.post("/travel-requests/{travel_id}/reject")
-def reject_travel_request(travel_id: int, _staff: dict = Depends(require_roles("admin"))):
+def reject_travel_request(travel_id: int, _staff: dict = Depends(require_roles("admin", "ceo"))):
 
     with engine.begin() as conn:
         tr = conn.execute(text("SELECT * FROM travel_requests WHERE id=:id"), {"id": travel_id}).mappings().first()
@@ -4983,12 +5097,15 @@ def delete_attendance(attendance_id: int, _admin: dict = Depends(require_roles("
 # ================================================================
 
 @app.post("/attendance/checkin")
-def checkin(emp_id: str):
+def checkin(_user: dict = Depends(get_current_user)):
     """
     Employee punches in for today.
     Creates attendance row with check_in = current IST time.
     Calculates late_minutes vs office_start_time from attendance_settings.
+    emp_id is taken from the verified auth token — never from client input —
+    so a logged-in user can only ever punch themselves in.
     """
+    emp_id = str(_user["uid"])
     from datetime import datetime as _dt
     now_ist = _dt.now(ZoneInfo("Asia/Kolkata"))
     today   = now_ist.date().isoformat()
@@ -5060,11 +5177,13 @@ def checkin(emp_id: str):
 
 
 @app.post("/attendance/checkout")
-def checkout(emp_id: str):
+def checkout(_user: dict = Depends(get_current_user)):
     """
     Employee punches out for today.
     Updates check_out, recalculates working_hours and overtime.
+    emp_id is taken from the verified auth token — never from client input.
     """
+    emp_id = str(_user["uid"])
     from datetime import datetime as _dt
     now_ist = _dt.now(ZoneInfo("Asia/Kolkata"))
     today   = now_ist.date().isoformat()
@@ -5894,7 +6013,7 @@ def lock_payroll(month: str, locked_by: str = "HR Admin", _admin: dict = Depends
 
 
 @app.post("/payroll/unlock")
-def unlock_payroll(month: str, data: PayrollUnlockRequest, _admin: dict = Depends(require_roles("admin"))):
+def unlock_payroll(month: str, data: PayrollUnlockRequest, _admin: dict = Depends(require_roles("admin", "ceo"))):
     """Super Admin unlocks a previously locked payroll month."""
     with engine.begin() as conn:
         result = conn.execute(
