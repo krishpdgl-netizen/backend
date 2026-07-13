@@ -403,7 +403,7 @@ async def preflight_handler(rest_of_path: str, request: Request):
     )
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://postgres:OJKDsedhwgqyuvTubYNEJssZeJkRUgiS@thomas.proxy.rlwy.net:22127/railway"
+    "postgresql://neondb_owner:npg_ceN7gVxPlpA5@ep-rough-wind-atil7hvd-pooler.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 )
 
 engine = create_engine(
