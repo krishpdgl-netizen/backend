@@ -372,127 +372,6 @@ def create_tables():
     except Exception as e:
         print(f"[startup migration warning] travel_requests migration failed: {e}")
 
-    # ── payroll: versioned salary structure + audit trail ─────────
-    # Own isolated try/except, same reasoning as above.
-    #
-    # PROBLEM THIS FIXES: `salary_structure` previously stored only the
-    # CURRENT values per employee (upsert on emp_id — every edit
-    # overwrote the row). Payroll generation and payslip locking both
-    # read that single live row, so editing an employee's structure
-    # today silently rewrote every past month's payroll (and payslips)
-    # the next time they were touched. Real payroll changes must be
-    # prospective only — history must never move once a month has
-    # been generated, and especially never once it's locked.
-    #
-    # FIX: salary_structure_history is an append-only ledger — every
-    # save creates a new dated row instead of overwriting one. Payroll
-    # generation resolves "the structure that was in force for month
-    # X" from history (most recent effective_from <= end of month X),
-    # and freezes the full earnings breakdown onto the payroll row
-    # itself, so locking/payslip generation never reads salary
-    # structure data again — it only ever copies the frozen row.
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS salary_structure_history (
-                    id                 SERIAL PRIMARY KEY,
-                    emp_id             TEXT NOT NULL,
-                    emp_name           TEXT,
-                    basic_salary       NUMERIC DEFAULT 0,
-                    hra                NUMERIC DEFAULT 0,
-                    special_allowance  NUMERIC DEFAULT 0,
-                    travel_allowance   NUMERIC DEFAULT 0,
-                    medical_allowance  NUMERIC DEFAULT 0,
-                    bonus              NUMERIC DEFAULT 0,
-                    incentives         NUMERIC DEFAULT 0,
-                    pf_pct             NUMERIC DEFAULT 12,
-                    esic_pct           NUMERIC DEFAULT 0.75,
-                    professional_tax   NUMERIC DEFAULT 200,
-                    income_tax         NUMERIC DEFAULT 0,
-                    other_deductions   NUMERIC DEFAULT 0,
-                    effective_from     DATE NOT NULL,
-                    created_by         INT,
-                    created_at         TIMESTAMP DEFAULT NOW()
-                )
-            """))
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_salstruct_hist_emp_eff "
-                "ON salary_structure_history (emp_id, effective_from)"
-            ))
-
-            # One-time backfill: if history is empty but salary_structure
-            # already has rows (existing installs), seed one history row
-            # per employee from their current values, so past months
-            # still resolve to a structure instead of suddenly having
-            # none. Uses each employee's stored effective_from if present,
-            # otherwise assumes they've been on these values since the
-            # start of the company's records in this system.
-            hist_count = conn.execute(text("SELECT COUNT(*) FROM salary_structure_history")).scalar()
-            if hist_count == 0:
-                existing = conn.execute(text("SELECT * FROM salary_structure")).mappings().all()
-                for s in existing:
-                    conn.execute(text("""
-                        INSERT INTO salary_structure_history
-                            (emp_id, emp_name, basic_salary, hra, special_allowance,
-                             travel_allowance, medical_allowance, bonus, incentives,
-                             pf_pct, esic_pct, professional_tax, income_tax,
-                             other_deductions, effective_from, created_by, created_at)
-                        VALUES
-                            (:emp_id, :emp_name, :basic_salary, :hra, :special_allowance,
-                             :travel_allowance, :medical_allowance, :bonus, :incentives,
-                             :pf_pct, :esic_pct, :professional_tax, :income_tax,
-                             :other_deductions, :effective_from, :created_by, NOW())
-                    """), {
-                        "emp_id": s["emp_id"], "emp_name": s.get("emp_name"),
-                        "basic_salary": s.get("basic_salary", 0), "hra": s.get("hra", 0),
-                        "special_allowance": s.get("special_allowance", 0),
-                        "travel_allowance": s.get("travel_allowance", 0),
-                        "medical_allowance": s.get("medical_allowance", 0),
-                        "bonus": s.get("bonus", 0), "incentives": s.get("incentives", 0),
-                        "pf_pct": s.get("pf_pct", 12), "esic_pct": s.get("esic_pct", 0.75),
-                        "professional_tax": s.get("professional_tax", 200),
-                        "income_tax": s.get("income_tax", 0),
-                        "other_deductions": s.get("other_deductions", 0),
-                        "effective_from": s.get("effective_from") or date(2024, 1, 1),
-                        "created_by": s.get("created_by"),
-                    })
-
-            # Freeze the full earnings breakdown + provenance onto each
-            # payroll row at generation time, so lock/payslip generation
-            # never has to look at salary_structure again.
-            for col_sql in [
-                "ALTER TABLE payroll ADD COLUMN IF NOT EXISTS basic_salary NUMERIC DEFAULT 0",
-                "ALTER TABLE payroll ADD COLUMN IF NOT EXISTS hra NUMERIC DEFAULT 0",
-                "ALTER TABLE payroll ADD COLUMN IF NOT EXISTS special_allowance NUMERIC DEFAULT 0",
-                "ALTER TABLE payroll ADD COLUMN IF NOT EXISTS travel_allowance NUMERIC DEFAULT 0",
-                "ALTER TABLE payroll ADD COLUMN IF NOT EXISTS medical_allowance NUMERIC DEFAULT 0",
-                "ALTER TABLE payroll ADD COLUMN IF NOT EXISTS bonus NUMERIC DEFAULT 0",
-                "ALTER TABLE payroll ADD COLUMN IF NOT EXISTS incentives NUMERIC DEFAULT 0",
-                "ALTER TABLE payroll ADD COLUMN IF NOT EXISTS structure_effective_from DATE",
-                "ALTER TABLE payroll ADD COLUMN IF NOT EXISTS generated_by TEXT",
-                "ALTER TABLE payroll ADD COLUMN IF NOT EXISTS regenerated_count INT DEFAULT 0",
-            ]:
-                conn.execute(text(col_sql))
-
-            # Audit trail: every generate/regenerate/lock/unlock of a
-            # payroll month is logged here so HR can see who changed
-            # what and when — separate from the attendance audit log.
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS payroll_audit (
-                    id                  SERIAL PRIMARY KEY,
-                    payroll_month       TEXT NOT NULL,
-                    action              TEXT NOT NULL,
-                    performed_by        TEXT,
-                    employees_processed INT DEFAULT 0,
-                    total_gross         NUMERIC,
-                    total_net           NUMERIC,
-                    notes               TEXT DEFAULT '',
-                    created_at          TIMESTAMP DEFAULT NOW()
-                )
-            """))
-    except Exception as e:
-        print(f"[startup migration warning] payroll versioning migration failed: {e}")
-
 
 # ── CORS ─────────────────────────────────────────────────
 # allow_origins=["*"] with allow_credentials=False is correct.
@@ -5057,33 +4936,6 @@ def _get_settings(conn) -> dict:
     return settings
 
 
-def _structure_for_month(conn, emp_id: str, month: str) -> Optional[dict]:
-    """
-    Return the salary structure that was IN FORCE for a given payroll
-    month (YYYY-MM) — i.e. the most recent row in salary_structure_history
-    for this employee whose effective_from is on/before the last day of
-    that month.
-
-    This is the core of the retroactive-change fix: a structure edit
-    saved today (effective_from = today) can never be picked up by a
-    month that already ended before today, because that month's most
-    recent applicable row is still the older one.
-    """
-    import calendar as _cal
-    year, mon = int(month[:4]), int(month[5:7])
-    month_end = date(year, mon, _cal.monthrange(year, mon)[1])
-    row = conn.execute(
-        text("""
-            SELECT * FROM salary_structure_history
-            WHERE emp_id=:eid AND effective_from <= :month_end
-            ORDER BY effective_from DESC, id DESC
-            LIMIT 1
-        """),
-        {"eid": emp_id, "month_end": month_end}
-    ).mappings().fetchone()
-    return dict(row) if row else None
-
-
 # ================================================================
 # ATTENDANCE SETTINGS
 # ================================================================
@@ -5859,20 +5711,7 @@ def get_salary_structure(emp_id: str):
 
 @app.post("/salary-structure")
 def upsert_salary_structure(data: SalaryStructure, _admin: dict = Depends(require_roles("admin"))):
-    """
-    Create or update an employee's salary structure.
-
-    IMPORTANT: this does NOT rewrite payroll history. It updates the
-    "current" pointer row in `salary_structure` (used only for display
-    in the Salary Structures list / to prefill the edit form) AND
-    appends a new dated row to `salary_structure_history`. Payroll for
-    any given month always resolves its structure from history — the
-    version whose effective_from is on/before that month — so this
-    change only affects payroll generated for `effective_from` onward.
-    Months that are already generated or locked are never touched by
-    saving a structure; they only change if someone explicitly
-    regenerates that specific month afterward.
-    """
+    """Create or update the salary structure for an employee."""
     eff = data.effective_from or date.today().isoformat()
     with engine.begin() as conn:
         conn.execute(
@@ -5923,76 +5762,7 @@ def upsert_salary_structure(data: SalaryStructure, _admin: dict = Depends(requir
                 "created_by":       data.created_by,
             }
         )
-
-        # Append-only history row — this is what payroll generation
-        # actually reads from. Never overwritten, never deleted.
-        conn.execute(
-            text("""
-                INSERT INTO salary_structure_history
-                    (emp_id, emp_name, basic_salary, hra, special_allowance,
-                     travel_allowance, medical_allowance, bonus, incentives,
-                     pf_pct, esic_pct, professional_tax, income_tax,
-                     other_deductions, effective_from, created_by, created_at)
-                VALUES
-                    (:emp_id, :emp_name, :basic_salary, :hra, :special_allowance,
-                     :travel_allowance, :medical_allowance, :bonus, :incentives,
-                     :pf_pct, :esic_pct, :professional_tax, :income_tax,
-                     :other_deductions, :effective_from, :created_by, NOW())
-            """),
-            {
-                "emp_id":           data.emp_id,
-                "emp_name":         data.emp_name,
-                "basic_salary":     data.basic_salary,
-                "hra":              data.hra,
-                "special_allowance":data.special_allowance,
-                "travel_allowance": data.travel_allowance,
-                "medical_allowance":data.medical_allowance,
-                "bonus":            data.bonus,
-                "incentives":       data.incentives,
-                "pf_pct":           data.pf_pct,
-                "esic_pct":         data.esic_pct,
-                "professional_tax": data.professional_tax,
-                "income_tax":       data.income_tax,
-                "other_deductions": data.other_deductions,
-                "effective_from":   eff,
-                "created_by":       data.created_by,
-            }
-        )
-
-        # Let HR know up front if this change could alter any payroll
-        # that's already been generated (drafted) but not yet locked.
-        # Locked months are always safe regardless — generate_payroll
-        # refuses to touch a locked month at all.
-        eff_month = str(eff)[:7]
-        affected = conn.execute(
-            text("""
-                SELECT payroll_month FROM payroll
-                WHERE emp_id=:eid AND status <> 'Locked' AND payroll_month >= :eff_month
-                ORDER BY payroll_month
-            """),
-            {"eid": data.emp_id, "eff_month": eff_month}
-        ).fetchall()
-
-    return {
-        "success": True,
-        "effective_from": eff,
-        "affected_unlocked_months": [r[0] for r in affected],
-    }
-
-
-@app.get("/salary-structure/{emp_id}/history")
-def get_salary_structure_history(emp_id: str):
-    """Full dated history of an employee's salary structure changes, most recent first."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT * FROM salary_structure_history
-                WHERE emp_id=:eid
-                ORDER BY effective_from DESC, id DESC
-            """),
-            {"eid": emp_id}
-        ).mappings().all()
-    return [dict(r) for r in rows]
+    return {"success": True}
 
 
 # ================================================================
@@ -6016,28 +5786,14 @@ def get_payroll(month: Optional[str] = None, emp_id: Optional[str] = None):
 
 
 @app.post("/payroll/generate")
-def generate_payroll(
-    month: str,
-    generated_by: str = "HR Admin",
-    force: bool = False,
-    _admin: dict = Depends(require_roles("admin")),
-):
+def generate_payroll(month: str, generated_by: str = "HR Admin", _admin: dict = Depends(require_roles("admin"))):
     """
-    Generates payroll for the given month (YYYY-MM), using — for EACH
-    employee — the salary structure that was actually in force during
-    that month (resolved from salary_structure_history), never
-    "whatever the structure happens to be right now". This is what
-    stops a structure edit made today from silently changing payroll
-    for a month that already happened: that month's calculation always
-    looks up the version effective as of its own end date.
-
-    Fails if payroll is already locked for that month. If a draft
-    already exists for this month (previously generated, not yet
-    locked), it is NOT silently overwritten — the caller must pass
-    force=true to explicitly recompute it (e.g. after an attendance
-    correction or an intentionally backdated structure change). Every
-    generate/regenerate is written to payroll_audit for traceability.
+    Generates payroll for ALL employees who have a salary structure,
+    for the given month (YYYY-MM).
+    Fails if payroll is already locked for that month.
+    Overwrites any un-locked draft for the same month.
     """
+    # Validate month format
     try:
         year, mon = int(month[:4]), int(month[5:7])
     except Exception:
@@ -6051,39 +5807,20 @@ def generate_payroll(
         if lock:
             return {"success": False, "message": "Payroll is locked for this month. Unlock first."}
 
-        existing_count = conn.execute(
-            text("SELECT COUNT(*) FROM payroll WHERE payroll_month=:m"), {"m": month}
-        ).scalar() or 0
-        if existing_count and not force:
-            return {
-                "success": False,
-                "needs_confirmation": True,
-                "message": (
-                    f"Payroll for {month} was already generated for {existing_count} "
-                    f"employee(s). Regenerating will recompute it from current attendance "
-                    f"and the salary structure in force for that month — confirm to proceed."
-                ),
-            }
+        # All salary structures
+        structs = conn.execute(
+            text("SELECT * FROM salary_structure")
+        ).mappings().all()
 
-        # Every employee who has EVER had a structure. We resolve the
-        # version applicable to THIS month for each one individually.
-        emp_ids = [r[0] for r in conn.execute(
-            text("SELECT DISTINCT emp_id FROM salary_structure_history")
-        ).fetchall()]
+        settings = _get_settings(conn)
 
     working_days = _working_days_in_month(year, mon)
     generated_rows = []
-    skipped_no_structure = []
 
-    for emp_id_val in emp_ids:
+    for ss in structs:
+        emp_id_val = ss["emp_id"]
+
         with engine.connect() as conn:
-            ss = _structure_for_month(conn, emp_id_val, month)
-            if not ss:
-                # This employee's structure wasn't set up yet as of
-                # this month — can't generate payroll for them here.
-                skipped_no_structure.append(emp_id_val)
-                continue
-
             att_rows = conn.execute(
                 text("""
                     SELECT status, late_minutes, overtime
@@ -6102,7 +5839,7 @@ def generate_payroll(
         effective_present = present + half_days * 0.5 + leave_days
         lop = max(0.0, working_days - effective_present)
 
-        # Earnings — from the structure version effective for THIS month
+        # Earnings
         basic  = float(ss["basic_salary"])
         hra    = float(ss["hra"])
         spl    = float(ss["special_allowance"])
@@ -6128,22 +5865,13 @@ def generate_payroll(
             "working_days": working_days, "present": present,
             "half_days": half_days, "leave": leave_days, "lop": lop,
             "ot_hours": ot_hours, "gross": gross,
-            "basic": basic, "hra": hra, "spl": spl, "travel": travel,
-            "med": med, "bonus": bonus, "inc": inc,
             "pf": pf_ded, "esic": esic_ded, "pt": pt_ded, "it": it_ded,
             "other": other_ded, "lop_ded": lop_ded,
             "total_ded": total_ded, "net": net,
-            "structure_effective_from": ss["effective_from"],
         })
 
-    total_gross = round(sum(r["gross"] for r in generated_rows), 2)
-    total_net   = round(sum(r["net"]   for r in generated_rows), 2)
-    was_regeneration = bool(existing_count)
-
     with engine.begin() as conn:
-        # Wipe old draft for this month (only reachable once we already
-        # know it's not locked, and either it's a first-time generate
-        # or the caller explicitly confirmed force=true)
+        # Wipe old draft for this month
         conn.execute(text("DELETE FROM payroll WHERE payroll_month=:m"), {"m": month})
         for r in generated_rows:
             conn.execute(
@@ -6152,61 +5880,34 @@ def generate_payroll(
                         (payroll_month, emp_id, emp_name, department,
                          working_days, present_days, half_days, leave_days, lop_days,
                          overtime_hours, gross_salary,
-                         basic_salary, hra, special_allowance, travel_allowance,
-                         medical_allowance, bonus, incentives,
                          pf_deduction, esic_deduction, pt_deduction, it_deduction,
                          other_deductions, lop_deduction, total_deductions, net_salary,
-                         structure_effective_from, generated_by, regenerated_count,
                          status, generated_at)
                     VALUES
                         (:m, :eid, :ename, :dept,
                          :wd, :p, :hd, :l, :lop,
                          :ot, :gross,
-                         :basic, :hra, :spl, :travel, :med, :bonus, :inc,
                          :pf, :esic, :pt, :it,
                          :other, :lop_ded, :total_ded, :net,
-                         :struct_eff, :gen_by, :regen_count,
                          'Generated', NOW())
                 """),
                 {
                     "m": r["month"], "eid": r["emp_id"], "ename": r["emp_name"], "dept": r["dept"],
                     "wd": r["working_days"], "p": r["present"], "hd": r["half_days"],
                     "l": r["leave"], "lop": r["lop"], "ot": r["ot_hours"],
-                    "gross": r["gross"],
-                    "basic": r["basic"], "hra": r["hra"], "spl": r["spl"], "travel": r["travel"],
-                    "med": r["med"], "bonus": r["bonus"], "inc": r["inc"],
-                    "pf": r["pf"], "esic": r["esic"],
+                    "gross": r["gross"], "pf": r["pf"], "esic": r["esic"],
                     "pt": r["pt"], "it": r["it"], "other": r["other"],
                     "lop_ded": r["lop_ded"], "total_ded": r["total_ded"], "net": r["net"],
-                    "struct_eff": r["structure_effective_from"], "gen_by": generated_by,
-                    "regen_count": 1 if was_regeneration else 0,
                 }
             )
 
-        conn.execute(
-            text("""
-                INSERT INTO payroll_audit
-                    (payroll_month, action, performed_by, employees_processed,
-                     total_gross, total_net, notes)
-                VALUES (:m, :action, :by, :cnt, :gross, :net, :notes)
-            """),
-            {
-                "m": month, "action": "regenerate" if was_regeneration else "generate",
-                "by": generated_by, "cnt": len(generated_rows),
-                "gross": total_gross, "net": total_net,
-                "notes": (
-                    f"Skipped (no structure effective for this month): {', '.join(skipped_no_structure)}"
-                    if skipped_no_structure else ""
-                ),
-            }
-        )
-
+    total_gross = sum(r["gross"] for r in generated_rows)
+    total_net   = sum(r["net"]   for r in generated_rows)
     return {
         "success": True,
         "employees_processed": len(generated_rows),
-        "total_gross": total_gross,
-        "total_net": total_net,
-        "skipped_no_structure": skipped_no_structure,
+        "total_gross": round(total_gross, 2),
+        "total_net": round(total_net, 2),
     }
 
 
