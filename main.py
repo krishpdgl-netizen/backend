@@ -306,6 +306,23 @@ def create_tables():
     except Exception as e:
         print(f"[startup migration warning] password reset / push / leave balance migration failed: {e}")
 
+    # ── one-time: hash any plaintext passwords still in the DB ────────
+    # bcrypt hashes always start with $2b$/$2a$/$2y$, so any row whose
+    # password doesn't start with that is still plaintext from before
+    # this migration existed. We hash it in place, once, automatically.
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text("SELECT id, password FROM users")).mappings().all()
+            for row in rows:
+                pw = row["password"]
+                if pw and not pw.startswith(("$2a$", "$2b$", "$2y$")):
+                    conn.execute(
+                        text("UPDATE users SET password=:pw WHERE id=:id"),
+                        {"pw": hash_password(pw), "id": row["id"]}
+                    )
+    except Exception as e:
+        print(f"[startup migration warning] password hashing migration failed: {e}")
+
     # ── print tracking (Print Center) ─────────────────────────────
     # Own isolated try/except, same reasoning as above.
     try:
@@ -400,10 +417,28 @@ engine = create_engine(
 import hmac, hashlib, base64
 import json as _auth_json
 import time as _auth_time
+import bcrypt
 from fastapi import Header, Depends, HTTPException
 
 AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY", "panache-dev-secret-CHANGE-ME-IN-PRODUCTION")
 TOKEN_VALID_HOURS = 12
+
+
+def hash_password(plain: str) -> str:
+    """Hash a plaintext password for storage. Never store plain text."""
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain: str, stored: str) -> bool:
+    """Check a plaintext password against a stored bcrypt hash."""
+    if not stored:
+        return False
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), stored.encode("utf-8"))
+    except (ValueError, TypeError):
+        # stored value isn't a valid bcrypt hash (shouldn't happen after
+        # migration, but fail closed rather than crash).
+        return False
 
 
 def _create_token(user_id: int, role: str) -> str:
@@ -479,10 +514,11 @@ def create_user(_admin: dict = Depends(require_roles("admin"))):
             (
                 'Admin User',
                 'admin@panache.com',
-                'admin123',
+                :password,
                 'admin'
             )
-            """)
+            """),
+            {"password": hash_password("admin123")}
         )
 
         conn.commit()
@@ -490,8 +526,13 @@ def create_user(_admin: dict = Depends(require_roles("admin"))):
     return {"message":"User Created"}
 
 
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
 @app.post("/login")
-def login(email: str, password: str):
+def login(data: LoginRequest):
 
     with engine.connect() as conn:
 
@@ -500,17 +541,15 @@ def login(email: str, password: str):
                 SELECT *
                 FROM users
                 WHERE email=:email
-                AND password=:password
             """),
             {
-                "email": email,
-                "password": password
+                "email": data.email
             }
         )
 
         user = result.fetchone()
 
-    if user:
+    if user and verify_password(data.password, user.password):
         token = _create_token(user.id, user.role)
         return {
     "success": True,
@@ -619,19 +658,21 @@ def reset_password(data: ResetPasswordIn):
         if len(data.new_password) < 6:
             return {"success": False, "message": "Password must be at least 6 characters."}
 
-        conn.execute(text("UPDATE users SET password=:pw WHERE id=:uid"), {"pw": data.new_password, "uid": row["user_id"]})
+        conn.execute(text("UPDATE users SET password=:pw WHERE id=:uid"), {"pw": hash_password(data.new_password), "uid": row["user_id"]})
         conn.execute(text("UPDATE password_reset_tokens SET used=TRUE WHERE id=:id"), {"id": row["id"]})
 
     return {"success": True, "message": "Password updated successfully. You can now log in."}
 
 
-@app.post("/register")
-def register_user(
-    fullname: str,
-    email: str,
-    password: str,
+class RegisterRequest(BaseModel):
+    fullname: str
+    email: str
+    password: str
     role: str
-):
+
+
+@app.post("/register")
+def register_user(data: RegisterRequest):
 
     with engine.connect() as conn:
 
@@ -642,7 +683,7 @@ def register_user(
                 WHERE full_name = :full_name
             """),
             {
-                "full_name": fullname
+                "full_name": data.fullname
             }
         ).fetchone()
 
@@ -660,10 +701,10 @@ def register_user(
                 (:full_name,:email,:password,:role)
             """),
             {
-                "full_name": fullname,
-                "email": email,
-                "password": password,
-                "role": role
+                "full_name": data.fullname,
+                "email": data.email,
+                "password": hash_password(data.password),
+                "role": data.role
             }
         )
 
@@ -1954,25 +1995,31 @@ def update_profile(user_id: int, full_name: str, email: str):
  
  
 # ── CHANGE PASSWORD ──────────────────────────────────────────────
+class ChangePasswordRequest(BaseModel):
+    user_id: int
+    current_password: str
+    new_password: str
+
+
 @app.post("/change-password")
-def change_password(user_id: int, current_password: str, new_password: str):
+def change_password(data: ChangePasswordRequest):
     with engine.connect() as conn:
  
         # Verify current password
         user = conn.execute(
-            text("SELECT id FROM users WHERE id=:user_id AND password=:password"),
-            {"user_id": user_id, "password": current_password}
+            text("SELECT id, password FROM users WHERE id=:user_id"),
+            {"user_id": data.user_id}
         ).fetchone()
  
-        if not user:
+        if not user or not verify_password(data.current_password, user.password):
             return {"success": False, "message": "Current password is incorrect"}
  
-        if len(new_password) < 6:
+        if len(data.new_password) < 6:
             return {"success": False, "message": "New password must be at least 6 characters"}
  
         conn.execute(
             text("UPDATE users SET password=:password WHERE id=:user_id"),
-            {"password": new_password, "user_id": user_id}
+            {"password": hash_password(data.new_password), "user_id": data.user_id}
         )
         conn.commit()
  
