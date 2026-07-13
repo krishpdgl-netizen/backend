@@ -2718,8 +2718,18 @@ def sales_test_add():
 
 import shutil, os as _os
 
-UPLOAD_DIR = _os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", ".") + "/task_files"
-_os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Files now live in the database (stored_files table) instead of a local/volume
+# path, so they survive on any host -- no persistent disk required.
+with engine.begin() as _conn:
+    _conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS stored_files (
+            filename      TEXT PRIMARY KEY,
+            content_type  TEXT,
+            data          BYTEA NOT NULL,
+            original_name TEXT,
+            created_at    TIMESTAMP DEFAULT now()
+        )
+    """))
 
 @app.post("/submit-task-with-file")
 async def submit_task_with_file(
@@ -2729,16 +2739,27 @@ async def submit_task_with_file(
     """
     Employee calls this instead of /update-task-status when submitting
     for review with an optional file attachment.
-    Saves the file to the persistent volume and stores the path in tasks.
+    Saves the file into the database and stores the path in tasks.
     """
     file_url  = None
     file_name = None
 
     if file and file.filename:
         safe_name = f"{task_id}_{file.filename.replace(' ', '_')}"
-        dest      = f"{UPLOAD_DIR}/{safe_name}"
-        with open(dest, "wb") as buf:
-            shutil.copyfileobj(file.file, buf)
+        contents  = await file.read()
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO stored_files (filename, content_type, data, original_name)
+                    VALUES (:fn, :ct, :data, :orig)
+                    ON CONFLICT (filename) DO UPDATE
+                    SET content_type = EXCLUDED.content_type,
+                        data = EXCLUDED.data,
+                        original_name = EXCLUDED.original_name,
+                        created_at = now()
+                """),
+                {"fn": safe_name, "ct": file.content_type, "data": contents, "orig": file.filename}
+            )
         file_url  = f"/task-file/{safe_name}"
         file_name = file.filename
 
@@ -2758,14 +2779,22 @@ async def submit_task_with_file(
     return {"success": True, "file_url": file_url, "file_name": file_name}
 
 
-from fastapi.responses import FileResponse as _FileResp
+from fastapi.responses import Response as _RawResponse
 
 @app.get("/task-file/{filename}")
 def serve_task_file(filename: str):
-    path = f"{UPLOAD_DIR}/{filename}"
-    if not _os.path.exists(path):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT content_type, data, original_name FROM stored_files WHERE filename=:fn"),
+            {"fn": filename}
+        ).mappings().first()
+    if not row:
         return {"error": "File not found"}
-    return _FileResp(path, filename=filename)
+    return _RawResponse(
+        content=bytes(row["data"]),
+        media_type=row["content_type"] or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{row["original_name"] or filename}"'}
+    )
 
 
 # ═══════════════════════════════════════════════════════
@@ -6786,8 +6815,6 @@ with engine.begin() as conn:
         )
     """))
 
-INSURANCE_UPLOAD_DIR = _os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", ".") + "/insurance_files"
-_os.makedirs(INSURANCE_UPLOAD_DIR, exist_ok=True)
 
 ANTHROPIC_API_KEY = _os.getenv("ANTHROPIC_API_KEY")
 
@@ -7154,9 +7181,20 @@ def get_policy_claims(policy_id: int):
 @app.post("/insurance/policies/{policy_id}/upload-document")
 async def upload_insurance_document(policy_id: int, file: UploadFile = FastAPIFile(...)):
     safe_name = f"{policy_id}_{int(_auth_time.time())}_{file.filename.replace(' ', '_')}"
-    dest = f"{INSURANCE_UPLOAD_DIR}/{safe_name}"
-    with open(dest, "wb") as buf:
-        shutil.copyfileobj(file.file, buf)
+    contents  = await file.read()
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO stored_files (filename, content_type, data, original_name)
+                VALUES (:fn, :ct, :data, :orig)
+                ON CONFLICT (filename) DO UPDATE
+                SET content_type = EXCLUDED.content_type,
+                    data = EXCLUDED.data,
+                    original_name = EXCLUDED.original_name,
+                    created_at = now()
+            """),
+            {"fn": safe_name, "ct": file.content_type, "data": contents, "orig": file.filename}
+        )
     file_url = f"/insurance/document/{safe_name}"
     with engine.begin() as conn:
         conn.execute(
@@ -7168,10 +7206,18 @@ async def upload_insurance_document(policy_id: int, file: UploadFile = FastAPIFi
 
 @app.get("/insurance/document/{filename}")
 def serve_insurance_document(filename: str):
-    path = f"{INSURANCE_UPLOAD_DIR}/{filename}"
-    if not _os.path.exists(path):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT content_type, data, original_name FROM stored_files WHERE filename=:fn"),
+            {"fn": filename}
+        ).mappings().first()
+    if not row:
         return {"error": "File not found"}
-    return _FileResp(path, filename=filename)
+    return _RawResponse(
+        content=bytes(row["data"]),
+        media_type=row["content_type"] or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{row["original_name"] or filename}"'}
+    )
 
 
 # ---------- AI DOCUMENT EXTRACTION (pre-fill the Add Policy form) ----------
