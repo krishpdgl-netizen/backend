@@ -7440,85 +7440,93 @@ async def submit_expense_voucher(
     expense_date: str = Form(...),
     amount: float = Form(...),
     description: str = Form(""),
-    files: List[UploadFile] = FastAPIFile(None),
+    files: List[UploadFile] = FastAPIFile(default=[]),
 ):
-    with engine.begin() as conn:
-        is_duplicate, over_limit = _expense_check_flags(conn, user_id, category, expense_date, amount)
-        manager_id = _expense_manager_for(conn, user_id)
-        voucher_no = _expense_voucher_no(conn)
+    try:
+        with engine.begin() as conn:
+            is_duplicate, over_limit = _expense_check_flags(conn, user_id, category, expense_date, amount)
+            manager_id = _expense_manager_for(conn, user_id)
+            voucher_no = _expense_voucher_no(conn)
 
-        result = conn.execute(text("""
-            INSERT INTO expense_vouchers
-                (voucher_no, user_id, employee_name, category, expense_date, amount,
-                 description, manager_id, is_duplicate_flag, over_limit_flag)
-            VALUES
-                (:vno, :uid, :ename, :cat, :edate, :amt,
-                 :desc, :mgr, :dup, :over)
-            RETURNING id
-        """), {
-            "vno": voucher_no, "uid": user_id, "ename": employee_name, "cat": category,
-            "edate": expense_date, "amt": amount, "desc": description, "mgr": manager_id,
-            "dup": is_duplicate, "over": over_limit,
-        })
-        voucher_id = result.fetchone()[0]
-        _expense_audit(conn, voucher_id, "Submitted", user_id, employee_name)
+            result = conn.execute(text("""
+                INSERT INTO expense_vouchers
+                    (voucher_no, user_id, employee_name, category, expense_date, amount,
+                     description, manager_id, is_duplicate_flag, over_limit_flag)
+                VALUES
+                    (:vno, :uid, :ename, :cat, :edate, :amt,
+                     :desc, :mgr, :dup, :over)
+                RETURNING id
+            """), {
+                "vno": voucher_no, "uid": user_id, "ename": employee_name, "cat": category,
+                "edate": expense_date, "amt": amount, "desc": description, "mgr": manager_id,
+                "dup": is_duplicate, "over": over_limit,
+            })
+            voucher_id = result.fetchone()[0]
+            _expense_audit(conn, voucher_id, "Submitted", user_id, employee_name)
 
-        saved_bills = []
-        for f in (files or []):
-            if not f or not f.filename:
-                continue
-            safe_name = f"expvch_{voucher_id}_{int(_exp_time.time()*1000)}_{f.filename.replace(' ', '_')}"
-            contents = await f.read()
-            conn.execute(text("""
-                INSERT INTO stored_files (filename, content_type, data, original_name)
-                VALUES (:fn, :ct, :data, :orig)
-                ON CONFLICT (filename) DO UPDATE
-                SET content_type = EXCLUDED.content_type, data = EXCLUDED.data,
-                    original_name = EXCLUDED.original_name, created_at = now()
-            """), {"fn": safe_name, "ct": f.content_type, "data": contents, "orig": f.filename})
-            file_url = f"/expenses/bill/{safe_name}"
-            conn.execute(text("""
-                INSERT INTO expense_bills (voucher_id, file_url, file_name)
-                VALUES (:vid, :url, :name)
-            """), {"vid": voucher_id, "url": file_url, "name": f.filename})
-            saved_bills.append({"file_url": file_url, "file_name": f.filename})
+            saved_bills = []
+            for f in (files or []):
+                if not f or not f.filename:
+                    continue
+                safe_name = f"expvch_{voucher_id}_{int(_exp_time.time()*1000)}_{f.filename.replace(' ', '_')}"
+                contents = await f.read()
+                conn.execute(text("""
+                    INSERT INTO stored_files (filename, content_type, data, original_name)
+                    VALUES (:fn, :ct, :data, :orig)
+                    ON CONFLICT (filename) DO UPDATE
+                    SET content_type = EXCLUDED.content_type, data = EXCLUDED.data,
+                        original_name = EXCLUDED.original_name, created_at = now()
+                """), {"fn": safe_name, "ct": f.content_type, "data": contents, "orig": f.filename})
+                file_url = f"/expenses/bill/{safe_name}"
+                conn.execute(text("""
+                    INSERT INTO expense_bills (voucher_id, file_url, file_name)
+                    VALUES (:vid, :url, :name)
+                """), {"vid": voucher_id, "url": file_url, "name": f.filename})
+                saved_bills.append({"file_url": file_url, "file_name": f.filename})
 
-    return {
-        "success": True, "id": voucher_id, "voucher_no": voucher_no,
-        "bills": saved_bills, "is_duplicate_flag": is_duplicate, "over_limit_flag": over_limit,
-    }
+        return {
+            "success": True, "id": voucher_id, "voucher_no": voucher_no,
+            "bills": saved_bills, "is_duplicate_flag": is_duplicate, "over_limit_flag": over_limit,
+        }
+    except Exception as e:
+        print(f"[expenses/vouchers/submit] error: {e}")
+        return {"success": False, "message": f"Couldn't submit the voucher: {e}"}
 
 
 # ---------- ADD MORE BILLS TO AN EXISTING VOUCHER ----------
 @app.post("/expenses/vouchers/{voucher_id}/bills")
 async def add_expense_bills(voucher_id: int, files: List[UploadFile] = FastAPIFile(...)):
-    with engine.begin() as conn:
-        row = conn.execute(text("SELECT status FROM expense_vouchers WHERE id=:id"), {"id": voucher_id}).first()
-        if not row:
-            return {"success": False, "message": "Voucher not found."}
-        if row[0] not in ("Submitted", "Rejected"):
-            return {"success": False, "message": "Bills can only be added while a voucher is still Submitted or Rejected."}
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text("SELECT status FROM expense_vouchers WHERE id=:id"), {"id": voucher_id}).first()
+            if not row:
+                return {"success": False, "message": "Voucher not found."}
+            if row[0] not in ("Submitted", "Rejected"):
+                return {"success": False, "message": "Bills can only be added while a voucher is still Submitted or Rejected."}
 
-        saved_bills = []
-        for f in files:
-            if not f or not f.filename:
-                continue
-            safe_name = f"expvch_{voucher_id}_{int(_exp_time.time()*1000)}_{f.filename.replace(' ', '_')}"
-            contents = await f.read()
-            conn.execute(text("""
-                INSERT INTO stored_files (filename, content_type, data, original_name)
-                VALUES (:fn, :ct, :data, :orig)
-                ON CONFLICT (filename) DO UPDATE
-                SET content_type = EXCLUDED.content_type, data = EXCLUDED.data,
-                    original_name = EXCLUDED.original_name, created_at = now()
-            """), {"fn": safe_name, "ct": f.content_type, "data": contents, "orig": f.filename})
-            file_url = f"/expenses/bill/{safe_name}"
-            conn.execute(text("""
-                INSERT INTO expense_bills (voucher_id, file_url, file_name)
-                VALUES (:vid, :url, :name)
-            """), {"vid": voucher_id, "url": file_url, "name": f.filename})
-            saved_bills.append({"file_url": file_url, "file_name": f.filename})
-    return {"success": True, "bills": saved_bills}
+            saved_bills = []
+            for f in files:
+                if not f or not f.filename:
+                    continue
+                safe_name = f"expvch_{voucher_id}_{int(_exp_time.time()*1000)}_{f.filename.replace(' ', '_')}"
+                contents = await f.read()
+                conn.execute(text("""
+                    INSERT INTO stored_files (filename, content_type, data, original_name)
+                    VALUES (:fn, :ct, :data, :orig)
+                    ON CONFLICT (filename) DO UPDATE
+                    SET content_type = EXCLUDED.content_type, data = EXCLUDED.data,
+                        original_name = EXCLUDED.original_name, created_at = now()
+                """), {"fn": safe_name, "ct": f.content_type, "data": contents, "orig": f.filename})
+                file_url = f"/expenses/bill/{safe_name}"
+                conn.execute(text("""
+                    INSERT INTO expense_bills (voucher_id, file_url, file_name)
+                    VALUES (:vid, :url, :name)
+                """), {"vid": voucher_id, "url": file_url, "name": f.filename})
+                saved_bills.append({"file_url": file_url, "file_name": f.filename})
+        return {"success": True, "bills": saved_bills}
+    except Exception as e:
+        print(f"[expenses/vouchers/{{voucher_id}}/bills] error: {e}")
+        return {"success": False, "message": f"Couldn't add the bill: {e}"}
 
 
 @app.get("/expenses/bill/{filename}")
