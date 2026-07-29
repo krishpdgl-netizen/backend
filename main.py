@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File as FastAPIFile
+from fastapi import FastAPI, UploadFile, File as FastAPIFile, Form
 from sqlalchemy import create_engine
 from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
@@ -6706,6 +6706,7 @@ EXPORTABLE_TABLES = {
     "print_logs":                "Print Logs",
     "insurance_policies":        "Insurance Policies",
     "insurance_claims":          "Insurance Claims",
+    "expense_vouchers":          "Expense Vouchers",
 }
 
 @app.get("/admin/export/{table_name}")
@@ -7288,3 +7289,593 @@ async def extract_insurance_document(file: UploadFile = FastAPIFile(...)):
         return {"success": True, "data": extracted}
     except Exception as e:
         return {"success": False, "message": f"Couldn't read that document automatically: {e}"}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# EXPENSE REIMBURSEMENT MODULE
+# Employees submit a voucher (category + amount + bill photos), it routes
+# to their manager, then to Finance/Admin for final sign-off and payout.
+# Bills are stored the same way as everywhere else in this app -- as blobs
+# in `stored_files`, served back out through a dedicated /expenses/bill
+# route -- so nothing new needs to be provisioned on disk or in S3.
+# ════════════════════════════════════════════════════════════════════════
+
+import time as _exp_time
+
+DEFAULT_EXPENSE_CATEGORIES = [
+    "Travel", "Fuel", "Accommodation", "Food", "Client Entertainment",
+    "Office Supplies", "Communication", "Training", "Other",
+]
+
+# ---------- TABLES (idempotent, safe to run on every startup) ----------
+try:
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS expense_vouchers (
+                id                 SERIAL PRIMARY KEY,
+                voucher_no         TEXT UNIQUE,
+                user_id            INT NOT NULL,
+                employee_name      TEXT NOT NULL,
+                category           TEXT NOT NULL,
+                expense_date       DATE NOT NULL,
+                amount             NUMERIC NOT NULL,
+                approved_amount    NUMERIC,
+                description        TEXT DEFAULT '',
+                status             TEXT DEFAULT 'Submitted',
+                    -- Submitted | Manager Approved | Approved | Rejected | Paid
+                manager_id         INT,
+                manager_action_by  INT,
+                manager_action_name TEXT,
+                manager_action_at  TIMESTAMP,
+                manager_remark     TEXT,
+                admin_action_by    INT,
+                admin_action_name  TEXT,
+                admin_action_at    TIMESTAMP,
+                rejection_reason   TEXT,
+                payment_status     TEXT DEFAULT 'Unpaid',
+                payment_date       DATE,
+                payment_reference  TEXT,
+                is_duplicate_flag  BOOLEAN DEFAULT FALSE,
+                over_limit_flag    BOOLEAN DEFAULT FALSE,
+                created_at         TIMESTAMP DEFAULT NOW(),
+                updated_at         TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS expense_bills (
+                id          SERIAL PRIMARY KEY,
+                voucher_id  INT NOT NULL REFERENCES expense_vouchers(id) ON DELETE CASCADE,
+                file_url    TEXT NOT NULL,
+                file_name   TEXT NOT NULL,
+                uploaded_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS expense_voucher_audit (
+                id          SERIAL PRIMARY KEY,
+                voucher_id  INT NOT NULL REFERENCES expense_vouchers(id) ON DELETE CASCADE,
+                action      TEXT NOT NULL,
+                actor_id    INT,
+                actor_name  TEXT,
+                remark      TEXT,
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS expense_category_limits (
+                id            SERIAL PRIMARY KEY,
+                category      TEXT UNIQUE NOT NULL,
+                daily_limit   NUMERIC,
+                monthly_limit NUMERIC
+            )
+        """))
+        existing_limits = conn.execute(text("SELECT COUNT(*) FROM expense_category_limits")).scalar()
+        if existing_limits == 0:
+            for cat in DEFAULT_EXPENSE_CATEGORIES:
+                conn.execute(text("""
+                    INSERT INTO expense_category_limits (category, daily_limit, monthly_limit)
+                    VALUES (:c, NULL, NULL) ON CONFLICT (category) DO NOTHING
+                """), {"c": cat})
+except Exception as e:
+    print(f"[startup migration warning] expense_vouchers migration failed: {e}")
+
+
+# ---------- Helpers ----------
+def _expense_voucher_no(conn) -> str:
+    year = _date.today().year
+    count = conn.execute(text(
+        "SELECT COUNT(*) FROM expense_vouchers WHERE EXTRACT(YEAR FROM created_at) = :y"
+    ), {"y": year}).scalar() or 0
+    return f"EXP-{year}-{count + 1:04d}"
+
+
+def _expense_row_to_dict(r):
+    d = dict(r)
+    for k in ("expense_date", "payment_date", "created_at", "updated_at",
+              "manager_action_at", "admin_action_at"):
+        if d.get(k) is not None:
+            d[k] = str(d[k])
+    for k in ("amount", "approved_amount"):
+        if d.get(k) is not None:
+            d[k] = float(d[k])
+    return d
+
+
+def _expense_audit(conn, voucher_id, action, actor_id=None, actor_name=None, remark=None):
+    conn.execute(text("""
+        INSERT INTO expense_voucher_audit (voucher_id, action, actor_id, actor_name, remark)
+        VALUES (:vid, :action, :aid, :aname, :remark)
+    """), {"vid": voucher_id, "action": action, "aid": actor_id, "aname": actor_name, "remark": remark})
+
+
+def _expense_manager_for(conn, user_id: int):
+    row = conn.execute(text("""
+        SELECT manager_id FROM team_members
+        WHERE employee_id = :uid ORDER BY id DESC LIMIT 1
+    """), {"uid": user_id}).first()
+    return row[0] if row and row[0] else None
+
+
+def _expense_check_flags(conn, user_id, category, expense_date, amount):
+    """Soft warnings only -- never blocks submission."""
+    is_duplicate = conn.execute(text("""
+        SELECT COUNT(*) FROM expense_vouchers
+        WHERE user_id = :uid AND category = :cat AND expense_date = :d AND amount = :amt
+          AND status != 'Rejected'
+    """), {"uid": user_id, "cat": category, "d": expense_date, "amt": amount}).scalar() > 0
+
+    limit_row = conn.execute(text(
+        "SELECT daily_limit FROM expense_category_limits WHERE category = :c"
+    ), {"c": category}).first()
+    over_limit = bool(limit_row and limit_row[0] is not None and float(amount) > float(limit_row[0]))
+    return is_duplicate, over_limit
+
+
+# ---------- SUBMIT (multipart: form fields + one or more bill files) ----------
+@app.post("/expenses/vouchers/submit")
+async def submit_expense_voucher(
+    user_id: int = Form(...),
+    employee_name: str = Form(...),
+    category: str = Form(...),
+    expense_date: str = Form(...),
+    amount: float = Form(...),
+    description: str = Form(""),
+    files: List[UploadFile] = FastAPIFile(None),
+):
+    with engine.begin() as conn:
+        is_duplicate, over_limit = _expense_check_flags(conn, user_id, category, expense_date, amount)
+        manager_id = _expense_manager_for(conn, user_id)
+        voucher_no = _expense_voucher_no(conn)
+
+        result = conn.execute(text("""
+            INSERT INTO expense_vouchers
+                (voucher_no, user_id, employee_name, category, expense_date, amount,
+                 description, manager_id, is_duplicate_flag, over_limit_flag)
+            VALUES
+                (:vno, :uid, :ename, :cat, :edate, :amt,
+                 :desc, :mgr, :dup, :over)
+            RETURNING id
+        """), {
+            "vno": voucher_no, "uid": user_id, "ename": employee_name, "cat": category,
+            "edate": expense_date, "amt": amount, "desc": description, "mgr": manager_id,
+            "dup": is_duplicate, "over": over_limit,
+        })
+        voucher_id = result.fetchone()[0]
+        _expense_audit(conn, voucher_id, "Submitted", user_id, employee_name)
+
+        saved_bills = []
+        for f in (files or []):
+            if not f or not f.filename:
+                continue
+            safe_name = f"expvch_{voucher_id}_{int(_exp_time.time()*1000)}_{f.filename.replace(' ', '_')}"
+            contents = await f.read()
+            conn.execute(text("""
+                INSERT INTO stored_files (filename, content_type, data, original_name)
+                VALUES (:fn, :ct, :data, :orig)
+                ON CONFLICT (filename) DO UPDATE
+                SET content_type = EXCLUDED.content_type, data = EXCLUDED.data,
+                    original_name = EXCLUDED.original_name, created_at = now()
+            """), {"fn": safe_name, "ct": f.content_type, "data": contents, "orig": f.filename})
+            file_url = f"/expenses/bill/{safe_name}"
+            conn.execute(text("""
+                INSERT INTO expense_bills (voucher_id, file_url, file_name)
+                VALUES (:vid, :url, :name)
+            """), {"vid": voucher_id, "url": file_url, "name": f.filename})
+            saved_bills.append({"file_url": file_url, "file_name": f.filename})
+
+    return {
+        "success": True, "id": voucher_id, "voucher_no": voucher_no,
+        "bills": saved_bills, "is_duplicate_flag": is_duplicate, "over_limit_flag": over_limit,
+    }
+
+
+# ---------- ADD MORE BILLS TO AN EXISTING VOUCHER ----------
+@app.post("/expenses/vouchers/{voucher_id}/bills")
+async def add_expense_bills(voucher_id: int, files: List[UploadFile] = FastAPIFile(...)):
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT status FROM expense_vouchers WHERE id=:id"), {"id": voucher_id}).first()
+        if not row:
+            return {"success": False, "message": "Voucher not found."}
+        if row[0] not in ("Submitted", "Rejected"):
+            return {"success": False, "message": "Bills can only be added while a voucher is still Submitted or Rejected."}
+
+        saved_bills = []
+        for f in files:
+            if not f or not f.filename:
+                continue
+            safe_name = f"expvch_{voucher_id}_{int(_exp_time.time()*1000)}_{f.filename.replace(' ', '_')}"
+            contents = await f.read()
+            conn.execute(text("""
+                INSERT INTO stored_files (filename, content_type, data, original_name)
+                VALUES (:fn, :ct, :data, :orig)
+                ON CONFLICT (filename) DO UPDATE
+                SET content_type = EXCLUDED.content_type, data = EXCLUDED.data,
+                    original_name = EXCLUDED.original_name, created_at = now()
+            """), {"fn": safe_name, "ct": f.content_type, "data": contents, "orig": f.filename})
+            file_url = f"/expenses/bill/{safe_name}"
+            conn.execute(text("""
+                INSERT INTO expense_bills (voucher_id, file_url, file_name)
+                VALUES (:vid, :url, :name)
+            """), {"vid": voucher_id, "url": file_url, "name": f.filename})
+            saved_bills.append({"file_url": file_url, "file_name": f.filename})
+    return {"success": True, "bills": saved_bills}
+
+
+@app.get("/expenses/bill/{filename}")
+def serve_expense_bill(filename: str):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT content_type, data, original_name FROM stored_files WHERE filename=:fn"),
+            {"fn": filename}
+        ).mappings().first()
+    if not row:
+        return {"error": "File not found"}
+    return _RawResponse(
+        content=bytes(row["data"]),
+        media_type=row["content_type"] or "application/octet-stream",
+        headers={"Content-Disposition": f'inline; filename="{row["original_name"] or filename}"'}
+    )
+
+
+# ---------- LIST (filters cover every dashboard's queue) ----------
+@app.get("/expenses/vouchers")
+def list_expense_vouchers(
+    role: str = "employee",
+    user_id: Optional[int] = None,
+    manager_id: Optional[int] = None,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    month: Optional[str] = None,   # 'YYYY-MM'
+    search: Optional[str] = None,
+):
+    filters, params = [], {}
+    if role == "employee" and user_id:
+        filters.append("user_id = :uid"); params["uid"] = user_id
+    if role == "manager" and manager_id:
+        filters.append("manager_id = :mgr"); params["mgr"] = manager_id
+    if status:
+        filters.append("status = :st"); params["st"] = status
+    if category:
+        filters.append("category = :cat"); params["cat"] = category
+    if month:
+        filters.append("TO_CHAR(expense_date, 'YYYY-MM') = :m"); params["m"] = month
+    if search:
+        filters.append("(employee_name ILIKE :s OR voucher_no ILIKE :s)")
+        params["s"] = f"%{search}%"
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"SELECT * FROM expense_vouchers {where} ORDER BY created_at DESC"), params
+        ).mappings().all()
+        out = []
+        for r in rows:
+            d = _expense_row_to_dict(r)
+            bills = conn.execute(text(
+                "SELECT id, file_url, file_name FROM expense_bills WHERE voucher_id=:vid ORDER BY id"
+            ), {"vid": r["id"]}).mappings().all()
+            d["bills"] = [dict(b) for b in bills]
+            out.append(d)
+    return out
+
+
+# ---------- GET SINGLE (bills + full audit trail) ----------
+@app.get("/expenses/vouchers/{voucher_id}")
+def get_expense_voucher(voucher_id: int):
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT * FROM expense_vouchers WHERE id=:id"), {"id": voucher_id}).mappings().first()
+        if not row:
+            return {"success": False, "message": "Voucher not found."}
+        d = _expense_row_to_dict(row)
+        bills = conn.execute(text(
+            "SELECT id, file_url, file_name, uploaded_at FROM expense_bills WHERE voucher_id=:vid ORDER BY id"
+        ), {"vid": voucher_id}).mappings().all()
+        audit = conn.execute(text(
+            "SELECT action, actor_id, actor_name, remark, created_at FROM expense_voucher_audit WHERE voucher_id=:vid ORDER BY id"
+        ), {"vid": voucher_id}).mappings().all()
+        d["bills"] = [dict(b) | {"uploaded_at": str(b["uploaded_at"])} for b in bills]
+        d["audit"] = [dict(a) | {"created_at": str(a["created_at"])} for a in audit]
+    return d
+
+
+# ---------- MANAGER REVIEW ----------
+class ExpenseReviewAction(BaseModel):
+    role: str
+    actor_id: int
+    actor_name: str
+    action: str  # "approve" | "reject"
+    remark: Optional[str] = None
+    approved_amount: Optional[float] = None
+
+
+@app.post("/expenses/vouchers/{voucher_id}/manager-review")
+def manager_review_voucher(voucher_id: int, data: ExpenseReviewAction):
+    if data.role not in ("admin", "manager"):
+        return {"success": False, "message": "You don't have permission to review vouchers."}
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT * FROM expense_vouchers WHERE id=:id"), {"id": voucher_id}).mappings().first()
+        if not row:
+            return {"success": False, "message": "Voucher not found."}
+        if row["status"] != "Submitted":
+            return {"success": False, "message": f"Voucher is already in status '{row['status']}'."}
+
+        if data.action == "approve":
+            approved_amt = data.approved_amount if data.approved_amount is not None else row["amount"]
+            conn.execute(text("""
+                UPDATE expense_vouchers
+                SET status='Manager Approved', approved_amount=:amt,
+                    manager_action_by=:aid, manager_action_name=:aname,
+                    manager_action_at=NOW(), manager_remark=:remark, updated_at=NOW()
+                WHERE id=:id
+            """), {"amt": approved_amt, "aid": data.actor_id, "aname": data.actor_name,
+                    "remark": data.remark, "id": voucher_id})
+            _expense_audit(conn, voucher_id, "Manager Approved", data.actor_id, data.actor_name, data.remark)
+        elif data.action == "reject":
+            conn.execute(text("""
+                UPDATE expense_vouchers
+                SET status='Rejected', rejection_reason=:reason,
+                    manager_action_by=:aid, manager_action_name=:aname,
+                    manager_action_at=NOW(), manager_remark=:remark, updated_at=NOW()
+                WHERE id=:id
+            """), {"reason": data.remark or "Rejected by manager", "aid": data.actor_id,
+                    "aname": data.actor_name, "remark": data.remark, "id": voucher_id})
+            _expense_audit(conn, voucher_id, "Manager Rejected", data.actor_id, data.actor_name, data.remark)
+        else:
+            return {"success": False, "message": "action must be 'approve' or 'reject'."}
+    return {"success": True}
+
+
+# ---------- FINANCE / ADMIN FINAL REVIEW ----------
+@app.post("/expenses/vouchers/{voucher_id}/finance-review")
+def finance_review_voucher(voucher_id: int, data: ExpenseReviewAction):
+    if data.role != "admin":
+        return {"success": False, "message": "Only Finance/Admin can give final approval."}
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT * FROM expense_vouchers WHERE id=:id"), {"id": voucher_id}).mappings().first()
+        if not row:
+            return {"success": False, "message": "Voucher not found."}
+        if row["status"] not in ("Submitted", "Manager Approved"):
+            return {"success": False, "message": f"Voucher is already in status '{row['status']}'."}
+
+        if data.action == "approve":
+            approved_amt = data.approved_amount if data.approved_amount is not None else (row["approved_amount"] or row["amount"])
+            conn.execute(text("""
+                UPDATE expense_vouchers
+                SET status='Approved', approved_amount=:amt,
+                    admin_action_by=:aid, admin_action_name=:aname, admin_action_at=NOW(),
+                    updated_at=NOW()
+                WHERE id=:id
+            """), {"amt": approved_amt, "aid": data.actor_id, "aname": data.actor_name, "id": voucher_id})
+            _expense_audit(conn, voucher_id, "Finance Approved", data.actor_id, data.actor_name, data.remark)
+        elif data.action == "reject":
+            conn.execute(text("""
+                UPDATE expense_vouchers
+                SET status='Rejected', rejection_reason=:reason,
+                    admin_action_by=:aid, admin_action_name=:aname, admin_action_at=NOW(),
+                    updated_at=NOW()
+                WHERE id=:id
+            """), {"reason": data.remark or "Rejected by Finance", "aid": data.actor_id,
+                    "aname": data.actor_name, "id": voucher_id})
+            _expense_audit(conn, voucher_id, "Finance Rejected", data.actor_id, data.actor_name, data.remark)
+        else:
+            return {"success": False, "message": "action must be 'approve' or 'reject'."}
+    return {"success": True}
+
+
+# ---------- MARK PAID ----------
+class ExpensePaymentIn(BaseModel):
+    role: str
+    actor_id: int
+    actor_name: str
+    payment_date: str
+    payment_reference: Optional[str] = None
+
+
+@app.post("/expenses/vouchers/{voucher_id}/mark-paid")
+def mark_voucher_paid(voucher_id: int, data: ExpensePaymentIn):
+    if data.role != "admin":
+        return {"success": False, "message": "Only Finance/Admin can record a payout."}
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT status FROM expense_vouchers WHERE id=:id"), {"id": voucher_id}).first()
+        if not row:
+            return {"success": False, "message": "Voucher not found."}
+        if row[0] != "Approved":
+            return {"success": False, "message": "Only an Approved voucher can be marked as paid."}
+        conn.execute(text("""
+            UPDATE expense_vouchers
+            SET status='Paid', payment_status='Paid', payment_date=:pd,
+                payment_reference=:pref, updated_at=NOW()
+            WHERE id=:id
+        """), {"pd": data.payment_date, "pref": data.payment_reference, "id": voucher_id})
+        _expense_audit(conn, voucher_id, "Paid", data.actor_id, data.actor_name,
+                        f"Ref: {data.payment_reference}" if data.payment_reference else None)
+    return {"success": True}
+
+
+# ---------- RESUBMIT AFTER REJECTION ----------
+class ExpenseResubmitIn(BaseModel):
+    user_id: int
+    category: Optional[str] = None
+    expense_date: Optional[str] = None
+    amount: Optional[float] = None
+    description: Optional[str] = None
+
+
+@app.post("/expenses/vouchers/{voucher_id}/resubmit")
+def resubmit_voucher(voucher_id: int, data: ExpenseResubmitIn):
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT * FROM expense_vouchers WHERE id=:id"), {"id": voucher_id}).mappings().first()
+        if not row:
+            return {"success": False, "message": "Voucher not found."}
+        if row["user_id"] != data.user_id:
+            return {"success": False, "message": "You can only resubmit your own voucher."}
+        if row["status"] != "Rejected":
+            return {"success": False, "message": "Only a rejected voucher can be resubmitted."}
+
+        category = data.category or row["category"]
+        expense_date = data.expense_date or row["expense_date"]
+        amount = data.amount if data.amount is not None else row["amount"]
+        description = data.description if data.description is not None else row["description"]
+        is_duplicate, over_limit = _expense_check_flags(conn, data.user_id, category, expense_date, amount)
+
+        conn.execute(text("""
+            UPDATE expense_vouchers
+            SET status='Submitted', category=:cat, expense_date=:edate, amount=:amt,
+                description=:desc, rejection_reason=NULL, approved_amount=NULL,
+                manager_action_by=NULL, manager_action_name=NULL, manager_action_at=NULL, manager_remark=NULL,
+                admin_action_by=NULL, admin_action_name=NULL, admin_action_at=NULL,
+                is_duplicate_flag=:dup, over_limit_flag=:over, updated_at=NOW()
+            WHERE id=:id
+        """), {"cat": category, "edate": expense_date, "amt": amount, "desc": description,
+                "dup": is_duplicate, "over": over_limit, "id": voucher_id})
+        _expense_audit(conn, voucher_id, "Resubmitted", data.user_id, row["employee_name"])
+    return {"success": True}
+
+
+# ---------- STATS (dashboard widgets) ----------
+@app.get("/expenses/stats")
+def expense_stats(role: str = "admin", manager_id: Optional[int] = None):
+    with engine.connect() as conn:
+        base_filter, params = "", {}
+        if role == "manager" and manager_id:
+            base_filter = "WHERE manager_id = :mgr"
+            params["mgr"] = manager_id
+
+        pending_manager = conn.execute(text(
+            f"SELECT COUNT(*), COALESCE(SUM(amount),0) FROM expense_vouchers {base_filter}"
+            f"{' AND' if base_filter else 'WHERE'} status='Submitted'"
+        ), params).fetchone()
+        pending_finance = conn.execute(text(
+            "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM expense_vouchers WHERE status='Manager Approved'"
+        )).fetchone()
+        approved_unpaid = conn.execute(text(
+            "SELECT COUNT(*), COALESCE(SUM(approved_amount),0) FROM expense_vouchers WHERE status='Approved'"
+        )).fetchone()
+        paid_this_month = conn.execute(text("""
+            SELECT COUNT(*), COALESCE(SUM(approved_amount),0) FROM expense_vouchers
+            WHERE status='Paid' AND TO_CHAR(payment_date, 'YYYY-MM') = TO_CHAR(CURRENT_DATE, 'YYYY-MM')
+        """)).fetchone()
+        by_category = conn.execute(text(f"""
+            SELECT category, COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total
+            FROM expense_vouchers {base_filter} GROUP BY category ORDER BY total DESC
+        """), params).mappings().all()
+
+    return {
+        "pending_manager_review":  {"count": pending_manager[0], "amount": float(pending_manager[1])},
+        "pending_finance_review":  {"count": pending_finance[0], "amount": float(pending_finance[1])},
+        "approved_unpaid":         {"count": approved_unpaid[0], "amount": float(approved_unpaid[1])},
+        "paid_this_month":         {"count": paid_this_month[0], "amount": float(paid_this_month[1])},
+        "by_category": [{"category": r["category"], "count": r["cnt"], "total": float(r["total"])} for r in by_category],
+    }
+
+
+# ---------- CATEGORY LIMITS (admin-configurable spend policy) ----------
+@app.get("/expenses/category-limits")
+def get_expense_category_limits():
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT * FROM expense_category_limits ORDER BY category")).mappings().all()
+    return [{"category": r["category"],
+             "daily_limit": float(r["daily_limit"]) if r["daily_limit"] is not None else None,
+             "monthly_limit": float(r["monthly_limit"]) if r["monthly_limit"] is not None else None} for r in rows]
+
+
+class ExpenseCategoryLimitIn(BaseModel):
+    role: str
+    category: str
+    daily_limit: Optional[float] = None
+    monthly_limit: Optional[float] = None
+
+
+@app.post("/expenses/category-limits")
+def upsert_expense_category_limit(data: ExpenseCategoryLimitIn):
+    if data.role != "admin":
+        return {"success": False, "message": "Only Admin can configure spend limits."}
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO expense_category_limits (category, daily_limit, monthly_limit)
+            VALUES (:cat, :dl, :ml)
+            ON CONFLICT (category) DO UPDATE
+            SET daily_limit = EXCLUDED.daily_limit, monthly_limit = EXCLUDED.monthly_limit
+        """), {"cat": data.category, "dl": data.daily_limit, "ml": data.monthly_limit})
+    return {"success": True}
+
+
+# ---------- AI BILL EXTRACTION (pre-fill the submit form) ----------
+@app.post("/expenses/extract-bill")
+async def extract_expense_bill(file: UploadFile = FastAPIFile(...)):
+    """Reads an uploaded bill/receipt photo or PDF and asks Claude to pull out
+    structured fields to pre-fill the voucher form. Best-effort -- the
+    employee should still review before submitting."""
+    if not ANTHROPIC_API_KEY:
+        return {"success": False, "message": "Bill scanning isn't configured yet. Set ANTHROPIC_API_KEY on the server."}
+
+    raw = await file.read()
+    b64data = _b64.b64encode(raw).decode()
+    ext = (file.filename or "").lower().split(".")[-1]
+    if ext == "pdf":
+        block_type, media_type = "document", "application/pdf"
+    else:
+        block_type = "image"
+        media_type = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
+
+    prompt = (
+        "You are reading a purchase receipt / bill. Extract the following fields and reply with "
+        "ONLY a strict JSON object -- no markdown fences, no commentary. Use null for anything not present.\n"
+        "{\n"
+        f'  "category": one of {DEFAULT_EXPENSE_CATEGORIES},\n'
+        '  "expense_date": "YYYY-MM-DD",\n'
+        '  "amount": number (the total/grand total paid),\n'
+        '  "vendor_name": string,\n'
+        '  "description": a short one-line summary of what was purchased\n'
+        "}"
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-5",
+                "max_tokens": 1000,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": block_type, "source": {"type": "base64", "media_type": media_type, "data": b64data}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            },
+            timeout=60,
+        )
+        result = resp.json()
+        if "content" not in result:
+            return {"success": False, "message": result.get("error", {}).get("message", "Extraction failed.")}
+        text_out = "".join(b.get("text", "") for b in result.get("content", []) if b.get("type") == "text")
+        cleaned = text_out.replace("```json", "").replace("```", "").strip()
+        extracted = _json.loads(cleaned)
+        return {"success": True, "data": extracted}
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't read that bill automatically: {e}"}
