@@ -7411,7 +7411,7 @@ def _expense_audit(conn, voucher_id, action, actor_id=None, actor_name=None, rem
 def _expense_manager_for(conn, user_id: int):
     row = conn.execute(text("""
         SELECT manager_id FROM team_members
-        WHERE employee_id = :uid ORDER BY id DESC LIMIT 1
+        WHERE employee_id = :uid LIMIT 1
     """), {"uid": user_id}).first()
     return row[0] if row and row[0] else None
 
