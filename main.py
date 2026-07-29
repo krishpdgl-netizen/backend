@@ -22,6 +22,43 @@ from datetime import date, timedelta
 import json
 import secrets
 import uuid as _uuid
+import time as _video_time
+import os as _video_os
+
+DAILY_API_KEY = _video_os.getenv("DAILY_API_KEY")
+
+def _create_video_room(room_name: str) -> str:
+    """
+    Creates a real multi-party video room via Daily.co (an actual SFU media
+    server, so it holds up properly for 6+ person calls) when DAILY_API_KEY
+    is configured. Falls back to a Jitsi P2P link if it isn't set yet or the
+    call fails, so meeting creation never breaks.
+    """
+    if DAILY_API_KEY:
+        try:
+            resp = requests.post(
+                "https://api.daily.co/v1/rooms",
+                headers={"Authorization": f"Bearer {DAILY_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "name": room_name,
+                    "privacy": "public",
+                    "properties": {
+                        "enable_chat": True,
+                        "enable_screenshare": True,
+                        "start_video_off": False,
+                        "start_audio_off": False,
+                        "exp": int(_video_time.time()) + 60 * 60 * 24 * 30,  # auto-expire in 30 days
+                    },
+                },
+                timeout=10,
+            )
+            data = resp.json()
+            if resp.status_code in (200, 201) and data.get("url"):
+                return data["url"]
+            print(f"[daily.co room create] non-200 response: {resp.status_code} {data}")
+        except Exception as e:
+            print(f"[daily.co room create] error: {e}")
+    return f"https://meet.jit.si/{room_name}"
 from pydantic import BaseModel
 from typing import List
 from sqlalchemy import text
@@ -2938,7 +2975,7 @@ def create_meeting(
     import json
     attendee_list = json.loads(attendees)
     room_name = f"panache-{_uuid.uuid4().hex[:12]}"
-    video_link = f"https://meet.jit.si/{room_name}"
+    video_link = _create_video_room(room_name)
 
     with engine.begin() as conn:
         conflict = conn.execute(
@@ -8228,7 +8265,7 @@ def start_instant_meeting(data: InstantMeetingIn):
     now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
     slot = now_ist.hour * 2 + (1 if now_ist.minute >= 30 else 0)
     room_name = f"panache-{_uuid.uuid4().hex[:12]}"
-    video_link = f"https://meet.jit.si/{room_name}"
+    video_link = _create_video_room(room_name)
 
     with engine.begin() as conn:
         meeting_id = conn.execute(text("""
