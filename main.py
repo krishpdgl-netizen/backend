@@ -58,6 +58,8 @@ def _create_video_room(room_name: str) -> str:
             print(f"[daily.co room create] non-200 response: {resp.status_code} {data}")
         except Exception as e:
             print(f"[daily.co room create] error: {e}")
+    else:
+        print("[daily.co room create] DAILY_API_KEY is not set — falling back to Jitsi")
     return f"https://meet.jit.si/{room_name}"
 from pydantic import BaseModel
 from typing import List
@@ -8309,3 +8311,34 @@ def upcoming_meetings(user_id: int, limit: int = 10):
         "end_time": slot_to_time(r["end_slot"]), "location": r["location"],
         "organizer_id": r["organizer_id"], "video_link": r["video_link"],
     } for r in rows]
+
+
+@app.get("/video/debug")
+def video_debug():
+    """
+    Self-check for the Daily.co integration: confirms whether DAILY_API_KEY
+    is actually being read by the running server, and if so, whether Daily's
+    API accepts it. Safe to hit any time -- never exposes the key itself.
+    """
+    if not DAILY_API_KEY:
+        return {
+            "daily_api_key_set": False,
+            "message": "DAILY_API_KEY is not set on this server (or the service hasn't restarted since it was added). "
+                        "Every meeting will use Jitsi until this is fixed.",
+        }
+    try:
+        resp = requests.get(
+            "https://api.daily.co/v1/",
+            headers={"Authorization": f"Bearer {DAILY_API_KEY}"},
+            timeout=10,
+        )
+        return {
+            "daily_api_key_set": True,
+            "key_preview": f"{DAILY_API_KEY[:4]}...{DAILY_API_KEY[-4:]}" if len(DAILY_API_KEY) > 8 else "(short key)",
+            "daily_api_status_code": resp.status_code,
+            "daily_api_response": resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text[:300],
+            "message": "Key looks valid and Daily accepted it." if resp.status_code == 200
+                       else "Daily rejected this key -- check it was copied correctly and hasn't been revoked.",
+        }
+    except Exception as e:
+        return {"daily_api_key_set": True, "message": f"Key is set, but the request to Daily's API failed: {e}"}
