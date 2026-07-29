@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from datetime import date, timedelta
 import json
 import secrets
+import uuid as _uuid
 from pydantic import BaseModel
 from typing import List
 from sqlalchemy import text
@@ -127,6 +128,8 @@ def create_tables():
                 created_at   TIMESTAMP DEFAULT NOW()
             )
         """))
+        conn.execute(text("ALTER TABLE meetings ADD COLUMN IF NOT EXISTS room_name TEXT"))
+        conn.execute(text("ALTER TABLE meetings ADD COLUMN IF NOT EXISTS video_link TEXT"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS meeting_attendees (
                 id              SERIAL PRIMARY KEY,
@@ -2934,6 +2937,8 @@ def create_meeting(
 ):
     import json
     attendee_list = json.loads(attendees)
+    room_name = f"panache-{_uuid.uuid4().hex[:12]}"
+    video_link = f"https://meet.jit.si/{room_name}"
 
     with engine.begin() as conn:
         conflict = conn.execute(
@@ -2953,14 +2958,17 @@ def create_meeting(
         meeting_id = conn.execute(
             text("""
                 INSERT INTO meetings
-                    (title, description, organizer_id, meeting_date, start_slot, end_slot, location)
+                    (title, description, organizer_id, meeting_date, start_slot, end_slot, location,
+                     room_name, video_link)
                 VALUES
-                    (:title, :description, :organizer_id, :meeting_date, :start_slot, :end_slot, :location)
+                    (:title, :description, :organizer_id, :meeting_date, :start_slot, :end_slot, :location,
+                     :room_name, :video_link)
                 RETURNING id
             """),
             {"title": title, "description": description, "organizer_id": organizer_id,
              "meeting_date": meeting_date, "start_slot": start_slot,
-             "end_slot": end_slot, "location": location}
+             "end_slot": end_slot, "location": location,
+             "room_name": room_name, "video_link": video_link}
         ).scalar()
 
         for uid in attendee_list:
@@ -2969,7 +2977,7 @@ def create_meeting(
                 {"mid": meeting_id, "uid": uid}
             )
 
-    return {"success": True, "meeting_id": meeting_id}
+    return {"success": True, "meeting_id": meeting_id, "video_link": video_link}
 
 
 
@@ -2980,7 +2988,7 @@ def get_month_meetings(user_id: int, month: str):
             text("""
                 SELECT DISTINCT m.id, m.title, m.description,
                     m.meeting_date, m.start_slot, m.end_slot,
-                    m.location, m.organizer_id
+                    m.location, m.organizer_id, m.video_link
                 FROM meetings m
                 LEFT JOIN meeting_attendees a ON m.id = a.meeting_id
                 WHERE (m.organizer_id = :user_id OR a.user_id = :user_id)
@@ -2993,7 +3001,7 @@ def get_month_meetings(user_id: int, month: str):
         {"id": r.id, "title": r.title, "description": r.description,
          "meeting_date": str(r.meeting_date), "date": str(r.meeting_date),
          "start_slot": r.start_slot, "end_slot": r.end_slot,
-         "location": r.location, "organizer_id": r.organizer_id}
+         "location": r.location, "organizer_id": r.organizer_id, "video_link": r.video_link}
         for r in rows
     ]
     
@@ -3004,7 +3012,7 @@ def get_day_meetings(date: str, user_id: int):
             text("""
             SELECT DISTINCT m.id, m.title, m.description,
                 m.meeting_date, m.start_slot, m.end_slot,
-                m.location, m.organizer_id
+                m.location, m.organizer_id, m.video_link
             FROM meetings m
             LEFT JOIN meeting_attendees a ON m.id = a.meeting_id
             WHERE m.meeting_date = :date
@@ -3026,6 +3034,7 @@ def get_day_meetings(date: str, user_id: int):
             "end_time":     slot_to_time(row.end_slot),
             "location":     row.location,
             "organizer_id": row.organizer_id,
+            "video_link":   row.video_link,
         }
         for row in rows
     ]
@@ -3079,7 +3088,8 @@ def get_week_meetings(user_id: int, week_start: str):
                 m.start_slot,
                 m.end_slot,
                 m.location,
-                m.organizer_id
+                m.organizer_id,
+                m.video_link
             FROM meetings m
 
             LEFT JOIN meeting_attendees a
@@ -3133,7 +3143,9 @@ def get_week_meetings(user_id: int, week_start: str):
 
             "location": row.location,
 
-            "organizer_id": row.organizer_id
+            "organizer_id": row.organizer_id,
+
+            "video_link": row.video_link
 
         })
 
@@ -3215,7 +3227,9 @@ def get_meeting_details(meeting_id: int):
 
             "location": row.location,
 
-            "organizer_id": row.organizer_id
+            "organizer_id": row.organizer_id,
+
+            "video_link": row.video_link
 
         },
 
@@ -7887,3 +7901,374 @@ async def extract_expense_bill(file: UploadFile = FastAPIFile(...)):
         return {"success": True, "data": extracted}
     except Exception as e:
         return {"success": False, "message": f"Couldn't read that bill automatically: {e}"}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# TEAM CHAT MODULE
+# DMs + group channels, polling-based (no websockets). Meetings reuse the
+# existing `meetings` / `meeting_attendees` tables (see room_name/video_link
+# columns added above) -- this section adds a quick "start an instant call"
+# helper that also drops the join link straight into a chat channel.
+# ════════════════════════════════════════════════════════════════════════
+
+try:
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS chat_channels (
+                id          SERIAL PRIMARY KEY,
+                name        TEXT,
+                type        TEXT NOT NULL DEFAULT 'group',  -- 'dm' | 'group'
+                created_by  INT,
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS chat_channel_members (
+                id            SERIAL PRIMARY KEY,
+                channel_id    INT NOT NULL REFERENCES chat_channels(id) ON DELETE CASCADE,
+                user_id       INT NOT NULL,
+                user_name     TEXT,
+                joined_at     TIMESTAMP DEFAULT NOW(),
+                last_read_at  TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id            SERIAL PRIMARY KEY,
+                channel_id    INT NOT NULL REFERENCES chat_channels(id) ON DELETE CASCADE,
+                sender_id     INT,
+                sender_name   TEXT,
+                content       TEXT DEFAULT '',
+                message_type  TEXT DEFAULT 'text',  -- 'text' | 'system' | 'file'
+                file_url      TEXT,
+                file_name     TEXT,
+                created_at    TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chat_messages_channel ON chat_messages(channel_id, id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chat_members_user ON chat_channel_members(user_id)"))
+except Exception as e:
+    print(f"[startup migration warning] chat module migration failed: {e}")
+
+
+def _chat_channel_display(conn, channel_id, viewer_id):
+    """Returns {name, type, member_ids} -- for a DM, name is the OTHER person's name."""
+    ch = conn.execute(text("SELECT id, name, type FROM chat_channels WHERE id=:id"), {"id": channel_id}).mappings().first()
+    if not ch:
+        return None
+    members = conn.execute(text(
+        "SELECT user_id, user_name FROM chat_channel_members WHERE channel_id=:cid"
+    ), {"cid": channel_id}).mappings().all()
+    member_ids = [m["user_id"] for m in members]
+    display_name = ch["name"]
+    if ch["type"] == "dm":
+        other = next((m for m in members if m["user_id"] != viewer_id), None)
+        display_name = other["user_name"] if other else (ch["name"] or "Direct Message")
+    return {"id": ch["id"], "type": ch["type"], "name": display_name, "member_ids": member_ids,
+            "members": [dict(m) for m in members]}
+
+
+# ---------- LIST MY CHANNELS (with last message + unread count) ----------
+@app.get("/chat/channels")
+def list_chat_channels(user_id: int):
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT c.id FROM chat_channels c
+            JOIN chat_channel_members cm ON cm.channel_id = c.id
+            WHERE cm.user_id = :uid
+        """), {"uid": user_id}).fetchall()
+
+        out = []
+        for (channel_id,) in rows:
+            info = _chat_channel_display(conn, channel_id, user_id)
+            if not info:
+                continue
+            last_msg = conn.execute(text("""
+                SELECT content, message_type, sender_name, created_at, id
+                FROM chat_messages WHERE channel_id=:cid ORDER BY id DESC LIMIT 1
+            """), {"cid": channel_id}).mappings().first()
+            member_row = conn.execute(text("""
+                SELECT last_read_at FROM chat_channel_members WHERE channel_id=:cid AND user_id=:uid
+            """), {"cid": channel_id, "uid": user_id}).first()
+            unread = 0
+            if member_row:
+                unread = conn.execute(text("""
+                    SELECT COUNT(*) FROM chat_messages
+                    WHERE channel_id=:cid AND created_at > :since AND sender_id != :uid
+                """), {"cid": channel_id, "since": member_row[0], "uid": user_id}).scalar() or 0
+            out.append({
+                "id": info["id"], "type": info["type"], "name": info["name"],
+                "member_ids": info["member_ids"],
+                "last_message": {
+                    "content": last_msg["content"] if last_msg else None,
+                    "type": last_msg["message_type"] if last_msg else None,
+                    "sender_name": last_msg["sender_name"] if last_msg else None,
+                    "created_at": str(last_msg["created_at"]) if last_msg else None,
+                } if last_msg else None,
+                "unread_count": unread,
+            })
+        out.sort(key=lambda c: c["last_message"]["created_at"] if c["last_message"] else "", reverse=True)
+    return out
+
+
+# ---------- FIND-OR-CREATE A DM ----------
+class ChatDmIn(BaseModel):
+    user_id: int
+    user_name: str
+    other_user_id: int
+    other_user_name: str
+
+
+@app.post("/chat/channels/dm")
+def open_dm_channel(data: ChatDmIn):
+    with engine.begin() as conn:
+        existing = conn.execute(text("""
+            SELECT cm1.channel_id
+            FROM chat_channel_members cm1
+            JOIN chat_channel_members cm2 ON cm1.channel_id = cm2.channel_id
+            JOIN chat_channels c ON c.id = cm1.channel_id
+            WHERE c.type = 'dm' AND cm1.user_id = :a AND cm2.user_id = :b
+            LIMIT 1
+        """), {"a": data.user_id, "b": data.other_user_id}).first()
+        if existing:
+            return {"success": True, "channel_id": existing[0]}
+
+        channel_id = conn.execute(text(
+            "INSERT INTO chat_channels (name, type, created_by) VALUES (NULL, 'dm', :cb) RETURNING id"
+        ), {"cb": data.user_id}).scalar()
+        conn.execute(text("""
+            INSERT INTO chat_channel_members (channel_id, user_id, user_name) VALUES
+            (:cid, :u1, :n1), (:cid, :u2, :n2)
+        """), {"cid": channel_id, "u1": data.user_id, "n1": data.user_name,
+                "u2": data.other_user_id, "n2": data.other_user_name})
+    return {"success": True, "channel_id": channel_id}
+
+
+# ---------- CREATE A GROUP CHANNEL ----------
+class ChatGroupIn(BaseModel):
+    name: str
+    created_by: int
+    created_by_name: str
+    member_ids: List[int] = []   # other members, NOT including the creator
+    member_names: List[str] = []
+
+
+@app.post("/chat/channels/group")
+def create_group_channel(data: ChatGroupIn):
+    if not data.name.strip():
+        return {"success": False, "message": "Group needs a name."}
+    with engine.begin() as conn:
+        channel_id = conn.execute(text(
+            "INSERT INTO chat_channels (name, type, created_by) VALUES (:name, 'group', :cb) RETURNING id"
+        ), {"name": data.name.strip(), "cb": data.created_by}).scalar()
+
+        conn.execute(text(
+            "INSERT INTO chat_channel_members (channel_id, user_id, user_name) VALUES (:cid, :uid, :name)"
+        ), {"cid": channel_id, "uid": data.created_by, "name": data.created_by_name})
+
+        for uid, name in zip(data.member_ids, data.member_names):
+            if uid == data.created_by:
+                continue
+            conn.execute(text(
+                "INSERT INTO chat_channel_members (channel_id, user_id, user_name) VALUES (:cid, :uid, :name)"
+            ), {"cid": channel_id, "uid": uid, "name": name})
+
+        _chat_system_message(conn, channel_id, f"{data.created_by_name} created the group.")
+    return {"success": True, "channel_id": channel_id}
+
+
+def _chat_system_message(conn, channel_id, content):
+    conn.execute(text("""
+        INSERT INTO chat_messages (channel_id, sender_id, sender_name, content, message_type)
+        VALUES (:cid, NULL, 'System', :content, 'system')
+    """), {"cid": channel_id, "content": content})
+
+
+# ---------- CHANNEL INFO + MEMBERS ----------
+@app.get("/chat/channels/{channel_id}")
+def get_chat_channel(channel_id: int, user_id: int = 0):
+    with engine.connect() as conn:
+        info = _chat_channel_display(conn, channel_id, user_id)
+    if not info:
+        return {"success": False, "message": "Channel not found."}
+    return {"success": True, **info}
+
+
+class ChatMemberIn(BaseModel):
+    user_id: int
+    user_name: str
+    added_by_name: Optional[str] = None
+
+
+@app.post("/chat/channels/{channel_id}/members")
+def add_chat_member(channel_id: int, data: ChatMemberIn):
+    with engine.begin() as conn:
+        ch = conn.execute(text("SELECT type FROM chat_channels WHERE id=:id"), {"id": channel_id}).first()
+        if not ch:
+            return {"success": False, "message": "Channel not found."}
+        if ch[0] != "group":
+            return {"success": False, "message": "Can't add members to a direct message."}
+        already = conn.execute(text(
+            "SELECT 1 FROM chat_channel_members WHERE channel_id=:cid AND user_id=:uid"
+        ), {"cid": channel_id, "uid": data.user_id}).first()
+        if already:
+            return {"success": False, "message": f"{data.user_name} is already in this group."}
+        conn.execute(text(
+            "INSERT INTO chat_channel_members (channel_id, user_id, user_name) VALUES (:cid, :uid, :name)"
+        ), {"cid": channel_id, "uid": data.user_id, "name": data.user_name})
+        _chat_system_message(conn, channel_id,
+            f"{data.added_by_name + ' added ' if data.added_by_name else ''}{data.user_name} to the group.")
+    return {"success": True}
+
+
+@app.delete("/chat/channels/{channel_id}/members/{user_id}")
+def remove_chat_member(channel_id: int, user_id: int, leaver_name: Optional[str] = None):
+    with engine.begin() as conn:
+        conn.execute(text(
+            "DELETE FROM chat_channel_members WHERE channel_id=:cid AND user_id=:uid"
+        ), {"cid": channel_id, "uid": user_id})
+        if leaver_name:
+            _chat_system_message(conn, channel_id, f"{leaver_name} left the group.")
+    return {"success": True}
+
+
+# ---------- MESSAGES (poll with since_id) ----------
+@app.get("/chat/channels/{channel_id}/messages")
+def get_chat_messages(channel_id: int, since_id: int = 0, limit: int = 50):
+    with engine.connect() as conn:
+        if since_id > 0:
+            rows = conn.execute(text("""
+                SELECT id, sender_id, sender_name, content, message_type, file_url, file_name, created_at
+                FROM chat_messages WHERE channel_id=:cid AND id > :sid ORDER BY id ASC
+            """), {"cid": channel_id, "sid": since_id}).mappings().all()
+        else:
+            rows = conn.execute(text("""
+                SELECT id, sender_id, sender_name, content, message_type, file_url, file_name, created_at
+                FROM chat_messages WHERE channel_id=:cid ORDER BY id DESC LIMIT :lim
+            """), {"cid": channel_id, "lim": limit}).mappings().all()
+            rows = list(reversed(rows))
+    return [
+        {**dict(r), "created_at": str(r["created_at"])}
+        for r in rows
+    ]
+
+
+@app.post("/chat/channels/{channel_id}/messages")
+async def send_chat_message(
+    channel_id: int,
+    sender_id: int = Form(...),
+    sender_name: str = Form(...),
+    content: str = Form(""),
+    file: UploadFile = FastAPIFile(None),
+):
+    try:
+        file_url, file_name, msg_type = None, None, "text"
+        with engine.begin() as conn:
+            if file and file.filename:
+                safe_name = f"chat_{channel_id}_{int(_exp_time.time()*1000)}_{file.filename.replace(' ', '_')}"
+                contents = await file.read()
+                conn.execute(text("""
+                    INSERT INTO stored_files (filename, content_type, data, original_name)
+                    VALUES (:fn, :ct, :data, :orig)
+                    ON CONFLICT (filename) DO UPDATE
+                    SET content_type = EXCLUDED.content_type, data = EXCLUDED.data,
+                        original_name = EXCLUDED.original_name, created_at = now()
+                """), {"fn": safe_name, "ct": file.content_type, "data": contents, "orig": file.filename})
+                file_url = f"/expenses/bill/{safe_name}"  # reuses the same generic blob server route
+                file_name = file.filename
+                msg_type = "file"
+
+            if not content.strip() and not file_url:
+                return {"success": False, "message": "Message can't be empty."}
+
+            result = conn.execute(text("""
+                INSERT INTO chat_messages (channel_id, sender_id, sender_name, content, message_type, file_url, file_name)
+                VALUES (:cid, :sid, :sname, :content, :mtype, :furl, :fname)
+                RETURNING id, created_at
+            """), {"cid": channel_id, "sid": sender_id, "sname": sender_name, "content": content,
+                    "mtype": msg_type, "furl": file_url, "fname": file_name})
+            row = result.fetchone()
+        return {"success": True, "id": row[0], "created_at": str(row[1]), "file_url": file_url, "file_name": file_name}
+    except Exception as e:
+        print(f"[chat/messages] error: {e}")
+        return {"success": False, "message": f"Couldn't send that message: {e}"}
+
+
+class ChatReadIn(BaseModel):
+    user_id: int
+
+
+@app.post("/chat/channels/{channel_id}/read")
+def mark_chat_read(channel_id: int, data: ChatReadIn):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE chat_channel_members SET last_read_at = NOW()
+            WHERE channel_id=:cid AND user_id=:uid
+        """), {"cid": channel_id, "uid": data.user_id})
+    return {"success": True}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# INSTANT / SCHEDULED VIDEO CALLS (Jitsi -- no API key needed)
+# Scheduled calls piggyback on the existing /meetings/create endpoint,
+# which now stamps every meeting with a room_name + video_link. This adds
+# a one-click "Start a call now" and a simple "what's coming up" list.
+# ════════════════════════════════════════════════════════════════════════
+
+class InstantMeetingIn(BaseModel):
+    organizer_id: int
+    organizer_name: str
+    title: str = "Quick Call"
+    attendee_ids: List[int] = []
+    channel_id: Optional[int] = None   # if set, the join link is also posted into this chat channel
+
+
+@app.post("/meetings/instant")
+def start_instant_meeting(data: InstantMeetingIn):
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    slot = now_ist.hour * 2 + (1 if now_ist.minute >= 30 else 0)
+    room_name = f"panache-{_uuid.uuid4().hex[:12]}"
+    video_link = f"https://meet.jit.si/{room_name}"
+
+    with engine.begin() as conn:
+        meeting_id = conn.execute(text("""
+            INSERT INTO meetings (title, description, organizer_id, meeting_date, start_slot, end_slot,
+                                   location, room_name, video_link)
+            VALUES (:title, 'Instant call', :oid, :d, :s, :e, 'Video Call', :rn, :vl)
+            RETURNING id
+        """), {"title": data.title, "oid": data.organizer_id, "d": now_ist.date(),
+                "s": slot, "e": min(slot + 2, 47), "rn": room_name, "vl": video_link}).scalar()
+
+        for uid in data.attendee_ids:
+            conn.execute(text(
+                "INSERT INTO meeting_attendees (meeting_id, user_id, response_status) VALUES (:mid, :uid, 'accepted')"
+            ), {"mid": meeting_id, "uid": uid})
+
+        if data.channel_id:
+            _chat_system_message(
+                conn, data.channel_id,
+                f"{data.organizer_name} started a video call — join: {video_link}"
+            )
+
+    return {"success": True, "meeting_id": meeting_id, "video_link": video_link}
+
+
+@app.get("/meetings/upcoming")
+def upcoming_meetings(user_id: int, limit: int = 10):
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT DISTINCT m.id, m.title, m.description, m.meeting_date, m.start_slot, m.end_slot,
+                   m.location, m.organizer_id, m.video_link
+            FROM meetings m
+            LEFT JOIN meeting_attendees a ON m.id = a.meeting_id
+            WHERE (m.organizer_id = :uid OR a.user_id = :uid)
+              AND m.meeting_date >= CURRENT_DATE
+            ORDER BY m.meeting_date, m.start_slot
+            LIMIT :lim
+        """), {"uid": user_id, "lim": limit}).mappings().all()
+    return [{
+        "id": r["id"], "title": r["title"], "description": r["description"],
+        "date": str(r["meeting_date"]), "start_time": slot_to_time(r["start_slot"]),
+        "end_time": slot_to_time(r["end_slot"]), "location": r["location"],
+        "organizer_id": r["organizer_id"], "video_link": r["video_link"],
+    } for r in rows]
