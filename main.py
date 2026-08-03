@@ -5306,6 +5306,20 @@ def list_device_map(_admin: dict = Depends(require_roles("admin"))):
     return [dict(r) for r in rows]
 
 
+@app.get("/attendance/mappable-employees")
+def list_mappable_employees(_admin: dict = Depends(require_roles("admin"))):
+    """
+    Every system user an admin can point a device Person ID at (unlike
+    GET /employees, this isn't restricted to role='employee' -- managers
+    and admins can badge in at the gate too).
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT id, full_name, role FROM users ORDER BY full_name")
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
 @app.post("/attendance/device-map")
 def upsert_device_map(data: DeviceMapIn, _admin: dict = Depends(require_roles("admin"))):
     """Manually map (or fix) one device Person ID to a system employee."""
