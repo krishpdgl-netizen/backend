@@ -4940,6 +4940,18 @@ class AttendanceSettingsUpdate(BaseModel):
     late_grace_minutes: Optional[int] = None
     overtime_after_hours: Optional[float] = None
     office_start_time: Optional[str] = None
+    # Check-in falling in [late_mark_from, late_mark_to] -> Late (still Present).
+    late_mark_from: Optional[str] = None
+    late_mark_to: Optional[str] = None
+    # Check-in at/after half_day_from -> Half Day (open-ended; half_day_to is
+    # informational only, since a check-in this late has no separate handling
+    # beyond Half Day).
+    half_day_from: Optional[str] = None
+    half_day_to: Optional[str] = None
+    # Check-out falling in [early_out_from, early_out_to] -> Early Out;
+    # early_leaving minutes = early_out_to - check_out.
+    early_out_from: Optional[str] = None
+    early_out_to: Optional[str] = None
 
 
 # ── HELPERS ─────────────────────────────────────────────────────
@@ -4974,19 +4986,74 @@ def _working_days_in_month(year: int, month: int) -> int:
 
 def _get_settings(conn) -> dict:
     row = conn.execute(text("SELECT * FROM attendance_settings WHERE id=1")).mappings().fetchone()
-    settings = dict(row) if row else {
+    settings = dict(row) if row else {}
+    defaults = {
         "correction_window_hours": 24,
         "standard_work_hours": 9.0,
         "late_grace_minutes": 10,
         "overtime_after_hours": 9.0,
         "office_start_time": "09:00",
+        "late_mark_from": "09:16",
+        "late_mark_to": "10:59",
+        "half_day_from": "11:00",
+        "half_day_to": "15:59",
+        "early_out_from": "16:00",
+        "early_out_to": "17:50",
     }
+    for k, v in defaults.items():
+        if settings.get(k) is None:
+            settings[k] = v
     # Postgres TIME columns come back as datetime.time objects, not strings.
-    # Normalize to "HH:MM" so downstream .split(":") calls always work.
-    ost = settings.get("office_start_time")
-    if ost is not None and not isinstance(ost, str):
-        settings["office_start_time"] = ost.strftime("%H:%M")
+    # Normalize every "HH:MM" setting so downstream .split(":") calls always work.
+    for key in ("office_start_time", "late_mark_from", "late_mark_to",
+                "half_day_from", "half_day_to", "early_out_from", "early_out_to"):
+        val = settings.get(key)
+        if val is not None and not isinstance(val, str):
+            settings[key] = val.strftime("%H:%M")
     return settings
+
+
+def _time_to_minutes(hhmm: str) -> int:
+    h, m = map(int, hhmm.split(":"))
+    return h * 60 + m
+
+
+def _classify_checkin(ci_str: str, settings: dict):
+    """
+    Classify a check-in time against the configured Late / Half-Day windows.
+    Returns (status, late_minutes, is_late):
+      - before late_mark_from            -> ("Present", 0, False)                      (on time)
+      - [late_mark_from, late_mark_to]   -> ("Present", minutes past late_mark_from, True)   (late, but still a full day)
+      - at/after half_day_from           -> ("Half Day", minutes past late_mark_from, False) (open-ended -- a check-in
+                                             any later than half_day_from is still Half Day)
+    late_minutes is measured from late_mark_from (not office_start), so it's
+    always zero for an on-time check-in and only grows once you're actually
+    inside the late/half-day zone.
+    """
+    ci_mins   = _time_to_minutes(ci_str)
+    late_from = _time_to_minutes(settings.get("late_mark_from", "09:16"))
+    half_from = _time_to_minutes(settings.get("half_day_from", "11:00"))
+
+    if ci_mins >= half_from:
+        return "Half Day", max(0, ci_mins - late_from), False
+    if ci_mins >= late_from:
+        return "Present", ci_mins - late_from, True
+    return "Present", 0, False
+
+
+def _classify_checkout(co_str: str, settings: dict):
+    """
+    Classify a check-out time against the configured Early-Out window.
+    Returns (early_leaving_minutes, is_early_out). early_leaving_minutes is
+    measured back from early_out_to (i.e. how many minutes short of the
+    "should stay until" mark they left).
+    """
+    co_mins = _time_to_minutes(co_str)
+    eo_from = _time_to_minutes(settings.get("early_out_from", "16:00"))
+    eo_to   = _time_to_minutes(settings.get("early_out_to", "17:50"))
+    if eo_from <= co_mins <= eo_to:
+        return max(0, eo_to - co_mins), True
+    return 0, False
 
 
 # ================================================================
@@ -5083,7 +5150,21 @@ def create_attendance(data: AttendanceRecord):
     """
     Create a single attendance record.
     Raises HTTP 409 if a record already exists for emp_id + att_date.
+
+    If status is left as the default "Present" and a check_in was given,
+    it's auto-classified against the configured Late-Mark / Half-Day /
+    Early-Out windows (same logic used by the biometric import). Any other
+    explicitly chosen status (Leave, Holiday, Work From Home, etc.) is left
+    exactly as given.
     """
+    status, late_minutes, early_leaving = data.status, data.late_minutes, data.early_leaving
+    if status == "Present" and data.check_in:
+        with engine.connect() as conn:
+            settings = _get_settings(conn)
+        status, late_minutes, _ = _classify_checkin(data.check_in, settings)
+        if data.check_out:
+            early_leaving, _ = _classify_checkout(data.check_out, settings)
+
     hours = data.working_hours if data.working_hours and data.working_hours != "—" else _calc_hours(data.check_in, data.check_out)
 
     try:
@@ -5110,9 +5191,9 @@ def create_attendance(data: AttendanceRecord):
                     "check_in":     data.check_in,
                     "check_out":    data.check_out,
                     "working_hours":hours,
-                    "status":       data.status,
-                    "late_minutes": data.late_minutes,
-                    "early_leaving":data.early_leaving,
+                    "status":       status,
+                    "late_minutes": late_minutes,
+                    "early_leaving":early_leaving,
                     "overtime":     data.overtime,
                     "remarks":      data.remarks,
                     "source":       data.source,
@@ -5138,12 +5219,25 @@ def update_attendance(attendance_id: int, data: AttendancePatch, _staff: dict = 
     if "check_in" in updates or "check_out" in updates:
         with engine.connect() as conn:
             existing = conn.execute(
-                text("SELECT check_in, check_out FROM attendance WHERE id=:id"),
+                text("SELECT check_in, check_out, status FROM attendance WHERE id=:id"),
                 {"id": attendance_id}
             ).fetchone()
-        ci = updates.get("check_in", str(existing.check_in) if existing and existing.check_in else None)
-        co = updates.get("check_out", str(existing.check_out) if existing and existing.check_out else None)
+        ci = updates.get("check_in", str(existing.check_in)[:5] if existing and existing.check_in else None)
+        co = updates.get("check_out", str(existing.check_out)[:5] if existing and existing.check_out else None)
         updates["working_hours"] = _calc_hours(ci, co)
+
+        # Same auto-classification as create_attendance: only kicks in if the
+        # record's status is (or is being set to) the default "Present".
+        effective_status = updates.get("status", existing.status if existing else "Present")
+        if effective_status == "Present" and ci:
+            with engine.connect() as conn:
+                settings = _get_settings(conn)
+            new_status, late_mins, _ = _classify_checkin(ci, settings)
+            updates["status"] = new_status
+            updates["late_minutes"] = late_mins
+            if co:
+                early_mins, _ = _classify_checkout(co, settings)
+                updates["early_leaving"] = early_mins
 
     updates["updated_at"] = datetime.now()
     set_clause = ", ".join(f"{k} = :{k}" for k in updates)
@@ -5270,6 +5364,21 @@ def _create_attendance_device_map_table():
                 created_at       TIMESTAMP DEFAULT NOW()
             )
         """))
+
+
+@app.on_event("startup")
+def _extend_attendance_settings_table():
+    """Add the Late-Mark / Half-Day / Early-Out window columns (idempotent)."""
+    with engine.begin() as conn:
+        for col_sql in [
+            "ALTER TABLE attendance_settings ADD COLUMN IF NOT EXISTS late_mark_from TIME DEFAULT '09:16'",
+            "ALTER TABLE attendance_settings ADD COLUMN IF NOT EXISTS late_mark_to   TIME DEFAULT '10:59'",
+            "ALTER TABLE attendance_settings ADD COLUMN IF NOT EXISTS half_day_from  TIME DEFAULT '11:00'",
+            "ALTER TABLE attendance_settings ADD COLUMN IF NOT EXISTS half_day_to    TIME DEFAULT '15:59'",
+            "ALTER TABLE attendance_settings ADD COLUMN IF NOT EXISTS early_out_from TIME DEFAULT '16:00'",
+            "ALTER TABLE attendance_settings ADD COLUMN IF NOT EXISTS early_out_to   TIME DEFAULT '17:50'",
+        ]:
+            conn.execute(text(col_sql))
 
 
 def _parse_scan_datetime(raw: str):
@@ -5442,12 +5551,10 @@ async def import_scan_log(
     # 3) Build daily attendance rows for every matched employee
     with engine.connect() as conn:
         settings = _get_settings(conn)
-    office_start = settings.get("office_start_time", "09:00")
-    grace        = int(settings.get("late_grace_minutes", 10))
-    std_hours    = float(settings.get("standard_work_hours", 9.0))
-    os_h, os_m   = map(int, office_start.split(":"))
+    std_hours = float(settings.get("standard_work_hours", 9.0))
 
     days_written, single_scan_days, absents_marked = 0, 0, 0
+    late_days, half_days, early_out_days = 0, 0, 0
 
     with engine.begin() as conn:
         for pid, day_map in scans.items():
@@ -5461,16 +5568,35 @@ async def import_scan_log(
                 ci_str = ci_dt.strftime("%H:%M")
                 co_str = co_dt.strftime("%H:%M") if co_dt else None
                 hours  = _calc_hours(ci_str, co_str) if co_str else "—"
-                late_mins = max(0, (ci_dt.hour * 60 + ci_dt.minute) - (os_h * 60 + os_m) - grace)
+
+                status, late_mins, is_late = _classify_checkin(ci_str, settings)
+                if status == "Half Day":
+                    half_days += 1
+                elif is_late:
+                    late_days += 1
+
+                early_mins, is_early_out = (0, False)
+                if co_str:
+                    early_mins, is_early_out = _classify_checkout(co_str, settings)
+                    if is_early_out:
+                        early_out_days += 1
+
                 ot_hours = 0.0
                 if co_dt:
                     worked_mins = int((co_dt - ci_dt).total_seconds() / 60)
                     ot_hours = round(max(0, worked_mins - std_hours * 60) / 60, 2)
-                if co_str:
-                    remarks = ""
-                else:
-                    remarks = "Single scan on device -- checkout time missing"
+
+                remark_bits = []
+                if not co_str:
+                    remark_bits.append("Single scan on device -- checkout time missing")
                     single_scan_days += 1
+                if status == "Half Day":
+                    remark_bits.append(f"Half day (checked in {ci_str})")
+                elif is_late:
+                    remark_bits.append(f"Late by {late_mins} min")
+                if is_early_out:
+                    remark_bits.append(f"Left early ({early_mins} min short)")
+                remarks = " · ".join(remark_bits)
 
                 existing = conn.execute(
                     text("SELECT source FROM attendance WHERE emp_id=:eid AND att_date=:d"),
@@ -5482,19 +5608,20 @@ async def import_scan_log(
                 conn.execute(text("""
                     INSERT INTO attendance
                         (emp_id, emp_name, department, att_date, check_in, check_out,
-                         working_hours, status, late_minutes, overtime, remarks, source,
+                         working_hours, status, late_minutes, early_leaving, overtime, remarks, source,
                          created_at, updated_at)
                     VALUES
-                        (:eid, :ename, :dept, :d, :ci, :co, :hrs, 'Present', :late, :ot, :remarks,
+                        (:eid, :ename, :dept, :d, :ci, :co, :hrs, :status, :late, :early, :ot, :remarks,
                          'biometric_import', NOW(), NOW())
                     ON CONFLICT (emp_id, att_date) DO UPDATE SET
                         check_in = EXCLUDED.check_in, check_out = EXCLUDED.check_out,
                         working_hours = EXCLUDED.working_hours, status = EXCLUDED.status,
-                        late_minutes = EXCLUDED.late_minutes, overtime = EXCLUDED.overtime,
-                        remarks = EXCLUDED.remarks, source = 'biometric_import', updated_at = NOW()
+                        late_minutes = EXCLUDED.late_minutes, early_leaving = EXCLUDED.early_leaving,
+                        overtime = EXCLUDED.overtime, remarks = EXCLUDED.remarks,
+                        source = 'biometric_import', updated_at = NOW()
                 """), {"eid": emp["emp_id"], "ename": emp["emp_name"], "dept": emp["department"],
-                       "d": d.isoformat(), "ci": ci_str, "co": co_str, "hrs": hours,
-                       "late": late_mins, "ot": ot_hours, "remarks": remarks})
+                       "d": d.isoformat(), "ci": ci_str, "co": co_str, "hrs": hours, "status": status,
+                       "late": late_mins, "early": early_mins, "ot": ot_hours, "remarks": remarks})
                 days_written += 1
 
         # 4) Optionally mark Absent for scan-less working days in the month
@@ -5546,11 +5673,17 @@ async def import_scan_log(
         "employees_matched": len(resolved),
         "days_written": days_written,
         "single_scan_days": single_scan_days,
+        "late_days": late_days,
+        "half_days": half_days,
+        "early_out_days": early_out_days,
         "absents_marked": absents_marked,
         "new_mappings": new_mappings,
         "unmatched": unmatched,
         "message": (
             f"Imported {days_written} day(s) across {len(resolved)} employee(s)."
+            + (f" {late_days} late." if late_days else "")
+            + (f" {half_days} half day(s)." if half_days else "")
+            + (f" {early_out_days} early-out(s)." if early_out_days else "")
             + (f" {absents_marked} absent day(s) marked." if absents_marked else "")
             + (f" {len(unmatched)} name(s) couldn't be matched -- map them manually and re-import."
                if unmatched else "")
