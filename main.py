@@ -6282,12 +6282,16 @@ def get_payroll(month: Optional[str] = None, emp_id: Optional[str] = None):
 
 
 @app.post("/payroll/generate")
-def generate_payroll(month: str, generated_by: str = "HR Admin", _admin: dict = Depends(require_roles("admin"))):
+def generate_payroll(month: str, generated_by: str = "HR Admin", force: bool = False, _admin: dict = Depends(require_roles("admin"))):
     """
     Generates payroll for ALL employees who have a salary structure,
     for the given pay cycle (YYYY-MM = the month the 26th->25th cycle ends in).
     Fails if payroll is already locked for that month.
     Overwrites any un-locked draft for the same month.
+
+    Refuses to run until the cycle has actually ended, unless force=true --
+    generating mid-cycle can't tell "day hasn't happened yet" apart from
+    "day was missed", so every un-elapsed day gets counted as LOP.
     """
     # Validate month format
     try:
@@ -6296,6 +6300,19 @@ def generate_payroll(month: str, generated_by: str = "HR Admin", _admin: dict = 
         return {"success": False, "message": "Invalid month format. Use YYYY-MM."}
 
     cyc_start, cyc_end = _cycle_bounds(month)
+
+    today = _ist_today()
+    if not force and cyc_end > today:
+        return {
+            "success": False,
+            "message": (
+                f"This pay cycle ({cyc_start.strftime('%d %b')} - {cyc_end.strftime('%d %b %Y')}) "
+                f"hasn't ended yet -- it runs through {cyc_end.strftime('%d %b %Y')}. Generating now would "
+                "mark every day after today as Loss of Pay, since there's no scan data for days that "
+                "haven't happened. Wait until the cycle ends, or pass force=true to generate an early "
+                "preview draft anyway."
+            ),
+        }
 
     with engine.connect() as conn:
         lock = conn.execute(
