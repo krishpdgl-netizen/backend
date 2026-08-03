@@ -1332,15 +1332,15 @@ def ceo_overview(_staff: dict = Depends(require_roles("ceo", "admin"))):
     month_start = _ist_today().replace(day=1).isoformat()
     payroll_month = _ist_today().strftime("%Y-%m")
 
-    # Attendance cycle runs 25th -> 24th (not the calendar month) --
-    # e.g. on any day from Jun 25 to Jul 24, the current cycle started Jun 25.
+    # Attendance cycle runs 26th -> 25th (not the calendar month) --
+    # e.g. on any day from Jun 26 to Jul 25, the current cycle started Jun 26.
     _today_d = _ist_today()
-    if _today_d.day >= 25:
-        cycle_start = _today_d.replace(day=25).isoformat()
+    if _today_d.day >= 26:
+        cycle_start = _today_d.replace(day=26).isoformat()
     elif _today_d.month == 1:
-        cycle_start = date(_today_d.year - 1, 12, 25).isoformat()
+        cycle_start = date(_today_d.year - 1, 12, 26).isoformat()
     else:
-        cycle_start = _today_d.replace(month=_today_d.month - 1, day=25).isoformat()
+        cycle_start = _today_d.replace(month=_today_d.month - 1, day=26).isoformat()
 
     with engine.connect() as conn:
 
@@ -5068,24 +5068,24 @@ def _classify_checkout(co_str: str, settings: dict):
 
 def _cycle_bounds(cycle_label: str):
     """
-    The attendance/payroll cycle runs the 25th -> the 24th, not a calendar
+    The attendance/payroll cycle runs the 26th -> the 25th, not a calendar
     month. cycle_label is "YYYY-MM" for the month the cycle ENDS in --
-    e.g. cycle "2026-07" = Jun 25, 2026 -> Jul 24, 2026 (inclusive).
+    e.g. cycle "2026-07" = Jun 26, 2026 -> Jul 25, 2026 (inclusive).
     Returns (start_date, end_date) as date objects.
     """
     y, m = map(int, cycle_label.split("-"))
-    end = date(y, m, 24)
+    end = date(y, m, 25)
     if m == 1:
-        start = date(y - 1, 12, 25)
+        start = date(y - 1, 12, 26)
     else:
-        start = date(y, m - 1, 25)
+        start = date(y, m - 1, 26)
     return start, end
 
 
 def _current_cycle_label(today: Optional[date] = None) -> str:
     """The cycle label ('YYYY-MM') that `today` falls into."""
     d = today or _ist_today()
-    if d.day >= 25:
+    if d.day >= 26:
         y, m = (d.year, d.month + 1) if d.month < 12 else (d.year + 1, 1)
     else:
         y, m = d.year, d.month
@@ -5099,9 +5099,9 @@ def _current_cycle_label(today: Optional[date] = None) -> str:
 @app.get("/attendance/cycle-info")
 def attendance_cycle_info(cycle: Optional[str] = None):
     """
-    Resolve a cycle label ("YYYY-MM") to its actual date range (25th -> 24th).
+    Resolve a cycle label ("YYYY-MM") to its actual date range (26th -> 25th).
     Defaults to whichever cycle today falls into. Used by the frontend so it
-    never has to duplicate the 25th-24th math itself.
+    never has to duplicate the 26th-25th math itself.
     """
     label = cycle or _current_cycle_label()
     start, end = _cycle_bounds(label)
@@ -5145,7 +5145,7 @@ def get_attendance(
     emp_id: Optional[str]    = None,
     att_date: Optional[str]  = None,
     month: Optional[str]     = None,   # YYYY-MM, calendar month
-    cycle: Optional[str]     = None,   # YYYY-MM, the 25th->24th pay cycle ending in that month
+    cycle: Optional[str]     = None,   # YYYY-MM, the 26th->25th pay cycle ending in that month
     department: Optional[str]= None,
     status: Optional[str]    = None,
     from_date: Optional[str] = None,
@@ -5156,7 +5156,7 @@ def get_attendance(
     - emp_id      → single employee
     - att_date    → exact date  (YYYY-MM-DD)
     - month       → all records for that CALENDAR month (YYYY-MM)
-    - cycle       → all records for that PAY CYCLE (25th -> 24th, YYYY-MM = the month it ends in)
+    - cycle       → all records for that PAY CYCLE (26th -> 25th, YYYY-MM = the month it ends in)
     - department  → filter by dept
     - status      → Present | Absent | …
     - from_date / to_date → date range
@@ -5402,7 +5402,7 @@ def attendance_summary_today():
 def employee_monthly_summary(emp_id: str, month: Optional[str] = None, cycle: Optional[str] = None):
     """
     Returns summary counts for an employee for a given period.
-    - cycle (YYYY-MM) → the 25th->24th pay cycle ending in that month (preferred;
+    - cycle (YYYY-MM) → the 26th->25th pay cycle ending in that month (preferred;
       this is what the employee "My Attendance" dashboard cards use).
     - month (YYYY-MM) → plain calendar month, kept for backward compatibility.
     """
@@ -5561,7 +5561,7 @@ def delete_device_map(device_person_id: str, _admin: dict = Depends(require_role
 @app.post("/attendance/import-scan-log")
 async def import_scan_log(
     file: UploadFile = FastAPIFile(...),
-    mark_absent_for_month: Optional[str] = Form(None),   # "YYYY-MM" pay cycle (25th->24th), optional
+    mark_absent_for_month: Optional[str] = Form(None),   # "YYYY-MM" pay cycle (26th->25th), optional
     _admin: dict = Depends(require_roles("admin")),
 ):
     """
@@ -5580,7 +5580,7 @@ async def import_scan_log(
       (source = 'manual' or 'correction').
     - If mark_absent_for_month is given ("YYYY-MM", the month the pay cycle
       ends in), any matched employee with zero scans on a working day in
-      that 25th->24th cycle (Mon-Fri, not a holiday, not on approved
+      that 26th->25th cycle (Mon-Fri, not a holiday, not on approved
       leave, not in the future) is marked Absent.
     """
     raw = await file.read()
@@ -5731,7 +5731,7 @@ async def import_scan_log(
                 days_written += 1
 
         # 4) Optionally mark Absent for scan-less working days in the pay
-        #    cycle (25th -> 24th; mark_absent_for_month is the YYYY-MM the
+        #    cycle (26th -> 25th; mark_absent_for_month is the YYYY-MM the
         #    cycle ends in, same label the "month" input already collects).
         if mark_absent_for_month:
             cyc_start, last_day = _cycle_bounds(mark_absent_for_month)
