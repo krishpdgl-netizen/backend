@@ -1332,6 +1332,16 @@ def ceo_overview(_staff: dict = Depends(require_roles("ceo", "admin"))):
     month_start = _ist_today().replace(day=1).isoformat()
     payroll_month = _ist_today().strftime("%Y-%m")
 
+    # Attendance cycle runs 25th -> 24th (not the calendar month) --
+    # e.g. on any day from Jun 25 to Jul 24, the current cycle started Jun 25.
+    _today_d = _ist_today()
+    if _today_d.day >= 25:
+        cycle_start = _today_d.replace(day=25).isoformat()
+    elif _today_d.month == 1:
+        cycle_start = date(_today_d.year - 1, 12, 25).isoformat()
+    else:
+        cycle_start = _today_d.replace(month=_today_d.month - 1, day=25).isoformat()
+
     with engine.connect() as conn:
 
         # ── headcount by role ─────────────────────────────
@@ -1349,7 +1359,7 @@ def ceo_overview(_staff: dict = Depends(require_roles("ceo", "admin"))):
         att_today = {r["status"]: r["cnt"] for r in att_today_rows}
         present_today = att_today.get("Present", 0) + att_today.get("Work From Home", 0)
 
-        # ── attendance this month (company-wide %) ────────
+        # ── attendance this cycle (company-wide %, 25th -> 24th) ──
         month_att = conn.execute(
             text("""
                 SELECT
@@ -1358,7 +1368,7 @@ def ceo_overview(_staff: dict = Depends(require_roles("ceo", "admin"))):
                 FROM attendance
                 WHERE att_date >= :m
             """),
-            {"m": month_start}
+            {"m": cycle_start}
         ).mappings().first()
         attendance_pct = round((month_att["present"] / month_att["total"]) * 100, 1) if month_att and month_att["total"] else 0
 
@@ -5056,9 +5066,47 @@ def _classify_checkout(co_str: str, settings: dict):
     return 0, False
 
 
+def _cycle_bounds(cycle_label: str):
+    """
+    The attendance/payroll cycle runs the 25th -> the 24th, not a calendar
+    month. cycle_label is "YYYY-MM" for the month the cycle ENDS in --
+    e.g. cycle "2026-07" = Jun 25, 2026 -> Jul 24, 2026 (inclusive).
+    Returns (start_date, end_date) as date objects.
+    """
+    y, m = map(int, cycle_label.split("-"))
+    end = date(y, m, 24)
+    if m == 1:
+        start = date(y - 1, 12, 25)
+    else:
+        start = date(y, m - 1, 25)
+    return start, end
+
+
+def _current_cycle_label(today: Optional[date] = None) -> str:
+    """The cycle label ('YYYY-MM') that `today` falls into."""
+    d = today or _ist_today()
+    if d.day >= 25:
+        y, m = (d.year, d.month + 1) if d.month < 12 else (d.year + 1, 1)
+    else:
+        y, m = d.year, d.month
+    return f"{y:04d}-{m:02d}"
+
+
 # ================================================================
 # ATTENDANCE SETTINGS
 # ================================================================
+
+@app.get("/attendance/cycle-info")
+def attendance_cycle_info(cycle: Optional[str] = None):
+    """
+    Resolve a cycle label ("YYYY-MM") to its actual date range (25th -> 24th).
+    Defaults to whichever cycle today falls into. Used by the frontend so it
+    never has to duplicate the 25th-24th math itself.
+    """
+    label = cycle or _current_cycle_label()
+    start, end = _cycle_bounds(label)
+    return {"cycle": label, "start_date": start.isoformat(), "end_date": end.isoformat()}
+
 
 @app.get("/attendance/settings")
 def get_attendance_settings():
@@ -5096,7 +5144,8 @@ def update_attendance_settings(data: AttendanceSettingsUpdate, _admin: dict = De
 def get_attendance(
     emp_id: Optional[str]    = None,
     att_date: Optional[str]  = None,
-    month: Optional[str]     = None,   # YYYY-MM
+    month: Optional[str]     = None,   # YYYY-MM, calendar month
+    cycle: Optional[str]     = None,   # YYYY-MM, the 25th->24th pay cycle ending in that month
     department: Optional[str]= None,
     status: Optional[str]    = None,
     from_date: Optional[str] = None,
@@ -5106,7 +5155,8 @@ def get_attendance(
     Fetch attendance records with optional filters.
     - emp_id      → single employee
     - att_date    → exact date  (YYYY-MM-DD)
-    - month       → all records for that month  (YYYY-MM)
+    - month       → all records for that CALENDAR month (YYYY-MM)
+    - cycle       → all records for that PAY CYCLE (25th -> 24th, YYYY-MM = the month it ends in)
     - department  → filter by dept
     - status      → Present | Absent | …
     - from_date / to_date → date range
@@ -5123,6 +5173,11 @@ def get_attendance(
     if month:
         filters.append("TO_CHAR(att_date,'YYYY-MM') = :month")
         params["month"] = month
+    if cycle:
+        c_start, c_end = _cycle_bounds(cycle)
+        filters.append("att_date >= :c_start AND att_date <= :c_end")
+        params["c_start"] = c_start.isoformat()
+        params["c_end"]   = c_end.isoformat()
     if department:
         filters.append("department = :department")
         params["department"] = department
@@ -5304,23 +5359,33 @@ def attendance_summary_today():
 
 
 @app.get("/attendance/employee/{emp_id}/monthly-summary")
-def employee_monthly_summary(emp_id: str, month: str):
+def employee_monthly_summary(emp_id: str, month: Optional[str] = None, cycle: Optional[str] = None):
     """
-    Returns summary counts for an employee for a given month (YYYY-MM).
-    Used by the employee My Attendance dashboard cards.
+    Returns summary counts for an employee for a given period.
+    - cycle (YYYY-MM) → the 25th->24th pay cycle ending in that month (preferred;
+      this is what the employee "My Attendance" dashboard cards use).
+    - month (YYYY-MM) → plain calendar month, kept for backward compatibility.
     """
+    if cycle:
+        c_start, c_end = _cycle_bounds(cycle)
+        date_filter = "att_date >= :c_start AND att_date <= :c_end"
+        params = {"emp_id": emp_id, "c_start": c_start.isoformat(), "c_end": c_end.isoformat()}
+    else:
+        date_filter = "TO_CHAR(att_date,'YYYY-MM') = :month"
+        params = {"emp_id": emp_id, "month": month}
+
     with engine.connect() as conn:
         rows = conn.execute(
-            text("""
+            text(f"""
                 SELECT status, COUNT(*) AS cnt,
                        SUM(late_minutes) AS total_late,
                        SUM(overtime)     AS total_ot
                 FROM attendance
                 WHERE emp_id = :emp_id
-                  AND TO_CHAR(att_date,'YYYY-MM') = :month
+                  AND {date_filter}
                 GROUP BY status
             """),
-            {"emp_id": emp_id, "month": month}
+            params
         ).mappings().all()
 
     status_map = {r["status"]: r for r in rows}
@@ -5456,7 +5521,7 @@ def delete_device_map(device_person_id: str, _admin: dict = Depends(require_role
 @app.post("/attendance/import-scan-log")
 async def import_scan_log(
     file: UploadFile = FastAPIFile(...),
-    mark_absent_for_month: Optional[str] = Form(None),   # "YYYY-MM", optional
+    mark_absent_for_month: Optional[str] = Form(None),   # "YYYY-MM" pay cycle (25th->24th), optional
     _admin: dict = Depends(require_roles("admin")),
 ):
     """
@@ -5473,9 +5538,10 @@ async def import_scan_log(
       admin can map them via POST /attendance/device-map, then re-import.
     - Never overwrites a record HR has already hand-corrected
       (source = 'manual' or 'correction').
-    - If mark_absent_for_month is given, any matched employee with zero
-      scans on a working day (Mon-Fri, not a holiday, not on approved
-      leave, not in the future) in that month is marked Absent.
+    - If mark_absent_for_month is given ("YYYY-MM", the month the pay cycle
+      ends in), any matched employee with zero scans on a working day in
+      that 25th->24th cycle (Mon-Fri, not a holiday, not on approved
+      leave, not in the future) is marked Absent.
     """
     raw = await file.read()
     try:
@@ -5624,15 +5690,16 @@ async def import_scan_log(
                        "late": late_mins, "early": early_mins, "ot": ot_hours, "remarks": remarks})
                 days_written += 1
 
-        # 4) Optionally mark Absent for scan-less working days in the month
+        # 4) Optionally mark Absent for scan-less working days in the pay
+        #    cycle (25th -> 24th; mark_absent_for_month is the YYYY-MM the
+        #    cycle ends in, same label the "month" input already collects).
         if mark_absent_for_month:
-            y, mo = map(int, mark_absent_for_month.split("-"))
-            last_day = (date(y, mo + 1, 1) - timedelta(days=1)) if mo < 12 else date(y, 12, 31)
+            cyc_start, last_day = _cycle_bounds(mark_absent_for_month)
             today = _ist_today()
 
             holiday_rows = conn.execute(
-                text("SELECT holiday_date FROM holidays WHERE TO_CHAR(holiday_date,'YYYY-MM')=:m"),
-                {"m": mark_absent_for_month}
+                text("SELECT holiday_date FROM holidays WHERE holiday_date >= :s AND holiday_date <= :e"),
+                {"s": cyc_start.isoformat(), "e": last_day.isoformat()}
             ).fetchall()
             holidays = {r[0] for r in holiday_rows}
 
@@ -5641,7 +5708,7 @@ async def import_scan_log(
                     SELECT start_date, end_date FROM leave_requests
                     WHERE CAST(user_id AS TEXT) = :eid AND status = 'Approved'
                       AND end_date >= :first AND start_date <= :last
-                """), {"eid": emp["emp_id"], "first": date(y, mo, 1).isoformat(),
+                """), {"eid": emp["emp_id"], "first": cyc_start.isoformat(),
                        "last": last_day.isoformat()}).fetchall()
                 on_leave = set()
                 for lr in leave_rows:
@@ -5651,7 +5718,7 @@ async def import_scan_log(
                         dd += timedelta(days=1)
 
                 scanned_days = set(scans.get(pid, {}).keys())
-                d = date(y, mo, 1)
+                d = cyc_start
                 while d <= last_day and d <= today:
                     if d.weekday() < 5 and d not in holidays and d not in on_leave and d not in scanned_days:
                         existing = conn.execute(
@@ -6608,62 +6675,77 @@ def delete_holiday(holiday_id: int, _admin: dict = Depends(require_roles("admin"
 # ================================================================
 
 @app.get("/reports/attendance/late")
-def report_late_employees(month: str):
-    """Employees with late arrivals in a given month."""
+def report_late_employees(month: Optional[str] = None, cycle: Optional[str] = None):
+    """Employees with late arrivals in a given period (cycle preferred, month = legacy calendar month)."""
+    if cycle:
+        c_start, c_end = _cycle_bounds(cycle)
+        date_filter, params = "att_date >= :s AND att_date <= :e", {"s": c_start.isoformat(), "e": c_end.isoformat()}
+    else:
+        date_filter, params = "TO_CHAR(att_date,'YYYY-MM')=:month", {"month": month}
     with engine.connect() as conn:
         rows = conn.execute(
-            text("""
+            text(f"""
                 SELECT emp_id, emp_name, department,
                        COUNT(*) AS late_days,
                        SUM(late_minutes) AS total_late_minutes,
                        ROUND(AVG(late_minutes),0) AS avg_late_minutes
                 FROM attendance
-                WHERE TO_CHAR(att_date,'YYYY-MM')=:month
+                WHERE {date_filter}
                   AND late_minutes > 0
                 GROUP BY emp_id, emp_name, department
                 ORDER BY total_late_minutes DESC
             """),
-            {"month": month}
+            params
         ).mappings().all()
     return [dict(r) for r in rows]
 
 
 @app.get("/reports/attendance/absentees")
-def report_absentees(month: str):
-    """Absent / leave / LOP days per employee for a given month."""
+def report_absentees(month: Optional[str] = None, cycle: Optional[str] = None):
+    """Absent / leave / LOP days per employee for a given period (cycle preferred, month = legacy calendar month)."""
+    if cycle:
+        c_start, c_end = _cycle_bounds(cycle)
+        date_filter, params = "att_date >= :s AND att_date <= :e", {"s": c_start.isoformat(), "e": c_end.isoformat()}
+    else:
+        date_filter, params = "TO_CHAR(att_date,'YYYY-MM')=:month", {"month": month}
     with engine.connect() as conn:
         rows = conn.execute(
-            text("""
+            text(f"""
                 SELECT emp_id, emp_name, department,
                        SUM(CASE WHEN status='Absent' THEN 1 ELSE 0 END) AS absent_days,
                        SUM(CASE WHEN status='Leave'  THEN 1 ELSE 0 END) AS leave_days
                 FROM attendance
-                WHERE TO_CHAR(att_date,'YYYY-MM')=:month
+                WHERE {date_filter}
                 GROUP BY emp_id, emp_name, department
                 HAVING SUM(CASE WHEN status IN ('Absent','Leave') THEN 1 ELSE 0 END) > 0
                 ORDER BY absent_days DESC
             """),
-            {"month": month}
+            params
         ).mappings().all()
     return [dict(r) for r in rows]
 
 
 @app.get("/reports/attendance/overtime")
-def report_overtime(month: str):
-    """Overtime summary per employee for a given month."""
+def report_overtime(month: Optional[str] = None, cycle: Optional[str] = None):
+    """Overtime summary per employee for a given period (cycle preferred, month = legacy calendar month)."""
+    if cycle:
+        c_start, c_end = _cycle_bounds(cycle)
+        date_filter, params = "att_date >= :s AND att_date <= :e", {"s": c_start.isoformat(), "e": c_end.isoformat()}
+    else:
+        date_filter, params = "TO_CHAR(att_date,'YYYY-MM')=:month", {"month": month}
     with engine.connect() as conn:
         rows = conn.execute(
-            text("""
+            text(f"""
                 SELECT emp_id, emp_name, department,
                        COUNT(*) AS ot_days,
                        SUM(overtime) AS ot_hours
                 FROM attendance
-                WHERE TO_CHAR(att_date,'YYYY-MM')=:month
+                WHERE {date_filter}
                   AND overtime > 0
                 GROUP BY emp_id, emp_name, department
                 ORDER BY ot_hours DESC
             """),
-            {"month": month}
+            params
         ).mappings().all()
     return [dict(r) for r in rows]
 
