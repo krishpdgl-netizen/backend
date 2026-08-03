@@ -5323,6 +5323,39 @@ def delete_attendance(attendance_id: int, _admin: dict = Depends(require_roles("
     return {"success": True}
 
 
+@app.delete("/attendance/clear-auto-absent")
+def clear_auto_absent(
+    from_date: str,
+    to_date: str,
+    emp_id: Optional[str] = None,
+    _admin: dict = Depends(require_roles("admin")),
+):
+    """
+    Bulk-remove Absent placeholder rows that the biometric import auto-generated
+    (source = 'biometric_import', no check_in) within a date range. Useful for
+    clearing out stale rows left over from a run made under an older
+    absence-marking rule (e.g. before the pay-cycle fix) or a wrong cycle
+    selection. Never touches manual entries, corrections, or rows with an
+    actual check_in on record.
+    """
+    filters = ["source = 'biometric_import'", "status = 'Absent'", "check_in IS NULL",
+               "att_date >= :from_date", "att_date <= :to_date"]
+    params: dict = {"from_date": from_date, "to_date": to_date}
+    if emp_id:
+        filters.append("emp_id = :emp_id")
+        params["emp_id"] = emp_id
+
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(f"DELETE FROM attendance WHERE {' AND '.join(filters)} RETURNING id"),
+            params
+        )
+        removed = len(result.fetchall())
+
+    return {"success": True, "removed": removed,
+            "message": f"Removed {removed} stale auto-marked Absent record(s)."}
+
+
 # ================================================================
 # NOTE: Self-service punch in / punch out (POST /attendance/checkin and
 # POST /attendance/checkout) has been removed. Attendance is now sourced
