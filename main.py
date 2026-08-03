@@ -4994,6 +4994,17 @@ def _working_days_in_month(year: int, month: int) -> int:
     return total
 
 
+def _working_days_in_cycle(start: date, end: date) -> int:
+    """Count Mon-Fri days between start and end inclusive (no holiday awareness)."""
+    total = 0
+    d = start
+    while d <= end:
+        if d.weekday() < 5:
+            total += 1
+        d += timedelta(days=1)
+    return total
+
+
 def _get_settings(conn) -> dict:
     row = conn.execute(text("SELECT * FROM attendance_settings WHERE id=1")).mappings().fetchone()
     settings = dict(row) if row else {}
@@ -6274,7 +6285,7 @@ def get_payroll(month: Optional[str] = None, emp_id: Optional[str] = None):
 def generate_payroll(month: str, generated_by: str = "HR Admin", _admin: dict = Depends(require_roles("admin"))):
     """
     Generates payroll for ALL employees who have a salary structure,
-    for the given month (YYYY-MM).
+    for the given pay cycle (YYYY-MM = the month the 26th->25th cycle ends in).
     Fails if payroll is already locked for that month.
     Overwrites any un-locked draft for the same month.
     """
@@ -6283,6 +6294,8 @@ def generate_payroll(month: str, generated_by: str = "HR Admin", _admin: dict = 
         year, mon = int(month[:4]), int(month[5:7])
     except Exception:
         return {"success": False, "message": "Invalid month format. Use YYYY-MM."}
+
+    cyc_start, cyc_end = _cycle_bounds(month)
 
     with engine.connect() as conn:
         lock = conn.execute(
@@ -6299,7 +6312,7 @@ def generate_payroll(month: str, generated_by: str = "HR Admin", _admin: dict = 
 
         settings = _get_settings(conn)
 
-    working_days = _working_days_in_month(year, mon)
+    working_days = _working_days_in_cycle(cyc_start, cyc_end)
     generated_rows = []
 
     for ss in structs:
@@ -6311,9 +6324,9 @@ def generate_payroll(month: str, generated_by: str = "HR Admin", _admin: dict = 
                     SELECT status, late_minutes, overtime
                     FROM attendance
                     WHERE emp_id=:eid
-                      AND TO_CHAR(att_date,'YYYY-MM')=:month
+                      AND att_date >= :c_start AND att_date <= :c_end
                 """),
-                {"eid": emp_id_val, "month": month}
+                {"eid": emp_id_val, "c_start": cyc_start.isoformat(), "c_end": cyc_end.isoformat()}
             ).mappings().all()
 
         present    = sum(1 for a in att_rows if a["status"] in ("Present","Work From Home","Manual Entry"))
