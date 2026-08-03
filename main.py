@@ -5175,137 +5175,14 @@ def delete_attendance(attendance_id: int, _admin: dict = Depends(require_roles("
 
 
 # ================================================================
-# SELF-SERVICE PUNCH IN / PUNCH OUT
+# NOTE: Self-service punch in / punch out (POST /attendance/checkin and
+# POST /attendance/checkout) has been removed. Attendance is now sourced
+# from the monthly biometric face-scan import (see
+# POST /attendance/import-scan-log below) plus manual admin entry via
+# POST/PUT /attendance. The corresponding "Punch In / Punch Out" UI has
+# been removed from the employee dashboard, manager dashboard, and the
+# "My Attendance" page.
 # ================================================================
-
-@app.post("/attendance/checkin")
-def checkin(_user: dict = Depends(get_current_user)):
-    """
-    Employee punches in for today.
-    Creates attendance row with check_in = current IST time.
-    Calculates late_minutes vs office_start_time from attendance_settings.
-    emp_id is taken from the verified auth token — never from client input —
-    so a logged-in user can only ever punch themselves in.
-    """
-    emp_id = str(_user["uid"])
-    from datetime import datetime as _dt
-    now_ist = _dt.now(ZoneInfo("Asia/Kolkata"))
-    today   = now_ist.date().isoformat()
-    ci_str  = now_ist.strftime("%H:%M")
-
-    with engine.connect() as conn:
-        user = conn.execute(
-            text("SELECT full_name FROM users WHERE id = :id OR CAST(id AS TEXT) = :ids"),
-            {"id": int(emp_id) if emp_id.isdigit() else -1, "ids": emp_id}
-        ).fetchone()
-        existing = conn.execute(
-            text("SELECT id, check_in FROM attendance WHERE emp_id=:eid AND att_date=:d"),
-            {"eid": emp_id, "d": today}
-        ).fetchone()
-        settings = _get_settings(conn)
-
-    office_start = settings.get("office_start_time", "09:00")
-    grace        = int(settings.get("late_grace_minutes", 10))
-    os_h, os_m   = map(int, office_start.split(":"))
-    ci_h, ci_m   = map(int, ci_str.split(":"))
-    late_mins    = max(0, (ci_h * 60 + ci_m) - (os_h * 60 + os_m) - grace)
-    emp_name     = user.full_name if user else emp_id
-
-    if existing and existing.check_in:
-        # Already punched in today (possibly already checked out too).
-        # Re-punching in restarts today's record cleanly: reset check_out/hours/overtime
-        # explicitly here (rather than relying on a generic PATCH, which ignores null
-        # values and would leave a stale check_out behind).
-        with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    UPDATE attendance
-                    SET check_in=:ci, check_out=NULL, working_hours=NULL, overtime=0,
-                        status='Present', late_minutes=:late, updated_at=NOW()
-                    WHERE emp_id=:eid AND att_date=:d
-                """),
-                {"ci": ci_str, "late": late_mins, "eid": emp_id, "d": today}
-            )
-        return {
-            "success": True,
-            "check_in": ci_str,
-            "late_minutes": late_mins,
-            "restarted": True,
-            "message": f"Punched in at {ci_str}" + (f" ({late_mins} min late)" if late_mins > 0 else "")
-        }
-
-    if existing:
-        with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE attendance SET check_in=:ci, status='Present', late_minutes=:late, updated_at=NOW() WHERE emp_id=:eid AND att_date=:d"),
-                {"ci": ci_str, "late": late_mins, "eid": emp_id, "d": today}
-            )
-    else:
-        with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO attendance (emp_id, emp_name, att_date, check_in, status, late_minutes, source, created_at, updated_at)
-                    VALUES (:eid, :ename, :d, :ci, 'Present', :late, 'self', NOW(), NOW())
-                """),
-                {"eid": emp_id, "ename": emp_name, "d": today, "ci": ci_str, "late": late_mins}
-            )
-
-    return {
-        "success": True,
-        "check_in": ci_str,
-        "late_minutes": late_mins,
-        "message": f"Checked in at {ci_str}" + (f" ({late_mins} min late)" if late_mins > 0 else "")
-    }
-
-
-@app.post("/attendance/checkout")
-def checkout(_user: dict = Depends(get_current_user)):
-    """
-    Employee punches out for today.
-    Updates check_out, recalculates working_hours and overtime.
-    emp_id is taken from the verified auth token — never from client input.
-    """
-    emp_id = str(_user["uid"])
-    from datetime import datetime as _dt
-    now_ist = _dt.now(ZoneInfo("Asia/Kolkata"))
-    today   = now_ist.date().isoformat()
-    co_str  = now_ist.strftime("%H:%M")
-
-    with engine.connect() as conn:
-        rec = conn.execute(
-            text("SELECT id, check_in, check_out FROM attendance WHERE emp_id=:eid AND att_date=:d"),
-            {"eid": emp_id, "d": today}
-        ).fetchone()
-        settings = _get_settings(conn)
-
-    if not rec:
-        return {"success": False, "message": "No check-in found for today. Please check in first."}
-    if rec.check_out:
-        return {"success": False, "message": f"Already checked out at {str(rec.check_out)[:5]}"}
-
-    ci_str    = str(rec.check_in)[:5] if rec.check_in else None
-    hours_str = _calc_hours(ci_str, co_str)
-    std_hours = float(settings.get("standard_work_hours", 9.0))
-    ot_hours  = 0.0
-    if ci_str:
-        ci_h, ci_m = map(int, ci_str.split(":"))
-        co_h, co_m = map(int, co_str.split(":"))
-        worked_mins = (co_h * 60 + co_m) - (ci_h * 60 + ci_m)
-        ot_hours = round(max(0, worked_mins - std_hours * 60) / 60, 2)
-
-    with engine.begin() as conn:
-        conn.execute(
-            text("UPDATE attendance SET check_out=:co, working_hours=:h, overtime=:ot, updated_at=NOW() WHERE emp_id=:eid AND att_date=:d"),
-            {"co": co_str, "h": hours_str, "ot": ot_hours, "eid": emp_id, "d": today}
-        )
-
-    return {
-        "success": True,
-        "check_out": co_str,
-        "working_hours": hours_str,
-        "overtime": ot_hours,
-        "message": f"Checked out at {co_str}. Total: {hours_str}"
-    }
 
 
 @app.get("/attendance/summary/today")
@@ -5363,6 +5240,307 @@ def employee_monthly_summary(emp_id: str, month: str):
         "half_day":   status_map.get("Half Day", {}).get("cnt") or 0,
         "late_days":  sum(1 for r in rows if (r.get("total_late") or 0) > 0),
         "overtime_hours": float(sum((r.get("total_ot") or 0) for r in rows)),
+    }
+
+
+# ================================================================
+# BIOMETRIC / FACE-SCAN ATTENDANCE IMPORT
+# Admin uploads the gate device's monthly "Original Records Report" CSV.
+# Every scan is grouped per employee per day: first scan -> check_in,
+# last scan -> check_out. Results land in the same `attendance` table
+# used everywhere else, so the existing admin table and the employee
+# "My Attendance" view pick it up automatically -- no other UI changes
+# needed to *display* it.
+# ================================================================
+
+import csv as _scan_csv
+import io as _scan_io
+from collections import defaultdict as _scan_defaultdict
+
+
+@app.on_event("startup")
+def _create_attendance_device_map_table():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS attendance_device_map (
+                device_person_id TEXT PRIMARY KEY,
+                emp_id           TEXT NOT NULL,
+                emp_name         TEXT NOT NULL,
+                department       TEXT DEFAULT '',
+                created_at       TIMESTAMP DEFAULT NOW()
+            )
+        """))
+
+
+def _parse_scan_datetime(raw: str):
+    """Face-scan exports use DD-MM-YYYY HH:MM; tolerate a couple of variants."""
+    raw = (raw or "").strip()
+    for fmt in ("%d-%m-%Y %H:%M", "%d-%m-%Y %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _clean_device_person_id(raw: str) -> str:
+    # Excel exports numeric-looking IDs with a leading apostrophe to force
+    # text formatting (e.g. "'0406") -- strip it.
+    return (raw or "").strip().lstrip("'").strip()
+
+
+class DeviceMapIn(BaseModel):
+    device_person_id: str
+    emp_id: str
+    emp_name: str
+    department: str = ""
+
+
+@app.get("/attendance/device-map")
+def list_device_map(_admin: dict = Depends(require_roles("admin"))):
+    """Current device-Person-ID -> employee mappings, so mismatches can be fixed."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT * FROM attendance_device_map ORDER BY emp_name")
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.post("/attendance/device-map")
+def upsert_device_map(data: DeviceMapIn, _admin: dict = Depends(require_roles("admin"))):
+    """Manually map (or fix) one device Person ID to a system employee."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO attendance_device_map (device_person_id, emp_id, emp_name, department)
+            VALUES (:pid, :eid, :ename, :dept)
+            ON CONFLICT (device_person_id) DO UPDATE
+            SET emp_id = EXCLUDED.emp_id, emp_name = EXCLUDED.emp_name, department = EXCLUDED.department
+        """), {"pid": data.device_person_id, "eid": data.emp_id,
+               "ename": data.emp_name, "dept": data.department})
+    return {"success": True}
+
+
+@app.delete("/attendance/device-map/{device_person_id}")
+def delete_device_map(device_person_id: str, _admin: dict = Depends(require_roles("admin"))):
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM attendance_device_map WHERE device_person_id=:pid"),
+            {"pid": device_person_id}
+        )
+    return {"success": True}
+
+
+@app.post("/attendance/import-scan-log")
+async def import_scan_log(
+    file: UploadFile = FastAPIFile(...),
+    mark_absent_for_month: Optional[str] = Form(None),   # "YYYY-MM", optional
+    _admin: dict = Depends(require_roles("admin")),
+):
+    """
+    Bulk-imports the gate device's monthly attendance CSV.
+
+    - Groups every scan by (device Person ID, calendar day); first scan of
+      the day becomes check_in, last scan becomes check_out.
+    - Computes working_hours / late_minutes / overtime with the same rules
+      as self check-in/out (attendance_settings).
+    - Resolves each device Person ID to a system employee via
+      attendance_device_map, falling back to an exact name match against
+      users.full_name (and remembering that mapping for future months).
+      Names that still can't be matched come back in "unmatched" so the
+      admin can map them via POST /attendance/device-map, then re-import.
+    - Never overwrites a record HR has already hand-corrected
+      (source = 'manual' or 'correction').
+    - If mark_absent_for_month is given, any matched employee with zero
+      scans on a working day (Mon-Fri, not a holiday, not on approved
+      leave, not in the future) in that month is marked Absent.
+    """
+    raw = await file.read()
+    try:
+        text_data = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text_data = raw.decode("latin-1")
+
+    rows = list(_scan_csv.reader(_scan_io.StringIO(text_data)))
+    if not rows:
+        return {"success": False, "message": "File is empty."}
+
+    header = [h.strip().lower() for h in rows[0]]
+    try:
+        idx_pid  = header.index("person id")
+        idx_name = header.index("name")
+        idx_time = header.index("time")
+    except ValueError:
+        return {"success": False, "message": "Couldn't find 'Person ID', 'Name' and 'Time' columns in this file."}
+    idx_dept = header.index("department") if "department" in header else None
+
+    # 1) Parse + group scans -> { person_id: { date: [datetime, ...] } }
+    scans = _scan_defaultdict(lambda: _scan_defaultdict(list))
+    names, depts = {}, {}
+    for row in rows[1:]:
+        if len(row) <= max(idx_pid, idx_name, idx_time):
+            continue
+        pid  = _clean_device_person_id(row[idx_pid])
+        name = row[idx_name].strip()
+        if not pid or not name:
+            continue
+        dt = _parse_scan_datetime(row[idx_time])
+        if not dt:
+            continue
+        scans[pid][dt.date()].append(dt)
+        names[pid] = name
+        if idx_dept is not None and row[idx_dept].strip() not in ("-", ""):
+            depts[pid] = row[idx_dept].strip()
+
+    if not scans:
+        return {"success": False, "message": "No usable rows found in this file."}
+
+    # 2) Resolve each device Person ID -> system employee
+    with engine.connect() as conn:
+        device_map = {r["device_person_id"]: dict(r) for r in conn.execute(
+            text("SELECT * FROM attendance_device_map")).mappings().all()}
+        users = conn.execute(text("SELECT id, full_name FROM users")).mappings().all()
+    name_lookup = {u["full_name"].strip().lower(): str(u["id"]) for u in users if u["full_name"]}
+
+    resolved, unmatched, new_mappings = {}, [], []
+    for pid, name in names.items():
+        if pid in device_map:
+            m = device_map[pid]
+            resolved[pid] = {"emp_id": m["emp_id"], "emp_name": m["emp_name"],
+                              "department": depts.get(pid, m.get("department") or "")}
+            continue
+        uid = name_lookup.get(name.lower())
+        if uid:
+            resolved[pid] = {"emp_id": uid, "emp_name": name, "department": depts.get(pid, "")}
+            new_mappings.append({"device_person_id": pid, "emp_id": uid, "emp_name": name,
+                                  "department": depts.get(pid, "")})
+        else:
+            unmatched.append({"person_id": pid, "name": name})
+
+    if new_mappings:
+        with engine.begin() as conn:
+            for m in new_mappings:
+                conn.execute(text("""
+                    INSERT INTO attendance_device_map (device_person_id, emp_id, emp_name, department)
+                    VALUES (:device_person_id, :emp_id, :emp_name, :department)
+                    ON CONFLICT (device_person_id) DO NOTHING
+                """), m)
+
+    # 3) Build daily attendance rows for every matched employee
+    with engine.connect() as conn:
+        settings = _get_settings(conn)
+    office_start = settings.get("office_start_time", "09:00")
+    grace        = int(settings.get("late_grace_minutes", 10))
+    std_hours    = float(settings.get("standard_work_hours", 9.0))
+    os_h, os_m   = map(int, office_start.split(":"))
+
+    days_written, single_scan_days, absents_marked = 0, 0, 0
+
+    with engine.begin() as conn:
+        for pid, day_map in scans.items():
+            if pid not in resolved:
+                continue
+            emp = resolved[pid]
+            for d, times in day_map.items():
+                times.sort()
+                ci_dt = times[0]
+                co_dt = times[-1] if len(times) > 1 else None
+                ci_str = ci_dt.strftime("%H:%M")
+                co_str = co_dt.strftime("%H:%M") if co_dt else None
+                hours  = _calc_hours(ci_str, co_str) if co_str else "—"
+                late_mins = max(0, (ci_dt.hour * 60 + ci_dt.minute) - (os_h * 60 + os_m) - grace)
+                ot_hours = 0.0
+                if co_dt:
+                    worked_mins = int((co_dt - ci_dt).total_seconds() / 60)
+                    ot_hours = round(max(0, worked_mins - std_hours * 60) / 60, 2)
+                if co_str:
+                    remarks = ""
+                else:
+                    remarks = "Single scan on device -- checkout time missing"
+                    single_scan_days += 1
+
+                existing = conn.execute(
+                    text("SELECT source FROM attendance WHERE emp_id=:eid AND att_date=:d"),
+                    {"eid": emp["emp_id"], "d": d.isoformat()}
+                ).fetchone()
+                if existing and existing[0] in ("manual", "correction"):
+                    continue  # don't clobber a hand-corrected record
+
+                conn.execute(text("""
+                    INSERT INTO attendance
+                        (emp_id, emp_name, department, att_date, check_in, check_out,
+                         working_hours, status, late_minutes, overtime, remarks, source,
+                         created_at, updated_at)
+                    VALUES
+                        (:eid, :ename, :dept, :d, :ci, :co, :hrs, 'Present', :late, :ot, :remarks,
+                         'biometric_import', NOW(), NOW())
+                    ON CONFLICT (emp_id, att_date) DO UPDATE SET
+                        check_in = EXCLUDED.check_in, check_out = EXCLUDED.check_out,
+                        working_hours = EXCLUDED.working_hours, status = EXCLUDED.status,
+                        late_minutes = EXCLUDED.late_minutes, overtime = EXCLUDED.overtime,
+                        remarks = EXCLUDED.remarks, source = 'biometric_import', updated_at = NOW()
+                """), {"eid": emp["emp_id"], "ename": emp["emp_name"], "dept": emp["department"],
+                       "d": d.isoformat(), "ci": ci_str, "co": co_str, "hrs": hours,
+                       "late": late_mins, "ot": ot_hours, "remarks": remarks})
+                days_written += 1
+
+        # 4) Optionally mark Absent for scan-less working days in the month
+        if mark_absent_for_month:
+            y, mo = map(int, mark_absent_for_month.split("-"))
+            last_day = (date(y, mo + 1, 1) - timedelta(days=1)) if mo < 12 else date(y, 12, 31)
+            today = _ist_today()
+
+            holiday_rows = conn.execute(
+                text("SELECT holiday_date FROM holidays WHERE TO_CHAR(holiday_date,'YYYY-MM')=:m"),
+                {"m": mark_absent_for_month}
+            ).fetchall()
+            holidays = {r[0] for r in holiday_rows}
+
+            for pid, emp in resolved.items():
+                leave_rows = conn.execute(text("""
+                    SELECT start_date, end_date FROM leave_requests
+                    WHERE CAST(user_id AS TEXT) = :eid AND status = 'Approved'
+                      AND end_date >= :first AND start_date <= :last
+                """), {"eid": emp["emp_id"], "first": date(y, mo, 1).isoformat(),
+                       "last": last_day.isoformat()}).fetchall()
+                on_leave = set()
+                for lr in leave_rows:
+                    dd = lr[0]
+                    while dd <= lr[1]:
+                        on_leave.add(dd)
+                        dd += timedelta(days=1)
+
+                scanned_days = set(scans.get(pid, {}).keys())
+                d = date(y, mo, 1)
+                while d <= last_day and d <= today:
+                    if d.weekday() < 5 and d not in holidays and d not in on_leave and d not in scanned_days:
+                        existing = conn.execute(
+                            text("SELECT id FROM attendance WHERE emp_id=:eid AND att_date=:d"),
+                            {"eid": emp["emp_id"], "d": d.isoformat()}
+                        ).fetchone()
+                        if not existing:
+                            conn.execute(text("""
+                                INSERT INTO attendance
+                                    (emp_id, emp_name, department, att_date, status, source, created_at, updated_at)
+                                VALUES (:eid, :ename, :dept, :d, 'Absent', 'biometric_import', NOW(), NOW())
+                            """), {"eid": emp["emp_id"], "ename": emp["emp_name"],
+                                   "dept": emp["department"], "d": d.isoformat()})
+                            absents_marked += 1
+                    d += timedelta(days=1)
+
+    return {
+        "success": True,
+        "employees_matched": len(resolved),
+        "days_written": days_written,
+        "single_scan_days": single_scan_days,
+        "absents_marked": absents_marked,
+        "new_mappings": new_mappings,
+        "unmatched": unmatched,
+        "message": (
+            f"Imported {days_written} day(s) across {len(resolved)} employee(s)."
+            + (f" {absents_marked} absent day(s) marked." if absents_marked else "")
+            + (f" {len(unmatched)} name(s) couldn't be matched -- map them manually and re-import."
+               if unmatched else "")
+        ),
     }
 
 
