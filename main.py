@@ -5309,20 +5309,6 @@ def update_attendance(attendance_id: int, data: AttendancePatch, _staff: dict = 
     return {"success": True}
 
 
-@app.delete("/attendance/{attendance_id}")
-def delete_attendance(attendance_id: int, _admin: dict = Depends(require_roles("admin"))):
-    """Delete an attendance record (admin only — enforce role on frontend)."""
-    with engine.begin() as conn:
-        result = conn.execute(
-            text("DELETE FROM attendance WHERE id=:id RETURNING id"),
-            {"id": attendance_id}
-        )
-        row = result.fetchone()
-    if not row:
-        return {"success": False, "message": "Record not found."}
-    return {"success": True}
-
-
 @app.delete("/attendance/clear-auto-absent")
 def clear_auto_absent(
     from_date: str,
@@ -5337,6 +5323,13 @@ def clear_auto_absent(
     absence-marking rule (e.g. before the pay-cycle fix) or a wrong cycle
     selection. Never touches manual entries, corrections, or rows with an
     actual check_in on record.
+
+    NOTE: this route must stay registered BEFORE /attendance/{attendance_id}
+    below -- FastAPI/Starlette matches routes by registration order for a
+    given path shape, and since {attendance_id} has no explicit ':int'
+    converter in the path string, it will otherwise swallow this literal
+    path first and fail Pydantic's int coercion (a 422), never reaching
+    this handler.
     """
     filters = ["source = 'biometric_import'", "status = 'Absent'", "check_in IS NULL",
                "att_date >= :from_date", "att_date <= :to_date"]
@@ -5354,6 +5347,20 @@ def clear_auto_absent(
 
     return {"success": True, "removed": removed,
             "message": f"Removed {removed} stale auto-marked Absent record(s)."}
+
+
+@app.delete("/attendance/{attendance_id}")
+def delete_attendance(attendance_id: int, _admin: dict = Depends(require_roles("admin"))):
+    """Delete an attendance record (admin only — enforce role on frontend)."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("DELETE FROM attendance WHERE id=:id RETURNING id"),
+            {"id": attendance_id}
+        )
+        row = result.fetchone()
+    if not row:
+        return {"success": False, "message": "Record not found."}
+    return {"success": True}
 
 
 # ================================================================
