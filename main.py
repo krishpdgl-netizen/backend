@@ -8468,8 +8468,10 @@ except Exception as e:
 
 
 def _chat_channel_display(conn, channel_id, viewer_id):
-    """Returns {name, type, member_ids} -- for a DM, name is the OTHER person's name."""
-    ch = conn.execute(text("SELECT id, name, type FROM chat_channels WHERE id=:id"), {"id": channel_id}).mappings().first()
+    """Returns {name, type, member_ids, created_by, created_at} -- for a DM, name is the OTHER person's name."""
+    ch = conn.execute(text(
+        "SELECT id, name, type, created_by, created_at FROM chat_channels WHERE id=:id"
+    ), {"id": channel_id}).mappings().first()
     if not ch:
         return None
     members = conn.execute(text(
@@ -8481,6 +8483,9 @@ def _chat_channel_display(conn, channel_id, viewer_id):
         other = next((m for m in members if m["user_id"] != viewer_id), None)
         display_name = other["user_name"] if other else (ch["name"] or "Direct Message")
     return {"id": ch["id"], "type": ch["type"], "name": display_name, "member_ids": member_ids,
+            "member_names": [m["user_name"] for m in members],
+            "created_by": ch["created_by"],
+            "created_at": str(ch["created_at"]) if ch["created_at"] else None,
             "members": [dict(m) for m in members]}
 
 
@@ -8638,13 +8643,96 @@ def add_chat_member(channel_id: int, data: ChatMemberIn):
 
 
 @app.delete("/chat/channels/{channel_id}/members/{user_id}")
-def remove_chat_member(channel_id: int, user_id: int, leaver_name: Optional[str] = None):
+def remove_chat_member(channel_id: int, user_id: int,
+                       leaver_name: Optional[str] = None,
+                       removed_by: Optional[int] = None,
+                       removed_by_name: Optional[str] = None):
+    """Kick a member out. Only the group creator may remove someone else."""
     with engine.begin() as conn:
+        ch = conn.execute(text("SELECT type, created_by FROM chat_channels WHERE id=:id"),
+                          {"id": channel_id}).first()
+        if not ch:
+            return {"success": False, "message": "Channel not found."}
+        if removed_by is not None and str(ch[1]) != str(removed_by) and str(removed_by) != str(user_id):
+            return {"success": False, "message": "Only the group admin can remove members."}
+
         conn.execute(text(
             "DELETE FROM chat_channel_members WHERE channel_id=:cid AND user_id=:uid"
         ), {"cid": channel_id, "uid": user_id})
-        if leaver_name:
+
+        if removed_by_name and leaver_name:
+            _chat_system_message(conn, channel_id, f"{removed_by_name} removed {leaver_name}.")
+        elif leaver_name:
             _chat_system_message(conn, channel_id, f"{leaver_name} left the group.")
+    return {"success": True}
+
+
+# ---------- RENAME A GROUP (admin only) ----------
+class ChatRenameIn(BaseModel):
+    name: str
+    user_id: int
+    user_name: str
+
+
+@app.post("/chat/channels/{channel_id}/rename")
+def rename_chat_channel(channel_id: int, data: ChatRenameIn):
+    new_name = (data.name or "").strip()
+    if not new_name:
+        return {"success": False, "message": "Group name can't be empty."}
+    with engine.begin() as conn:
+        ch = conn.execute(text("SELECT name, type, created_by FROM chat_channels WHERE id=:id"),
+                          {"id": channel_id}).first()
+        if not ch:
+            return {"success": False, "message": "Channel not found."}
+        if ch[1] != "group":
+            return {"success": False, "message": "Only group chats can be renamed."}
+        if str(ch[2]) != str(data.user_id):
+            return {"success": False, "message": "Only the group admin can rename the group."}
+
+        old_name = ch[0]
+        conn.execute(text("UPDATE chat_channels SET name=:n WHERE id=:id"),
+                     {"n": new_name, "id": channel_id})
+        _chat_system_message(
+            conn, channel_id,
+            f'{data.user_name} changed the group name from "{old_name}" to "{new_name}".')
+    return {"success": True, "name": new_name}
+
+
+# ---------- LEAVE A GROUP ----------
+class ChatLeaveIn(BaseModel):
+    user_id: int
+    user_name: str
+
+
+@app.post("/chat/channels/{channel_id}/leave")
+def leave_chat_channel(channel_id: int, data: ChatLeaveIn):
+    with engine.begin() as conn:
+        ch = conn.execute(text("SELECT type, created_by FROM chat_channels WHERE id=:id"),
+                          {"id": channel_id}).first()
+        if not ch:
+            return {"success": False, "message": "Channel not found."}
+        if ch[0] != "group":
+            return {"success": False, "message": "You can only leave group chats."}
+
+        member = conn.execute(text(
+            "SELECT 1 FROM chat_channel_members WHERE channel_id=:cid AND user_id=:uid"
+        ), {"cid": channel_id, "uid": data.user_id}).first()
+        if not member:
+            return {"success": False, "message": "You're not in this group."}
+
+        conn.execute(text(
+            "DELETE FROM chat_channel_members WHERE channel_id=:cid AND user_id=:uid"
+        ), {"cid": channel_id, "uid": data.user_id})
+        _chat_system_message(conn, channel_id, f"{data.user_name} left the group.")
+
+        # if the admin walked out, hand the badge to the longest-standing member left
+        if str(ch[1]) == str(data.user_id):
+            nxt = conn.execute(text(
+                "SELECT user_id FROM chat_channel_members WHERE channel_id=:cid ORDER BY id ASC LIMIT 1"
+            ), {"cid": channel_id}).first()
+            if nxt:
+                conn.execute(text("UPDATE chat_channels SET created_by=:cb WHERE id=:id"),
+                             {"cb": nxt[0], "id": channel_id})
     return {"success": True}
 
 
