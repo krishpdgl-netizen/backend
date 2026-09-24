@@ -2074,7 +2074,7 @@ def manager_report(manager_id:int):
         "top_performer": top_performer
 
     }
-@app.api_route("/delete-user", methods=["POST", "DELETE"])
+@app.post("/delete-user")
 def delete_user(user_id: int, _admin: dict = Depends(require_roles("admin"))):
 
     with engine.connect() as conn:
