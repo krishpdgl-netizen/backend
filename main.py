@@ -5385,6 +5385,95 @@ def delete_attendance(attendance_id: int, _admin: dict = Depends(require_roles("
 # ================================================================
 
 
+@app.get("/attendance/summary/excel")
+def attendance_summary_excel(cycle: Optional[str] = None, _admin: dict = Depends(require_roles("admin"))):
+    """Download employee-by-employee attendance summary for a 26th->25th cycle."""
+    import io as _excel_io
+    from openpyxl import Workbook as _ExcelWorkbook
+    from openpyxl.styles import Font as _ExcelFont, PatternFill as _ExcelFill
+    from fastapi.responses import StreamingResponse as _ExcelStreamingResponse
+
+    label = cycle or _current_cycle_label()
+    try:
+        cycle_start, cycle_end = _cycle_bounds(label)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid cycle. Use YYYY-MM.")
+
+    effective_end = min(cycle_end, _ist_today())
+    with engine.connect() as conn:
+        users = conn.execute(text("SELECT id, full_name, role FROM users ORDER BY full_name")).mappings().all()
+        attendance_rows = conn.execute(text("""
+            SELECT emp_id, emp_name, department, att_date, status,
+                   COALESCE(late_minutes,0) AS late_minutes,
+                   COALESCE(early_leaving,0) AS early_leaving
+            FROM attendance
+            WHERE att_date >= :s AND att_date <= :e
+            ORDER BY emp_name, att_date
+        """), {"s": cycle_start.isoformat(), "e": effective_end.isoformat()}).mappings().all()
+        holiday_rows = conn.execute(text("""
+            SELECT holiday_date, name, holiday_type FROM holidays
+            WHERE holiday_date >= :s AND holiday_date <= :e
+        """), {"s": cycle_start.isoformat(), "e": effective_end.isoformat()}).mappings().all()
+        map_rows = conn.execute(text("SELECT emp_id, MAX(batch) AS batch FROM attendance_device_map GROUP BY emp_id")).mappings().all()
+        leave_rows = conn.execute(text("""
+            SELECT user_id, start_date, end_date FROM leave_requests
+            WHERE status='Approved' AND end_date >= :s AND start_date <= :e
+        """), {"s": cycle_start.isoformat(), "e": effective_end.isoformat()}).mappings().all()
+
+    holidays = {r['holiday_date'] for r in holiday_rows}
+    batch_by_emp = {str(r['emp_id']): (r['batch'] or 'batch_1') for r in map_rows}
+    attendance_by_emp = {}
+    for r in attendance_rows:
+        attendance_by_emp.setdefault(str(r['emp_id']), {})[r['att_date']] = dict(r)
+    leave_by_emp = {}
+    for r in leave_rows:
+        eid=str(r['user_id']); leave_by_emp.setdefault(eid,set())
+        d=r['start_date']
+        while d <= r['end_date']:
+            if cycle_start <= d <= effective_end: leave_by_emp[eid].add(d)
+            d += timedelta(days=1)
+
+    def second_sat(d): return d.weekday()==5 and 8 <= d.day <= 14
+    wb=_ExcelWorkbook(); ws=wb.active; ws.title='Attendance Summary'
+    headers=['Employee ID','Employee Name','Department','Batch','Cycle','Present Days','Half Days','Late Marks','Early Out Days','Absent Days','Leave Days','Holidays','Weekly Off Days','Working Days']
+    ws.append(headers)
+    fill=_ExcelFill('solid', fgColor='1F4E78')
+    for c in ws[1]: c.font=_ExcelFont(bold=True,color='FFFFFF'); c.fill=fill
+
+    for u in users:
+        eid=str(u['id']); rows=attendance_by_emp.get(eid,{})
+        dept=next((r.get('department') for r in rows.values() if r.get('department')), '')
+        batch=batch_by_emp.get(eid,'batch_1')
+        batch_label='9:30 AM - 6:30 PM' if batch=='batch_2' else '9:00 AM - 6:00 PM'
+        present=half=late=early=absent=leave=holiday_count=weekly=working=0
+        d=cycle_start
+        while d <= effective_end:
+            ar=rows.get(d)
+            if d in holidays: holiday_count += 1
+            elif d.weekday()==6 or second_sat(d): weekly += 1
+            elif d in leave_by_emp.get(eid,set()): leave += 1
+            else:
+                working += 1
+                status=(ar or {}).get('status','')
+                if status=='Half Day': half += 1
+                elif status in ('Present','Work From Home','Manual Entry'): present += 1
+                elif status=='Leave': leave += 1
+                elif status in ('Holiday','Office Off'): holiday_count += 1
+                elif status=='Weekly Off': weekly += 1
+                elif status=='Absent' or not ar: absent += 1
+                if ar:
+                    if int(ar.get('late_minutes') or 0)>0: late += 1
+                    if int(ar.get('early_leaving') or 0)>0: early += 1
+            d += timedelta(days=1)
+        ws.append([eid,u['full_name'] or '',dept,batch_label,label,present,half,late,early,absent,leave,holiday_count,weekly,working])
+
+    ws.freeze_panes='A2'; ws.auto_filter.ref=ws.dimensions
+    widths=[16,28,22,22,14,14,12,12,16,13,12,12,16,14]
+    for i,w in enumerate(widths,1): ws.column_dimensions[chr(64+i)].width=w
+    out=_excel_io.BytesIO(); wb.save(out); out.seek(0)
+    return _ExcelStreamingResponse(out, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers={'Content-Disposition': f'attachment; filename="attendance_summary_{label}.xlsx"'})
+
+
 @app.get("/attendance/summary/today")
 def attendance_summary_today():
     """Quick stat cards for admin dashboard — today's counts."""
@@ -5477,9 +5566,11 @@ def _create_attendance_device_map_table():
                 emp_id           TEXT NOT NULL,
                 emp_name         TEXT NOT NULL,
                 department       TEXT DEFAULT '',
+                batch            TEXT DEFAULT 'batch_1',
                 created_at       TIMESTAMP DEFAULT NOW()
             )
         """))
+        conn.execute(text("ALTER TABLE attendance_device_map ADD COLUMN IF NOT EXISTS batch TEXT DEFAULT 'batch_1'"))
 
 
 @app.on_event("startup")
@@ -5519,6 +5610,7 @@ class DeviceMapIn(BaseModel):
     emp_id: str
     emp_name: str
     department: str = ""
+    batch: str = "batch_1"
 
 
 @app.get("/attendance/device-map")
@@ -5550,12 +5642,12 @@ def upsert_device_map(data: DeviceMapIn, _admin: dict = Depends(require_roles("a
     """Manually map (or fix) one device Person ID to a system employee."""
     with engine.begin() as conn:
         conn.execute(text("""
-            INSERT INTO attendance_device_map (device_person_id, emp_id, emp_name, department)
-            VALUES (:pid, :eid, :ename, :dept)
+            INSERT INTO attendance_device_map (device_person_id, emp_id, emp_name, department, batch)
+            VALUES (:pid, :eid, :ename, :dept, :batch)
             ON CONFLICT (device_person_id) DO UPDATE
-            SET emp_id = EXCLUDED.emp_id, emp_name = EXCLUDED.emp_name, department = EXCLUDED.department
+            SET emp_id = EXCLUDED.emp_id, emp_name = EXCLUDED.emp_name, department = EXCLUDED.department, batch = EXCLUDED.batch
         """), {"pid": data.device_person_id, "eid": data.emp_id,
-               "ename": data.emp_name, "dept": data.department})
+               "ename": data.emp_name, "dept": data.department, "batch": data.batch})
     return {"success": True}
 
 
