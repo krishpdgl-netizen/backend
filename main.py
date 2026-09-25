@@ -5027,7 +5027,6 @@ def _is_second_saturday(d: date) -> bool:
     """Return True if `d` is the second Saturday of its month."""
     if d.weekday() != 5:   # 5 = Saturday
         return False
-    # Count Saturdays in the month up to and including `d`
     count = 0
     for day in range(1, d.day + 1):
         if date(d.year, d.month, day).weekday() == 5:
@@ -5036,10 +5035,7 @@ def _is_second_saturday(d: date) -> bool:
 
 
 def _is_office_off(d: date, conn) -> bool:
-    """
-    Return True if `d` is an office-declared off day OR a standard holiday.
-    Checks both the `holidays` table and the `office_off_days` table.
-    """
+    """Return True if `d` is a declared holiday or admin office-off day."""
     row = conn.execute(
         text("SELECT 1 FROM holidays WHERE holiday_date = :d LIMIT 1"),
         {"d": d.isoformat()}
@@ -5055,16 +5051,16 @@ def _is_office_off(d: date, conn) -> bool:
 
 def _is_working_day(d: date, conn) -> bool:
     """
-    A day counts as a working day only if ALL of these hold:
+    A day is a working day only if ALL hold:
       - Not a Sunday
       - Not the second Saturday of the month
       - Not a holiday or office off day
     """
-    if d.weekday() == 6:              # Sunday
+    if d.weekday() == 6:           # Sunday
         return False
-    if _is_second_saturday(d):        # 2nd Saturday
+    if _is_second_saturday(d):     # 2nd Saturday
         return False
-    if _is_office_off(d, conn):       # holidays + office off days
+    if _is_office_off(d, conn):    # holidays + office off days
         return False
     return True
 
@@ -5106,8 +5102,8 @@ def _time_to_minutes(hhmm: str) -> int:
 def _batch_windows(batch: str):
     """
     Return (start_h, start_m, end_h, end_m) for a named batch.
-    Batch "9-6"    => 09:00 - 18:00
-    Batch "930-630"=> 09:30 - 18:30
+    batch "9-6"     => 09:00 - 18:00
+    batch "930-630" => 09:30 - 18:30
     Any unknown batch defaults to "9-6".
     """
     if batch == "930-630":
@@ -5120,16 +5116,15 @@ def _classify_checkin_batch(ci_str: str, batch: str = "9-6"):
     Batch-aware check-in classification.
     Rules:
       - 20-minute morning buffer: on time up to (start + 20 min)
-      - [start+20, start+20+..until 10:59 for 9-6 / 11:29 for 930-630] -> Late Mark (Present + late flag)
-        Concretely: late mark ends at HH:59 where HH = start_hour + 1
+      - [start+20 .. top of second hour from start - 1 min] -> Late Mark (Present + late flag)
+        e.g. 9-6 batch: late zone = 09:21 - 10:59
+             930-630 batch: late zone = 09:51 - 11:29
       - >= 11:00 (9-6) / >= 11:30 (930-630) -> Half Day
     Returns (status, late_minutes, is_late)
     """
     sh, sm, _, _ = _batch_windows(batch)
     start_mins = sh * 60 + sm
     buffer_end = start_mins + 20          # on time up to start + 20 min
-    # late mark zone ends at top of the second hour from start (10:59 for 9am, 11:29 for 9:30am)
-    late_end   = (sh + 1) * 60 + 59      # 10:59 for batch 9-6, 11:29 for 930-630  → actually sh+1:59
     half_from  = (sh + 2) * 60           # 11:00 for 9-6, 11:30 for 930-630
 
     ci_mins = _time_to_minutes(ci_str)
@@ -5158,12 +5153,10 @@ def _classify_checkout_batch(co_str: str, batch: str = "9-6", checkin_status: st
     co_mins = _time_to_minutes(co_str)
 
     if co_mins < halfday_cut:
-        # Left before 4:30 PM -> half day regardless of morning status
         early_mins = end_mins - co_mins
         return early_mins, False, True   # (early_mins, is_early_out, is_checkout_halfday)
 
     if co_mins < buffer_end:
-        # Left between 4:30 and (end-15) -> Early Out
         early_mins = buffer_end - co_mins
         return early_mins, True, False
 
@@ -5171,19 +5164,12 @@ def _classify_checkout_batch(co_str: str, batch: str = "9-6", checkin_status: st
 
 
 def _classify_checkin(ci_str: str, settings: dict, batch: str = "9-6"):
-    """
-    Legacy single-return wrapper kept for callers that pass settings dict.
-    Delegates to batch-aware version.
-    """
+    """Legacy wrapper — delegates to batch-aware version."""
     return _classify_checkin_batch(ci_str, batch)
 
 
 def _classify_checkout(co_str: str, settings: dict, batch: str = "9-6"):
-    """
-    Legacy wrapper. Returns (early_leaving_minutes, is_early_out).
-    checkout_halfday flag is discarded here; callers that need it should
-    call _classify_checkout_batch directly.
-    """
+    """Legacy wrapper. Returns (early_leaving_minutes, is_early_out)."""
     early_mins, is_early_out, _ = _classify_checkout_batch(co_str, batch)
     return early_mins, is_early_out
 
@@ -5496,6 +5482,95 @@ def delete_attendance(attendance_id: int, _admin: dict = Depends(require_roles("
 # ================================================================
 
 
+@app.get("/attendance/summary/excel")
+def attendance_summary_excel(cycle: Optional[str] = None, _admin: dict = Depends(require_roles("admin"))):
+    """Download employee-by-employee attendance summary for a 26th->25th cycle."""
+    import io as _excel_io
+    from openpyxl import Workbook as _ExcelWorkbook
+    from openpyxl.styles import Font as _ExcelFont, PatternFill as _ExcelFill
+    from fastapi.responses import StreamingResponse as _ExcelStreamingResponse
+
+    label = cycle or _current_cycle_label()
+    try:
+        cycle_start, cycle_end = _cycle_bounds(label)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid cycle. Use YYYY-MM.")
+
+    effective_end = min(cycle_end, _ist_today())
+    with engine.connect() as conn:
+        users = conn.execute(text("SELECT id, full_name, role FROM users ORDER BY full_name")).mappings().all()
+        attendance_rows = conn.execute(text("""
+            SELECT emp_id, emp_name, department, att_date, status,
+                   COALESCE(late_minutes,0) AS late_minutes,
+                   COALESCE(early_leaving,0) AS early_leaving
+            FROM attendance
+            WHERE att_date >= :s AND att_date <= :e
+            ORDER BY emp_name, att_date
+        """), {"s": cycle_start.isoformat(), "e": effective_end.isoformat()}).mappings().all()
+        holiday_rows = conn.execute(text("""
+            SELECT holiday_date, name, holiday_type FROM holidays
+            WHERE holiday_date >= :s AND holiday_date <= :e
+        """), {"s": cycle_start.isoformat(), "e": effective_end.isoformat()}).mappings().all()
+        map_rows = conn.execute(text("SELECT emp_id, MAX(batch) AS batch FROM attendance_device_map GROUP BY emp_id")).mappings().all()
+        leave_rows = conn.execute(text("""
+            SELECT user_id, start_date, end_date FROM leave_requests
+            WHERE status='Approved' AND end_date >= :s AND start_date <= :e
+        """), {"s": cycle_start.isoformat(), "e": effective_end.isoformat()}).mappings().all()
+
+    holidays = {r['holiday_date'] for r in holiday_rows}
+    batch_by_emp = {str(r['emp_id']): (r['batch'] or 'batch_1') for r in map_rows}
+    attendance_by_emp = {}
+    for r in attendance_rows:
+        attendance_by_emp.setdefault(str(r['emp_id']), {})[r['att_date']] = dict(r)
+    leave_by_emp = {}
+    for r in leave_rows:
+        eid=str(r['user_id']); leave_by_emp.setdefault(eid,set())
+        d=r['start_date']
+        while d <= r['end_date']:
+            if cycle_start <= d <= effective_end: leave_by_emp[eid].add(d)
+            d += timedelta(days=1)
+
+    def second_sat(d): return d.weekday()==5 and 8 <= d.day <= 14
+    wb=_ExcelWorkbook(); ws=wb.active; ws.title='Attendance Summary'
+    headers=['Employee ID','Employee Name','Department','Batch','Cycle','Present Days','Half Days','Late Marks','Early Out Days','Absent Days','Leave Days','Holidays','Weekly Off Days','Working Days']
+    ws.append(headers)
+    fill=_ExcelFill('solid', fgColor='1F4E78')
+    for c in ws[1]: c.font=_ExcelFont(bold=True,color='FFFFFF'); c.fill=fill
+
+    for u in users:
+        eid=str(u['id']); rows=attendance_by_emp.get(eid,{})
+        dept=next((r.get('department') for r in rows.values() if r.get('department')), '')
+        batch=batch_by_emp.get(eid,'batch_1')
+        batch_label='9:30 AM - 6:30 PM' if batch=='batch_2' else '9:00 AM - 6:00 PM'
+        present=half=late=early=absent=leave=holiday_count=weekly=working=0
+        d=cycle_start
+        while d <= effective_end:
+            ar=rows.get(d)
+            if d in holidays: holiday_count += 1
+            elif d.weekday()==6 or second_sat(d): weekly += 1
+            elif d in leave_by_emp.get(eid,set()): leave += 1
+            else:
+                working += 1
+                status=(ar or {}).get('status','')
+                if status=='Half Day': half += 1
+                elif status in ('Present','Work From Home','Manual Entry'): present += 1
+                elif status=='Leave': leave += 1
+                elif status in ('Holiday','Office Off'): holiday_count += 1
+                elif status=='Weekly Off': weekly += 1
+                elif status=='Absent' or not ar: absent += 1
+                if ar:
+                    if int(ar.get('late_minutes') or 0)>0: late += 1
+                    if int(ar.get('early_leaving') or 0)>0: early += 1
+            d += timedelta(days=1)
+        ws.append([eid,u['full_name'] or '',dept,batch_label,label,present,half,late,early,absent,leave,holiday_count,weekly,working])
+
+    ws.freeze_panes='A2'; ws.auto_filter.ref=ws.dimensions
+    widths=[16,28,22,22,14,14,12,12,16,13,12,12,16,14]
+    for i,w in enumerate(widths,1): ws.column_dimensions[chr(64+i)].width=w
+    out=_excel_io.BytesIO(); wb.save(out); out.seek(0)
+    return _ExcelStreamingResponse(out, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers={'Content-Disposition': f'attachment; filename="attendance_summary_{label}.xlsx"'})
+
+
 @app.get("/attendance/summary/today")
 def attendance_summary_today():
     """Quick stat cards for admin dashboard — today's counts."""
@@ -5592,7 +5667,6 @@ def _create_attendance_device_map_table():
                 created_at       TIMESTAMP DEFAULT NOW()
             )
         """))
-        # Idempotent: add batch column if table existed before this migration
         conn.execute(text("ALTER TABLE attendance_device_map ADD COLUMN IF NOT EXISTS batch TEXT DEFAULT '9-6'"))
 
 
@@ -5651,6 +5725,44 @@ class DeviceMapIn(BaseModel):
     batch: str = "9-6"   # "9-6" = 09:00-18:00, "930-630" = 09:30-18:30
 
 
+# ── OFFICE OFF DAYS ──────────────────────────────────────────────────────────
+
+class OfficeOffDayIn(BaseModel):
+    off_date: str   # YYYY-MM-DD
+    reason:   str = ""
+
+
+@app.get("/attendance/office-off-days")
+def list_office_off_days(_admin: dict = Depends(require_roles("admin"))):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT * FROM office_off_days ORDER BY off_date DESC")
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.post("/attendance/office-off-days")
+def add_office_off_day(data: OfficeOffDayIn, admin: dict = Depends(require_roles("admin"))):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO office_off_days (off_date, reason, created_by)
+            VALUES (:d, :reason, :by)
+            ON CONFLICT (off_date) DO UPDATE SET reason = EXCLUDED.reason
+        """), {"d": data.off_date, "reason": data.reason,
+               "by": str(admin.get("uid", ""))})
+    return {"success": True}
+
+
+@app.delete("/attendance/office-off-days/{off_date}")
+def delete_office_off_day(off_date: str, _admin: dict = Depends(require_roles("admin"))):
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM office_off_days WHERE off_date = :d"),
+            {"d": off_date}
+        )
+    return {"success": True}
+
+
 @app.get("/attendance/device-map")
 def list_device_map(_admin: dict = Depends(require_roles("admin"))):
     """Current device-Person-ID -> employee mappings, so mismatches can be fixed."""
@@ -5683,11 +5795,9 @@ def upsert_device_map(data: DeviceMapIn, _admin: dict = Depends(require_roles("a
             INSERT INTO attendance_device_map (device_person_id, emp_id, emp_name, department, batch)
             VALUES (:pid, :eid, :ename, :dept, :batch)
             ON CONFLICT (device_person_id) DO UPDATE
-            SET emp_id = EXCLUDED.emp_id, emp_name = EXCLUDED.emp_name,
-                department = EXCLUDED.department, batch = EXCLUDED.batch
+            SET emp_id = EXCLUDED.emp_id, emp_name = EXCLUDED.emp_name, department = EXCLUDED.department, batch = EXCLUDED.batch
         """), {"pid": data.device_person_id, "eid": data.emp_id,
-               "ename": data.emp_name, "dept": data.department,
-               "batch": data.batch or "9-6"})
+               "ename": data.emp_name, "dept": data.department, "batch": data.batch})
     return {"success": True}
 
 
@@ -5766,7 +5876,7 @@ async def import_scan_log(
     if not scans:
         return {"success": False, "message": "No usable rows found in this file."}
 
-    # 2) Resolve each device Person ID -> system employee (batch stored permanently in device_map)
+    # 2) Resolve each device Person ID -> system employee (batch stored permanently)
     with engine.connect() as conn:
         device_map = {r["device_person_id"]: dict(r) for r in conn.execute(
             text("SELECT * FROM attendance_device_map")).mappings().all()}
@@ -5834,11 +5944,9 @@ async def import_scan_log(
                 if co_str:
                     early_mins, is_early_out, is_checkout_halfday = _classify_checkout_batch(
                         co_str, batch, status)
-                    # Checkout before 4:30 PM overrides morning Present -> Half Day
-                    # Two half-days in one day = still Half Day (not Absent)
                     if is_checkout_halfday:
                         status = "Half Day"
-                        is_early_out = False  # it's a half day, not just early-out
+                        is_early_out = False
 
                 if status == "Half Day":
                     half_days += 1
