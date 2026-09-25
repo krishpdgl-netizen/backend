@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 sqlalchemy
-psycopg2-binary
+psycopg[binary]
 openpyxl
 python-multipart
 APScheduler==3.10.4
