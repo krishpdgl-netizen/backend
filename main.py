@@ -5099,62 +5099,78 @@ def _time_to_minutes(hhmm: str) -> int:
     return h * 60 + m
 
 
+def _normalize_batch(batch: str) -> str:
+    """Normalize all supported batch names."""
+    b = str(batch or "").strip().lower().replace("_", "-")
+    if b in (
+        "batch-2", "batch2", "930-630",
+        "9:30-6:30", "09:30-18:30", "9:30-18:30"
+    ):
+        return "930-630"
+    return "9-6"
+
+
 def _batch_windows(batch: str):
     """
-    Return (start_h, start_m, end_h, end_m) for a named batch.
-    batch "9-6"     => 09:00 - 18:00
-    batch "930-630" => 09:30 - 18:30
-    Any unknown batch defaults to "9-6".
+    Return (start_h, start_m, end_h, end_m).
+    Batch 1: 09:00 - 18:00
+    Batch 2: 09:30 - 18:30
     """
-    if batch == "930-630":
+    if _normalize_batch(batch) == "930-630":
         return 9, 30, 18, 30
-    return 9, 0, 18, 0   # default: "9-6"
+    return 9, 0, 18, 0
 
 
 def _classify_checkin_batch(ci_str: str, batch: str = "9-6"):
     """
     Batch-aware check-in classification.
-    Rules:
-      - 20-minute morning buffer: on time up to (start + 20 min)
-      - [start+20 .. top of second hour from start - 1 min] -> Late Mark (Present + late flag)
-        e.g. 9-6 batch: late zone = 09:21 - 10:59
-             930-630 batch: late zone = 09:51 - 11:29
-      - >= 11:00 (9-6) / >= 11:30 (930-630) -> Half Day
-    Returns (status, late_minutes, is_late)
-    """
-    sh, sm, _, _ = _batch_windows(batch)
-    start_mins = sh * 60 + sm
-    buffer_end = start_mins + 20          # on time up to start + 20 min
-    half_from  = (sh + 2) * 60           # 11:00 for 9-6, 11:30 for 930-630
 
+    Batch 1:
+      09:00-09:20 = Present, no late
+      09:21-10:59 = Present, Late
+      11:00+      = Half Day
+
+    Batch 2:
+      09:30-09:50 = Present, no late
+      09:51-10:59 = Present, Late
+      11:00+      = Half Day
+    """
+    start_h, start_m, _, _ = _batch_windows(batch)
+    buffer_end = start_h * 60 + start_m + 20
+    half_from = 11 * 60
     ci_mins = _time_to_minutes(ci_str)
 
     if ci_mins >= half_from:
         return "Half Day", max(0, ci_mins - buffer_end), False
-    if ci_mins > buffer_end:              # inside late-mark zone
+    if ci_mins > buffer_end:
         return "Present", ci_mins - buffer_end, True
     return "Present", 0, False
 
 
-def _classify_checkout_batch(co_str: str, batch: str = "9-6", checkin_status: str = "Present"):
+def _classify_checkout_batch(
+    co_str: str,
+    batch: str = "9-6",
+    checkin_status: str = "Present"
+):
     """
     Batch-aware check-out classification.
-    Rules:
-      - Left before 16:30 (4:30 PM) -> Half Day (overrides Present from morning)
-      - 16:30 <= co < (end - 15 min) -> Early Out
-      - >= (end - 15 min) -> Clean / on time
-    Returns (early_leaving_minutes, is_early_out, is_checkout_halfday)
+
+    Before 16:30 -> Half Day
+    16:30 to batch-end minus 15 minutes -> Early Out
+    Batch 1 clean from 17:45 onward
+    Batch 2 clean from 18:15 onward
     """
+    batch = _normalize_batch(batch)
     _, _, eh, em = _batch_windows(batch)
-    end_mins    = eh * 60 + em
-    buffer_end  = end_mins - 15          # can leave 15 min early cleanly
-    halfday_cut = 16 * 60 + 30           # 4:30 PM hard cutoff
+    end_mins = eh * 60 + em
+    buffer_end = end_mins - 15
+    halfday_cut = 16 * 60 + 30
 
     co_mins = _time_to_minutes(co_str)
 
     if co_mins < halfday_cut:
         early_mins = end_mins - co_mins
-        return early_mins, False, True   # (early_mins, is_early_out, is_checkout_halfday)
+        return early_mins, False, True
 
     if co_mins < buffer_end:
         early_mins = buffer_end - co_mins
@@ -5172,7 +5188,6 @@ def _classify_checkout(co_str: str, settings: dict, batch: str = "9-6"):
     """Legacy wrapper. Returns (early_leaving_minutes, is_early_out)."""
     early_mins, is_early_out, _ = _classify_checkout_batch(co_str, batch)
     return early_mins, is_early_out
-
 
 def _cycle_bounds(cycle_label: str):
     """
