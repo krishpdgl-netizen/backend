@@ -5074,11 +5074,11 @@ def _get_settings(conn) -> dict:
         "late_grace_minutes": 10,
         "overtime_after_hours": 9.0,
         "office_start_time": "09:00",
-        "late_mark_from": "09:16",
+        "late_mark_from": "09:20",
         "late_mark_to": "10:59",
         "half_day_from": "11:00",
         "half_day_to": "15:59",
-        "early_out_from": "16:00",
+        "early_out_from": "16:20",
         "early_out_to": "17:50",
     }
     for k, v in defaults.items():
@@ -5155,8 +5155,8 @@ def _classify_checkout_batch(
     """
     Batch-aware check-out classification.
 
-    Before 16:30 -> Half Day
-    16:30 to batch-end minus 15 minutes -> Early Out
+    Before 16:20 -> Half Day
+    16:20 to batch-end minus 15 minutes -> Early Out
     Batch 1 clean from 17:45 onward
     Batch 2 clean from 18:15 onward
     """
@@ -5164,7 +5164,7 @@ def _classify_checkout_batch(
     _, _, eh, em = _batch_windows(batch)
     end_mins = eh * 60 + em
     buffer_end = end_mins - 15
-    halfday_cut = 16 * 60 + 30
+    halfday_cut = 16 * 60 + 20
 
     co_mins = _time_to_minutes(co_str)
 
