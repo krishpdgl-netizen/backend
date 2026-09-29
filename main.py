@@ -5512,6 +5512,7 @@ def attendance_summary_excel(cycle: Optional[str] = None, _admin: dict = Depends
         raise HTTPException(status_code=400, detail="Invalid cycle. Use YYYY-MM.")
 
     effective_end = min(cycle_end, _ist_today())
+
     with engine.connect() as conn:
         users = conn.execute(text("SELECT id, full_name, role FROM users ORDER BY full_name")).mappings().all()
         attendance_rows = conn.execute(text("""
@@ -5522,11 +5523,14 @@ def attendance_summary_excel(cycle: Optional[str] = None, _admin: dict = Depends
             WHERE att_date >= :s AND att_date <= :e
             ORDER BY emp_name, att_date
         """), {"s": cycle_start.isoformat(), "e": effective_end.isoformat()}).mappings().all()
+
         holiday_rows = conn.execute(text("""
             SELECT holiday_date, name, holiday_type FROM holidays
             WHERE holiday_date >= :s AND holiday_date <= :e
         """), {"s": cycle_start.isoformat(), "e": effective_end.isoformat()}).mappings().all()
+
         map_rows = conn.execute(text("SELECT emp_id, MAX(batch) AS batch FROM attendance_device_map GROUP BY emp_id")).mappings().all()
+
         leave_rows = conn.execute(text("""
             SELECT user_id, start_date, end_date FROM leave_requests
             WHERE status='Approved' AND end_date >= :s AND start_date <= :e
@@ -5534,9 +5538,11 @@ def attendance_summary_excel(cycle: Optional[str] = None, _admin: dict = Depends
 
     holidays = {r['holiday_date'] for r in holiday_rows}
     batch_by_emp = {str(r['emp_id']): (r['batch'] or 'batch_1') for r in map_rows}
+
     attendance_by_emp = {}
     for r in attendance_rows:
         attendance_by_emp.setdefault(str(r['emp_id']), {})[r['att_date']] = dict(r)
+
     leave_by_emp = {}
     for r in leave_rows:
         eid=str(r['user_id']); leave_by_emp.setdefault(eid,set())
@@ -5546,9 +5552,13 @@ def attendance_summary_excel(cycle: Optional[str] = None, _admin: dict = Depends
             d += timedelta(days=1)
 
     def second_sat(d): return d.weekday()==5 and 8 <= d.day <= 14
+
     wb=_ExcelWorkbook(); ws=wb.active; ws.title='Attendance Summary'
-    headers=['Employee ID','Employee Name','Department','Batch','Cycle','Present Days','Half Days','Late Marks','Early Out Days','Absent Days','Leave Days','Holidays','Weekly Off Days','Working Days']
+    
+    # Added 'Total Absent' to the headers
+    headers=['Employee ID','Employee Name','Department','Batch','Cycle','Present Days','Half Days','Late Marks','Early Out Days','Absent Days','Leave Days','Holidays','Weekly Off Days','Working Days','Total Absent']
     ws.append(headers)
+
     fill=_ExcelFill('solid', fgColor='1F4E78')
     for c in ws[1]: c.font=_ExcelFont(bold=True,color='FFFFFF'); c.fill=fill
 
@@ -5557,6 +5567,7 @@ def attendance_summary_excel(cycle: Optional[str] = None, _admin: dict = Depends
         dept=next((r.get('department') for r in rows.values() if r.get('department')), '')
         batch=batch_by_emp.get(eid,'batch_1')
         batch_label='9:30 AM - 6:30 PM' if batch=='batch_2' else '9:00 AM - 6:00 PM'
+        
         present=half=late=early=absent=leave=holiday_count=weekly=working=0
         d=cycle_start
         while d <= effective_end:
@@ -5577,14 +5588,26 @@ def attendance_summary_excel(cycle: Optional[str] = None, _admin: dict = Depends
                     if int(ar.get('late_minutes') or 0)>0: late += 1
                     if int(ar.get('early_leaving') or 0)>0: early += 1
             d += timedelta(days=1)
-        ws.append([eid,u['full_name'] or '',dept,batch_label,label,present,half,late,early,absent,leave,holiday_count,weekly,working])
+            
+        # --- NEW LOGIC ---
+        # Penalty for combined late + early out occurrences
+        # 3-5 times = 0.5 day, 6-8 times = 1.0 day, 9-11 times = 1.5 days, etc.
+        penalty_days = ((late + early) // 3) * 0.5
+        
+        # Total Absent = Absent Days + (Half Days * 0.5) + Penalty Days
+        total_absent = absent + (half * 0.5) + penalty_days
+        
+        # Appending the new total_absent value at the end of the row
+        ws.append([eid,u['full_name'] or '',dept,batch_label,label,present,half,late,early,absent,leave,holiday_count,weekly,working, total_absent])
 
     ws.freeze_panes='A2'; ws.auto_filter.ref=ws.dimensions
-    widths=[16,28,22,22,14,14,12,12,16,13,12,12,16,14]
+    
+    # Added width for the new 15th column
+    widths=[16,28,22,22,14,14,12,12,16,13,12,12,16,14,14]
     for i,w in enumerate(widths,1): ws.column_dimensions[chr(64+i)].width=w
+
     out=_excel_io.BytesIO(); wb.save(out); out.seek(0)
     return _ExcelStreamingResponse(out, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers={'Content-Disposition': f'attachment; filename="attendance_summary_{label}.xlsx"'})
-
 
 @app.get("/attendance/summary/today")
 def attendance_summary_today():
